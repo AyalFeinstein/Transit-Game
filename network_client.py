@@ -32,6 +32,7 @@ class NetworkClient(QObject):
     settings_updated = pyqtSignal(dict)  # Emitted when settings are updated
     year_advanced = pyqtSignal(dict)  # Emitted when year advances
     end_year_status = pyqtSignal(dict)  # Emitted when end year status updates
+    chat_received = pyqtSignal(dict)  # Emitted when chat message received {message, sender}
     
     def __init__(self, server_url: str = "http://localhost:8080"):
         super().__init__()
@@ -150,7 +151,11 @@ class NetworkClient(QObject):
         @self.sio.on('end_year_status')
         def on_end_year_status(data):
             self.end_year_status.emit(data)
-    
+
+        @self.sio.on('chat_message')
+        def on_chat_message(data):
+            self.chat_received.emit(data)
+
     def create_game(self, player_names: list[str], map_width: int = 100, 
                    map_height: int = 75, starting_money: int = 20000,
                    worker_replenishment_rate: float = 1.0):
@@ -240,6 +245,15 @@ class NetworkClient(QObject):
     def end_year(self):
         """Signal ready to end the year - year advances when all players are ready"""
         self.send_action('end_year', {})
+
+    def send_chat(self, message: str):
+        """Send a chat message to the server"""
+        if not self.connected_flag or not self.session_id:
+            return
+        self.sio.emit('chat', {
+            'session_id': self.session_id,
+            'message': message
+        })
     
     def end_turn(self):
         """End current turn (legacy - no longer used in simultaneous mode)"""
@@ -263,13 +277,13 @@ class NetworkClient(QObject):
             'value': value
         })
     
-    def start_game_on_server(self):
-        """Request server to start the game"""
+    def start_game_on_server(self, ai_player_indices=None):
+        """Request server to start the game. ai_player_indices: list of player indices that are AI."""
         if not self.connected_flag:
             self.error_received.emit("Not connected to server")
             return
         
-        self.sio.emit('start_game', {})
+        self.sio.emit('start_game', {'ai_player_indices': ai_player_indices if ai_player_indices is not None else []})
     
     def deserialize_game_state(self, game_state_data: dict) -> Optional[Game]:
         """Deserialize game state from server format"""

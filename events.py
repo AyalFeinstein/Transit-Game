@@ -46,15 +46,14 @@ class AutomobileInventionEvent(GameEvent):
                 progress = min(1.0, progress)  # Cap at 2020
                 population_reduction = progress * 0.6  # 0% to 60%
         else:
-            # From 2020 to 2050: 60% to 70% population reduction
-            # Linear interpolation
-            period_years = 2050 - 2020  # 30 years
+            # From 2020 to 2050: 60% to 70% population reduction (continued suburbanization)
+            period_years = 2050 - 2020
             years_since_2020 = current_year - 2020
             if period_years == 0:
                 population_reduction = 0.6
             else:
                 progress = years_since_2020 / period_years
-                progress = min(1.0, progress)  # Cap at 2050
+                progress = min(1.0, progress)
                 population_reduction = 0.6 + (progress * 0.1)  # 60% to 70%
         
         return {
@@ -73,25 +72,22 @@ class Covid19Event(GameEvent):
         )
     
     def get_effect(self, current_year: int) -> dict:
-        """Calculate population reduction based on COVID-19 impact
-        People avoid public transit due to health concerns"""
+        """Suppress transit line profits (ridership demand) without applying a city-wide population cut."""
         if not self.is_active(current_year):
             return {}
         years_since_start = current_year - self.year
         if years_since_start < 0:
             return {}
-        recovery_period = 4  
+        recovery_period = 4
         if years_since_start > recovery_period:
             return {}
-        if recovery_period == 0:
-            population_reduction = 0.95
-        else:
-            recovery_progress = years_since_start / recovery_period
-            population_reduction = 0.95 - (recovery_progress * 0.95)
-            population_reduction = max(0.0, population_reduction)  # Cap at 0%
+        recovery_progress = years_since_start / recovery_period
+        # Year 2020: strong ridership hit; linear recovery to normal by start of year after the 4th recovery year
+        profit_multiplier = 0.35 + 0.65 * recovery_progress
+        pct = int(round(profit_multiplier * 100))
         return {
-            'population_reduction': population_reduction,
-            'description': f"COVID-19 pandemic reduces population by {population_reduction*100:.1f}%"
+            'profit_multiplier': profit_multiplier,
+            'description': f"COVID-19 pandemic: transit demand at ~{pct}% of normal, recovering over {recovery_period} years",
         }
 
 
@@ -323,15 +319,15 @@ class EventSystem:
     def check_and_create_natural_disaster(self, current_year: int) -> 'NaturalDisasterEvent':
         """Check if a random natural disaster should occur.
         Frequency is adjusted by natural_disaster_frequency parameter.
-        Base frequency: every 20-40 turns (1.0 frequency).
-        Higher frequency (e.g., 2.0) = disasters happen more often (every 10-20 turns).
-        Lower frequency (e.g., 0.5) = disasters happen less often (every 40-80 turns)."""
+        Base frequency: every 40-60 years on average (1.0 frequency).
+        Higher frequency (e.g., 2.0) = disasters happen more often (every 20-30 years).
+        Lower frequency (e.g., 0.5) = disasters happen less often (every 80-120 years)."""
         import random
         
         # Adjust base interval by frequency (inverse relationship)
-        # frequency 1.0 = 20-40 years, frequency 2.0 = 10-20 years, frequency 0.5 = 40-80 years
-        base_min_years = int(20 / self.natural_disaster_frequency)
-        base_max_years = int(40 / self.natural_disaster_frequency)
+        # frequency 1.0 = 40-60 years (avg one per 50), frequency 2.0 = 20-30 years, frequency 0.5 = 80-120 years
+        base_min_years = int(40 / self.natural_disaster_frequency)
+        base_max_years = int(60 / self.natural_disaster_frequency)
         
         # Initialize if first time
         if not hasattr(self, 'last_natural_disaster_year'):

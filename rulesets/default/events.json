@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "events": [
+    {
+      "type": "automobile",
+      "name": "Invention of the Automobile",
+      "year": 1910,
+      "description": "The automobile becomes widely available, providing competition to rail transport"
+    },
+    {
+      "type": "covid19",
+      "name": "COVID-19 Pandemic",
+      "year": 2020,
+      "description": "The COVID-19 pandemic causes massive disruption to public transit"
+    },
+    {
+      "type": "worker_protection",
+      "name": "Worker Protection Act",
+      "year": 1925,
+      "description": "New labor laws protect workers on strike from being fired"
+    },
+    {
+      "type": "trust_busting",
+      "name": "Trust Busting",
+      "year": 1904,
+      "description": "Antitrust laws allow lawsuits against monopolistic practices"
+    },
+    {
+      "type": "environmental_protection",
+      "name": "Environmental Protection Act",
+      "year": 1970,
+      "description": "Environmental Protection Agency is established and can sue for environmental damage"
+    },
+    {
+      "type": "government_automobile_preference",
+      "name": "Government Automobile Preference",
+      "year": 1945,
+      "description": "Post-WWII government policies heavily favor automobile infrastructure over public transportation, leading to highway construction, suburbanization, and reduced transit funding",
+      "end_year": 1975
+    }
+  ]
+}

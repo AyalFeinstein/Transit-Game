@@ -13,6 +13,7 @@ class Vehicle:
         self.object_id = object_id
         self.maitnance_costs = maitnance_costs
         self.year_introduced = year_introduced
+        self.purchase_year = None
         self.base_price = base_price  # Base price before inflation (older vehicles have lower base prices)
         self.obselete_by = obselete_by
 
@@ -33,19 +34,23 @@ class Vehicle:
         if not isinstance(self, Locomotive):
             return base_cost
         
-        if current_year is None or self.year_introduced is None:
+        if current_year is None:
             return base_cost
         
-        # Calculate how outdated the locomotive is
-        years_outdated = current_year - self.year_introduced
+        age_year = getattr(self, 'purchase_year', None)
+        if age_year is None:
+            age_year = self.year_introduced
+        if age_year is None:
+            return base_cost
+        
+        # Age from purchase (or introduction if legacy save); inflation is handled separately elsewhere.
+        years_outdated = int(current_year) - int(age_year)
         
         # Dramatic increase: maintenance doubles every 20 years after introduction
-        # After 40 years, it's 4x, after 60 years it's 8x, etc.
+        # After 40 years, it's 4x, after 60 years it's 8x, etc. (capped at 20x).
         if years_outdated > 20:
-            # Exponential increase: 2^(years_outdated/20)
-            outdated_factor = 2.0 ** ((years_outdated - 20) / 20.0)
-            # Cap at 20x to prevent extreme values
-            outdated_factor = min(20.0, outdated_factor)
+            exponent = (years_outdated - 20) / 20.0
+            outdated_factor = 20.0 if exponent >= 4.32 else (2.0 ** exponent)
             return int(base_cost * outdated_factor)
         
         return base_cost
@@ -99,6 +104,20 @@ class Locomotive(Vehicle):
             base_price = self.base_price
         from inflation_utils import get_inflation_factor
         return int(base_price * get_inflation_factor(current_year))
+
+    def get_catalog_base_price(self) -> int:
+        """Intro-era catalog price (sum of base_price fields, no inflation). Used for Historical Society."""
+        if self.base_price is not None:
+            return int(self.base_price)
+        return int(self.maitnance_costs * 3)
+
+    def get_historical_society_price(self, current_year: int) -> int:
+        """Spare locomotive: 5x catalog base price if 100+ years since year_introduced (RULES.md)."""
+        if self.year_introduced is None:
+            return 0
+        if current_year - self.year_introduced < 100:
+            return 0
+        return int(self.get_catalog_base_price() * 5)
 
 class Railcar(Vehicle):
     def __init__(self, name: str,
@@ -194,17 +213,45 @@ class Trainset:
         self.capacity = self.calc_capacity()
         self.maitnance_costs = self.calc_maitnance_costs()
         return True
+
+    def remove_railcar(self, railcar: Railcar = None, index: int = -1):
+        """Remove a railcar from this trainset. Returns the removed car, or None if none removed."""
+        if not self.cars:
+            return None
+        if railcar is not None:
+            if railcar not in self.cars:
+                return None
+            self.cars.remove(railcar)
+            removed = railcar
+        else:
+            idx = index if index >= 0 else len(self.cars) - 1
+            if idx < 0 or idx >= len(self.cars):
+                return None
+            removed = self.cars.pop(idx)
+        self.capacity = self.calc_capacity()
+        self.maitnance_costs = self.calc_maitnance_costs()
+        return removed
+
+    def get_catalog_base_price(self) -> int:
+        """Sum of component catalog base prices (no inflation). Used for Historical Society (RULES.md: 5x original)."""
+        total = self.locomotive.base_price
+        if not total:
+            total = self.locomotive.maitnance_costs * 3
+        for car in self.cars:
+            car_price = car.base_price
+            if not car.base_price:
+                car_price = car.maitnance_costs * 2
+            total += car_price
+        return int(total)
     
     def get_historical_society_price(self, current_year: int) -> int:
-        """Calculate price the Historical Society will pay (5x original price if over 100 years old)"""
+        """5x catalog base price if the trainset's locomotive is 100+ years old (RULES.md)."""
         if self.locomotive is None or self.locomotive.year_introduced is None:
             return 0
-        
         years_old = current_year - self.locomotive.year_introduced
         if years_old < 100:
-            return 0  
-        original_price = self.get_price(current_year)
-        return original_price * 2
+            return 0
+        return int(self.get_catalog_base_price() * 5)
     
     def get_price(self, current_year=1830):
         """Calculate price for a trainset with inflation"""

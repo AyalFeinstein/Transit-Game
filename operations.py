@@ -12,9 +12,11 @@ from marketplace import Marketplace, SaleItem
 from game_presets import (
     AI_DIFFICULTIES,
     AI_FOCUSES,
+    AI_MAX_STRAIGHT_LAND_SEGMENT_MILES,
     LINE_NIMBY_ELEVATION_CHANCE_MULTIPLIER,
     LINE_NIMBY_LAWSUIT_BASE_CHANCE,
     STARTING_MONEY,
+    STATION_MAX_WATER_DISTANCE_TO_LAND_M,
 )
 
 # NIMBY line-build excuses (noise / property / environment).
@@ -28,10 +30,15 @@ _LINE_NIMBY_EXCUSE_CAUSES = frozenset({
 AI_DIFFICULTY_COST_MULTIPLIER = {'easy': 1.15, 'medium': 1.0, 'hard': 0.75}
 AI_DIFFICULTY_MARKETPLACE_MULTIPLIER = {'easy': 1.1, 'medium': 1.0, 'hard': 0.75}
 AI_DIFFICULTY_LOBBY_BONUS = {'easy': -0.05, 'medium': 0.0, 'hard': 0.15}
-# Operating-margin guard: easy AIs accept slightly thinner routes; hard AIs demand more projected surplus.
-AI_DIFFICULTY_MARGIN_GROSS_MULTIPLIER = {'easy': 1.1, 'medium': 1.0, 'hard': 0.93}
 # AI-built stops must be at least this straight-line distance from any existing or queued stop (meters).
 AI_MIN_STOP_DIRECT_SEPARATION_METERS = 80.0
+
+# Track sharing: rail segments that run within this distance of an existing line's track
+# reuse the same physical tracks, so they are not charged full construction cost.
+SHARED_TRACK_MAX_DISTANCE_M = 10.0
+# Fraction of normal segment cost charged when a segment reuses an existing track
+# (junctions/connections only — no new track laid).
+SHARED_TRACK_COST_FACTOR = 0.1
 
 
 def _norm_display_name(name: str) -> str:
@@ -84,8 +91,8 @@ def _ai_line_geometry_exists_elsewhere(points: list, game_map: Map, build_queue:
 
 
 def _ai_route_has_backtracking(points: list, game_map: Map) -> bool:
-    """True when a route doubles back on the same street (loops, hairpins, reverse legs)."""
-    if not points or len(points) < 3:
+    """True when a route doubles back (loops, hairpins, parallel reverse legs, excessive detours)."""
+    if not points or len(points) < 2:
         return False
     seen_edges: set = set()
     for i in range(len(points) - 1):
@@ -96,12 +103,106 @@ def _ai_route_has_backtracking(points: list, game_map: Map) -> bool:
         if seg_key in seen_edges or rev_key in seen_edges:
             return True
         seen_edges.add(seg_key)
+    if len(points) < 3:
+        return False
     try:
-        from map_preset_utils import polyline_has_self_overlap, ai_grid_polyline_overlap_tolerance
+        from game_presets import AI_MAX_ROUTE_DETOUR_RATIO, AI_ROUTE_BACKTRACK_TURN_DEGREES
+        from map_preset_utils import (
+            _polyline_xy_points,
+            ai_grid_polyline_overlap_tolerance,
+            polyline_has_reverse_corridor,
+            polyline_has_self_overlap,
+            route_turn_angle_degrees,
+        )
+
+        pts = _polyline_xy_points(points)
+        if len(pts) >= 3:
+            start, end = pts[0], pts[-1]
+            direct = math.hypot(end[0] - start[0], end[1] - start[1])
+            if direct < 0.04:
+                return True
+            total = 0.0
+            for i in range(len(pts) - 1):
+                total += math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+            if direct > 1e-9 and total / direct > float(AI_MAX_ROUTE_DETOUR_RATIO):
+                return True
+            for i in range(1, len(pts) - 1):
+                if route_turn_angle_degrees(pts[i - 1], pts[i], pts[i + 1]) >= float(AI_ROUTE_BACKTRACK_TURN_DEGREES):
+                    return True
         tol = ai_grid_polyline_overlap_tolerance(game_map)
+        wide_tol = max(tol * 6.0, 0.15)
+        if polyline_has_reverse_corridor(pts, wide_tol):
+            return True
         return bool(polyline_has_self_overlap(points, tolerance=tol))
     except Exception:
         return False
+
+
+def _route_corner_borders_water_crossing(
+    game_map: Map, pts: list, corner_index: int, *, skip_osm: bool = False,
+) -> bool:
+    """Skip turn checks at corners where an adjacent segment is an over-water span."""
+    if corner_index <= 0 or corner_index >= len(pts) - 1:
+        return False
+    x0, y0 = float(pts[corner_index - 1][0]), float(pts[corner_index - 1][1])
+    x1, y1 = float(pts[corner_index][0]), float(pts[corner_index][1])
+    x2, y2 = float(pts[corner_index + 1][0]), float(pts[corner_index + 1][1])
+    return (
+        _route_segment_is_water_crossing(game_map, x0, y0, x1, y1, skip_osm=skip_osm)
+        or _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm)
+    )
+
+
+def _route_exceeds_max_turn_except_water_corners(
+    game_map: Map,
+    points: list,
+    max_turn_degrees: float,
+    *,
+    min_segment_grid: float = 0.025,
+    skip_osm: bool = False,
+) -> bool:
+    from map_preset_utils import _polyline_xy_points, route_turn_angle_degrees
+
+    pts = _polyline_xy_points(points)
+    if len(pts) < 3:
+        return False
+    for i in range(1, len(pts) - 1):
+        if _route_corner_borders_water_crossing(game_map, pts, i, skip_osm=skip_osm):
+            continue
+        l1 = math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+        l2 = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        if l1 < min_segment_grid or l2 < min_segment_grid:
+            continue
+        if route_turn_angle_degrees(pts[i - 1], pts[i], pts[i + 1]) > float(max_turn_degrees):
+            return True
+    return False
+
+
+def _route_violates_min_turn_radius_except_water_corners(
+    game_map: Map,
+    points: list,
+    min_radius_grid: float,
+    *,
+    min_segment_grid: float = 0.025,
+    skip_osm: bool = False,
+) -> bool:
+    from map_preset_utils import _polyline_xy_points, route_turn_angle_degrees, route_approx_turn_radius_grid
+
+    pts = _polyline_xy_points(points)
+    if len(pts) < 3:
+        return False
+    for i in range(1, len(pts) - 1):
+        if _route_corner_borders_water_crossing(game_map, pts, i, skip_osm=skip_osm):
+            continue
+        l1 = math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+        l2 = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        if l1 < min_segment_grid or l2 < min_segment_grid:
+            continue
+        if route_turn_angle_degrees(pts[i - 1], pts[i], pts[i + 1]) < 8.0:
+            continue
+        if route_approx_turn_radius_grid(pts[i - 1], pts[i], pts[i + 1]) < float(min_radius_grid):
+            return True
+    return False
 
 
 def _validate_route_geometry(
@@ -110,8 +211,9 @@ def _validate_route_geometry(
     *,
     is_bus_line: bool = False,
     is_ferry_line: bool = False,
+    skip_osm: bool = False,
 ) -> None:
-    """Reject routes that double back or exceed turn limits (rail and bus; not ferries)."""
+    """Reject routes that exceed turn limits (rail and bus; not ferries). Backtracking is AI-only."""
     if is_ferry_line or not points or len(points) < 3:
         return
     from game_presets import (
@@ -120,24 +222,1040 @@ def _validate_route_geometry(
         MIN_TRAIN_TURN_RADIUS_GRID,
         ROUTE_TURN_CHECK_MIN_SEGMENT_GRID,
     )
-    from map_preset_utils import route_exceeds_max_turn, route_violates_min_turn_radius
 
     max_turn = MAX_BUS_ROUTE_TURN_DEGREES if is_bus_line else MAX_TRAIN_ROUTE_TURN_DEGREES
     min_seg = ROUTE_TURN_CHECK_MIN_SEGMENT_GRID
-    if route_exceeds_max_turn(points, max_turn, min_segment_grid=min_seg):
+    if _route_exceeds_max_turn_except_water_corners(
+        game_map, points, max_turn, min_segment_grid=min_seg, skip_osm=skip_osm,
+    ):
         kind = 'Bus' if is_bus_line else 'Train'
         raise ValueError(
             f"{kind} routes cannot turn more than {int(max_turn)}° at a corner. "
             "Use a gentler curve or a longer alignment."
         )
-    if not is_bus_line and route_violates_min_turn_radius(
-        points, MIN_TRAIN_TURN_RADIUS_GRID, min_segment_grid=min_seg
+    if not is_bus_line and _route_violates_min_turn_radius_except_water_corners(
+        game_map, points, MIN_TRAIN_TURN_RADIUS_GRID, min_segment_grid=min_seg, skip_osm=skip_osm,
     ):
         raise ValueError(
             "Turn radius is too tight for trains at one or more corners."
         )
-    if _ai_route_has_backtracking(points, game_map):
+
+
+def _route_segment_is_water_crossing(
+    game_map: Map, x1: float, y1: float, x2: float, y2: float, *, skip_osm: bool = False,
+) -> bool:
+    """True when a segment may be a straight line (open water or bridge), not a land street."""
+    ts = getattr(game_map, 'tile_system', None)
+
+    def _in_water(x, y) -> bool:
+        if ts:
+            try:
+                return bool(ts.is_point_in_water(x, y, skip_osm=skip_osm))
+            except TypeError:
+                return bool(ts.is_point_in_water(x, y))
+        preset_name = getattr(game_map, 'map_preset_name', None)
+        if preset_name:
+            from map_preset_loader import preset_has_water_areas, preset_is_point_in_water
+            if preset_has_water_areas(preset_name):
+                return bool(preset_is_point_in_water(
+                    preset_name, x, y, game_map, skip_osm=skip_osm,
+                ))
+        return False
+
+    p1_w = _in_water(x1, y1)
+    p2_w = _in_water(x2, y2)
+    if p1_w and p2_w:
+        return True
+    if ts and hasattr(ts, 'is_segment_entirely_water') and not skip_osm:
+        try:
+            if ts.is_segment_entirely_water(x1, y1, x2, y2, skip_osm=False):
+                return True
+        except TypeError:
+            if ts.is_segment_entirely_water(x1, y1, x2, y2):
+                return True
+    mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
+    if not p1_w and not p2_w and _in_water(mid_x, mid_y):
+        return True
+    return False
+
+
+def _ferry_point_near_water(game_map: Map, x: float, y: float, max_distance_m: float = 60.0) -> bool:
+    """True when a ferry terminal may be placed: on water or within max_distance_m of water."""
+    import math
+
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    if preset_name:
+        from map_preset_loader import preset_has_water_areas, preset_is_point_in_water, get_map_bounds
+        if preset_has_water_areas(preset_name):
+            if preset_is_point_in_water(preset_name, x, y, game_map, skip_osm=True):
+                return True
+            bounds = get_map_bounds(preset_name)
+            h = max(1, int(getattr(game_map, 'height', 50) or 50))
+            w = max(1, int(getattr(game_map, 'width', 50) or 50))
+            if bounds and 'min_lat' in bounds:
+                lat_span = bounds['max_lat'] - bounds['min_lat']
+                lon_span = bounds['max_lon'] - bounds['min_lon']
+                mid_lat = bounds['min_lat'] + (float(y) / h) * lat_span
+                m_per_lat = 111_000.0
+                m_per_lon = 111_000.0 * max(0.01, math.cos(math.radians(mid_lat)))
+                dlat = (max_distance_m / m_per_lat) / lat_span * h
+                dlon = (max_distance_m / m_per_lon) / lon_span * w
+                for k in range(10):
+                    ang = 2.0 * math.pi * k / 10.0
+                    sx = float(x) + dlon * math.cos(ang)
+                    sy = float(y) + dlat * math.sin(ang)
+                    if preset_is_point_in_water(preset_name, sx, sy, game_map, skip_osm=True):
+                        return True
+            return False
+    ts = getattr(game_map, 'tile_system', None)
+    if ts:
+        try:
+            if ts.is_point_in_water(x, y, skip_osm=False):
+                return True
+        except TypeError:
+            if ts.is_point_in_water(x, y):
+                return True
+        if hasattr(ts, 'is_point_near_water'):
+            return bool(ts.is_point_near_water(x, y, max_distance_m, skip_osm=False))
+    return False
+
+
+def _ferry_segment_crosses_open_water(
+    game_map: Map,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    min_fraction: float = 0.72,
+) -> bool:
+    """True when the interior of a segment is mostly open water (single ferry geometry check)."""
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    if preset_name:
+        from map_preset_loader import preset_has_water_areas, preset_is_point_in_water
+        if preset_has_water_areas(preset_name):
+            hits = 0
+            total = 0
+            end_trim = 0.12
+            for k in range(1, 11):
+                t = end_trim + (1.0 - 2.0 * end_trim) * (k / 10.0)
+                sx = x1 + t * (x2 - x1)
+                sy = y1 + t * (y2 - y1)
+                total += 1
+                if preset_is_point_in_water(preset_name, sx, sy, game_map, skip_osm=True):
+                    hits += 1
+            if total > 0 and (hits / total) >= min_fraction:
+                return True
+    ts = getattr(game_map, 'tile_system', None)
+    if ts and hasattr(ts, 'ferry_corridor_interior_mostly_water'):
+        return bool(ts.ferry_corridor_interior_mostly_water(
+            x1, y1, x2, y2, skip_osm=False, min_fraction=min_fraction,
+        ))
+    return False
+
+
+def _ai_land_straight_limit_applies(game_map: Map) -> bool:
+    """~1 km straight land limit applies only on presets with street routing (not grid chord maps)."""
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    if not preset_name:
+        return False
+    from map_preset_loader import preset_has_road_support
+    return bool(preset_has_road_support(preset_name))
+
+
+def _ai_land_straight_segment_exceeds_limit(
+    game_map: Map, x1: float, y1: float, x2: float, y2: float,
+    *, skip_osm: bool = False, planning_only: bool = False, is_ferry_line: bool = False,
+    current_year: int = None,
+) -> bool:
+    """True when a straight land chord violates street rules (ferries and water exempt).
+
+    Buses use _route_has_off_street_bus_segment instead. Other modes allow short off-street
+    connectors up to 60m when not longer than adjacent on-street segments (route-level check).
+    """
+    if is_ferry_line:
+        return False
+    if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+        return False
+    if current_year is not None and _route_land_segment_follows_street(
+        game_map, x1, y1, x2, y2, int(current_year), skip_osm=skip_osm,
+    ):
+        return False
+    from game_presets import AI_MAX_STRAIGHT_LAND_SEGMENT_GRID
+
+    dist = _grid_segment_length(x1, y1, x2, y2)
+    if dist <= float(AI_MAX_STRAIGHT_LAND_SEGMENT_GRID):
+        return False
+    if planning_only:
+        return True
+    return True
+
+
+def _bus_land_segment_follows_street(
+    game_map: Map,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> bool:
+    """True when a bus segment stays on the street network (water crossings exempt)."""
+    if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+        return True
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    if not preset_name:
+        return False
+    from map_preset_loader import get_preset_bus_segment_follows_street, preset_has_road_support
+
+    if not preset_has_road_support(preset_name):
+        return False
+    return get_preset_bus_segment_follows_street(
+        preset_name, game_map, x1, y1, x2, y2, int(current_year),
+    )
+
+
+def _route_has_off_street_bus_segment(
+    game_map: Map, points: list, *, skip_osm: bool = False, current_year: int = None,
+) -> bool:
+    """True when a bus route leaves the street network on land (beyond short connectors)."""
+    if not points or len(points) < 2:
+        return False
+    cy = int(current_year) if current_year is not None else 1830
+    for i in range(len(points) - 1):
+        x1, y1 = float(points[i][0]), float(points[i][1])
+        x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
+        if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+            continue
+        if _bus_land_segment_follows_street(
+            game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm,
+        ):
+            continue
+        if _bus_connector_valid_at_route_index(
+            game_map, points, i, cy, skip_osm=skip_osm,
+        ):
+            continue
+    return True
+    return False
+
+
+def _ai_route_has_overlong_land_straight_segment(
+    game_map: Map, points: list, *, skip_osm: bool = False, planning_only: bool = False,
+    is_ferry_line: bool = False, is_bus_line: bool = False, current_year: int = None,
+) -> bool:
+    if is_ferry_line or not points or len(points) < 2:
+        return False
+    if is_bus_line:
+        return _route_has_off_street_bus_segment(
+            game_map, points, skip_osm=skip_osm, current_year=current_year,
+        )
+    cy = int(current_year) if current_year is not None else 1830
+    for i in range(len(points) - 1):
+        x1, y1 = float(points[i][0]), float(points[i][1])
+        x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
+        if _ai_land_straight_segment_exceeds_limit(
+            game_map, x1, y1, x2, y2, skip_osm=skip_osm, planning_only=planning_only,
+            is_ferry_line=is_ferry_line, current_year=current_year,
+        ):
+            return True
+        if (
+            not _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm)
+            and not _route_land_segment_follows_street(
+                game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm,
+            )
+            and not _straight_connector_valid_at_route_index(
+                game_map, points, i, cy, skip_osm=skip_osm,
+            )
+        ):
+            return True
+    if _ai_route_has_excessive_inter_street_connectors(
+        game_map, points, current_year=cy, skip_osm=skip_osm,
+        ):
+            return True
+    return False
+
+
+def _land_segment_is_short_straight_connector(x1: float, y1: float, x2: float, y2: float) -> bool:
+    """True for straight land chords up to the max off-street connector length."""
+    from game_presets import AI_MAX_STRAIGHT_LAND_SEGMENT_GRID
+
+    return _grid_segment_length(x1, y1, x2, y2) <= float(AI_MAX_STRAIGHT_LAND_SEGMENT_GRID) + 1e-9
+
+
+def _straight_connector_valid_at_route_index(
+    game_map: Map,
+    points: list,
+    seg_idx: int,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> bool:
+    """True when a land straight connector is not longer than adjacent on-street segments (water exempt)."""
+    if not points or seg_idx < 0 or seg_idx >= len(points) - 1:
+        return False
+    x1, y1 = float(points[seg_idx][0]), float(points[seg_idx][1])
+    x2, y2 = float(points[seg_idx + 1][0]), float(points[seg_idx + 1][1])
+    if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+        return True
+    cy = int(current_year)
+    if _route_land_segment_follows_street(game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm):
+        return True
+    conn_len = _grid_segment_length(x1, y1, x2, y2)
+    street_limits = []
+    if seg_idx > 0:
+        px1, py1 = float(points[seg_idx - 1][0]), float(points[seg_idx - 1][1])
+        if _route_land_segment_follows_street(game_map, px1, py1, x1, y1, cy, skip_osm=skip_osm):
+            street_limits.append(_grid_segment_length(px1, py1, x1, y1))
+    if seg_idx < len(points) - 2:
+        nx2, ny2 = float(points[seg_idx + 2][0]), float(points[seg_idx + 2][1])
+        if _route_land_segment_follows_street(game_map, x2, y2, nx2, ny2, cy, skip_osm=skip_osm):
+            street_limits.append(_grid_segment_length(x2, y2, nx2, ny2))
+    if not street_limits:
+        return False
+    return all(conn_len <= lim + 1e-9 for lim in street_limits)
+
+
+def _segment_on_bridge_or_tunnel(
+    game_map: Map, x1: float, y1: float, x2: float, y2: float, current_year: int,
+) -> bool:
+    """True when a segment lies on a historic bridge or tunnel (street elevation allowed over water)."""
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    if not preset_name:
+        return False
+    from map_preset_loader import get_preset_is_point_on_bridge
+    cy = int(current_year)
+    for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+        px = x1 + t * (x2 - x1)
+        py = y1 + t * (y2 - y1)
+        if get_preset_is_point_on_bridge(preset_name, px, py, cy, game_map):
+            return True
+    return False
+
+
+def _bus_connector_valid_at_route_index(
+    game_map: Map,
+    points: list,
+    seg_idx: int,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> bool:
+    """True when a bus off-street segment is a short connector between on-street segments."""
+    from game_presets import AI_BUS_MAX_CONNECTOR_GRID
+
+    if not points or seg_idx < 0 or seg_idx >= len(points) - 1:
+        return False
+    x1, y1 = float(points[seg_idx][0]), float(points[seg_idx][1])
+    x2, y2 = float(points[seg_idx + 1][0]), float(points[seg_idx + 1][1])
+    if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+        return False
+    cy = int(current_year)
+    if _route_land_segment_follows_street(game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm):
+        return False
+    conn_len = _grid_segment_length(x1, y1, x2, y2)
+    if conn_len > float(AI_BUS_MAX_CONNECTOR_GRID) + 1e-9:
+        return False
+    has_prev_street = False
+    has_next_street = False
+    if seg_idx > 0:
+        px1, py1 = float(points[seg_idx - 1][0]), float(points[seg_idx - 1][1])
+        has_prev_street = _route_land_segment_follows_street(
+            game_map, px1, py1, x1, y1, cy, skip_osm=skip_osm,
+        )
+    if seg_idx < len(points) - 2:
+        nx2, ny2 = float(points[seg_idx + 2][0]), float(points[seg_idx + 2][1])
+        has_next_street = _route_land_segment_follows_street(
+            game_map, x2, y2, nx2, ny2, cy, skip_osm=skip_osm,
+        )
+    return has_prev_street and has_next_street
+
+
+_STREET_ALIGNED_ELEVATIONS = frozenset({'street', 'above_ground'})
+_WATER_SEGMENT_ELEVATIONS = ('above_ground', 'underground')
+_LAND_SEGMENT_ELEVATIONS = ('street', 'above_ground', 'underground')
+
+
+def _segment_elevation_requires_street_alignment(elevation: str) -> bool:
+    """True when a segment must follow streets (not free-form chords on land)."""
+    return (elevation or 'street').strip().lower() in _STREET_ALIGNED_ELEVATIONS
+
+
+def _normalize_route_elevation_levels(
+    points: list,
+    elevation_levels: list = None,
+    *,
+    is_bus_line: bool = False,
+    is_ferry_line: bool = False,
+    cost_info: dict = None,
+) -> list:
+    """Return one elevation per segment, padding with mode-appropriate defaults."""
+    n = max(0, len(points) - 1)
+    if n <= 0:
+        return []
+    elev = list(elevation_levels or [])
+    if not elev and cost_info:
+        elev = list(cost_info.get('elevation_levels') or [])
+    default = 'water' if is_ferry_line else ('street' if is_bus_line else 'above_ground')
+    if len(elev) < n:
+        elev = elev + [default] * (n - len(elev))
+    return elev[:n]
+
+
+def _merged_route_elevation_levels(
+    line,
+    merged_points: list,
+    additional_points: list,
+    extend_from_end: bool,
+    extension_elevation_levels: list = None,
+    *,
+    is_bus_line: bool = False,
+) -> list:
+    """Elevation per segment for a line plus extension (for street-alignment validation)."""
+    n = max(0, len(merged_points) - 1)
+    if n <= 0:
+        return []
+    default = 'street' if is_bus_line else 'above_ground'
+    old_route = list(line.get_route() or []) if line and hasattr(line, 'get_route') else []
+    n_old = max(0, len(old_route) - 1)
+    old_elevs = list(getattr(line, 'elevation_levels', None) or [])
+    if len(old_elevs) < n_old:
+        old_elevs = old_elevs + [default] * (n_old - len(old_elevs))
+    old_elevs = old_elevs[:n_old]
+    n_new = max(0, n - n_old)
+    ext_elevs = list(extension_elevation_levels or [])
+    if len(ext_elevs) < n_new:
+        ext_elevs = ext_elevs + [default] * (n_new - len(ext_elevs))
+    ext_elevs = ext_elevs[:n_new]
+    if extend_from_end:
+        combined = old_elevs + ext_elevs
+    else:
+        combined = ext_elevs + old_elevs
+    if len(combined) < n:
+        combined = combined + [default] * (n - len(combined))
+    return combined[:n]
+
+
+def _route_land_segment_follows_street(
+    game_map: Map, x1: float, y1: float, x2: float, y2: float, current_year: int,
+    *, skip_osm: bool = False,
+) -> bool:
+    """True when a land segment lies on streets (endpoints and midpoint on road or bridge)."""
+    if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+        return True
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    if not preset_name:
+        return True
+    from map_preset_loader import (
+        get_preset_is_point_on_bridge,
+        get_preset_is_point_on_road,
+        get_preset_point_near_street_centerline,
+        preset_has_road_support,
+    )
+    if not preset_has_road_support(preset_name):
+        return True
+
+    cy = int(current_year)
+
+    def _on_street(x: float, y: float) -> bool:
+        if get_preset_is_point_on_road(preset_name, x, y, cy, game_map):
+            return True
+        return bool(get_preset_is_point_on_bridge(preset_name, x, y, cy, game_map))
+
+    def _midpoint_on_street() -> bool:
+        mid_x = x1 + 0.5 * (x2 - x1)
+        mid_y = y1 + 0.5 * (y2 - y1)
+        if _on_street(mid_x, mid_y):
+            return True
+        return get_preset_point_near_street_centerline(preset_name, game_map, mid_x, mid_y, cy)
+
+    for t in (0.0, 1.0):
+        px = x1 + t * (x2 - x1)
+        py = y1 + t * (y2 - y1)
+        if not _on_street(px, py):
+            return False
+    if not _midpoint_on_street():
+        return False
+
+    seg_len = _grid_segment_length(x1, y1, x2, y2)
+    from game_presets import AI_MAX_STRAIGHT_LAND_SEGMENT_GRID
+    if seg_len > float(AI_MAX_STRAIGHT_LAND_SEGMENT_GRID):
+        for i in range(1, 8):
+            if i == 4:
+                continue
+            t = i / 8.0
+            px = x1 + t * (x2 - x1)
+            py = y1 + t * (y2 - y1)
+            if not _on_street(px, py):
+                return False
+    return True
+
+
+def _grid_segment_length(x1: float, y1: float, x2: float, y2: float) -> float:
+    import math
+    return math.hypot(float(x2) - float(x1), float(y2) - float(y1))
+
+
+def _off_street_segment_cost_multiplier(
+    game_map: Map, x1: float, y1: float, x2: float, y2: float, current_year: int,
+    *, is_bus_line: bool = False,
+) -> float:
+    from game_presets import (
+        OFF_STREET_SEGMENT_COST_MULTIPLIER,
+        AI_OFF_STREET_FREE_SEGMENT_GRID,
+        AI_BUS_CONNECTOR_COST_MULTIPLIER,
+        AI_BUS_MAX_CONNECTOR_GRID,
+    )
+
+    if _route_land_segment_follows_street(game_map, x1, y1, x2, y2, current_year):
+        return 1.0
+    seg_len = _grid_segment_length(x1, y1, x2, y2)
+    if is_bus_line and seg_len <= float(AI_BUS_MAX_CONNECTOR_GRID) + 1e-9:
+        return float(AI_BUS_CONNECTOR_COST_MULTIPLIER)
+    if seg_len <= float(AI_OFF_STREET_FREE_SEGMENT_GRID):
+        return 1.0
+    return float(OFF_STREET_SEGMENT_COST_MULTIPLIER)
+
+
+def _ai_route_off_street_cost_multiplier(
+    game_map: Map, route_points: list, current_year: int, *, is_bus_line: bool = False,
+) -> float:
+    """>1 when the route leaves streets (matches build-cost penalty per segment)."""
+    if not route_points or len(route_points) < 2:
+        return 1.0
+    mult = 1.0
+    cy = int(current_year)
+    for i in range(len(route_points) - 1):
+        x1, y1 = float(route_points[i][0]), float(route_points[i][1])
+        x2, y2 = float(route_points[i + 1][0]), float(route_points[i + 1][1])
+        mult *= _off_street_segment_cost_multiplier(
+            game_map, x1, y1, x2, y2, cy, is_bus_line=is_bus_line,
+        )
+    return float(mult)
+
+
+def _route_off_street_length_fraction(
+    game_map: Map, route_points: list, current_year: int,
+) -> float:
+    """Share of route length on off-street land segments (water is never off-street).
+
+    Off-street = any non-water segment that does not follow a street/road polyline.
+    Short connectors are exempt from the maintenance surcharge only.
+    """
+    from game_presets import AI_OFF_STREET_FREE_SEGMENT_GRID
+
+    if not route_points or len(route_points) < 2:
+        return 0.0
+    total_len = 0.0
+    penalized_len = 0.0
+    free_len = float(AI_OFF_STREET_FREE_SEGMENT_GRID)
+    cy = int(current_year)
+    for i in range(len(route_points) - 1):
+        x1, y1 = float(route_points[i][0]), float(route_points[i][1])
+        x2, y2 = float(route_points[i + 1][0]), float(route_points[i + 1][1])
+        seg_len = _grid_segment_length(x1, y1, x2, y2)
+        total_len += seg_len
+        # Water is not off-street (ferries / bridges over water).
+        if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=True):
+            continue
+        if seg_len <= free_len:
+            continue
+        if not _route_land_segment_follows_street(game_map, x1, y1, x2, y2, cy, skip_osm=True):
+            penalized_len += seg_len
+    if total_len <= 0.0:
+        return 0.0
+    return penalized_len / total_len
+
+
+def _route_street_water_and_connector_lengths(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> tuple:
+    """Return (street_or_water_len, off_street_len, total_len) for an AI route.
+
+    Off-street = any non-water segment not on a street/road polyline (no free-length exemption).
+    """
+    if not route_points or len(route_points) < 2:
+        return 0.0, 0.0, 0.0
+    street_water_len = 0.0
+    off_street_len = 0.0
+    total_len = 0.0
+    cy = int(current_year)
+    for i in range(len(route_points) - 1):
+        x1, y1 = float(route_points[i][0]), float(route_points[i][1])
+        x2, y2 = float(route_points[i + 1][0]), float(route_points[i + 1][1])
+        seg_len = _grid_segment_length(x1, y1, x2, y2)
+        total_len += seg_len
+        if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+            street_water_len += seg_len
+        elif _route_land_segment_follows_street(
+            game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm,
+        ):
+            street_water_len += seg_len
+        else:
+            # Off-street: land segment not designed to follow a street.
+            off_street_len += seg_len
+    return street_water_len, off_street_len, total_len
+
+
+def _route_osm_polyline_water_and_connector_lengths(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> tuple:
+    """Return (osm_polyline_len, water_len, connector_len, total_len) for an AI rail route.
+
+    osm_polyline_len counts land segments that hug OSM road centerlines (not chords between
+    separate polylines). water_len counts water crossings. connector_len is everything else.
+    """
+    if not route_points or len(route_points) < 2:
+        return 0.0, 0.0, 0.0, 0.0
+    osm_polyline_len = 0.0
+    water_len = 0.0
+    connector_len = 0.0
+    total_len = 0.0
+    cy = int(current_year)
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    use_osm_polyline = bool(preset_name)
+    for i in range(len(route_points) - 1):
+        x1, y1 = float(route_points[i][0]), float(route_points[i][1])
+        x2, y2 = float(route_points[i + 1][0]), float(route_points[i + 1][1])
+        seg_len = _grid_segment_length(x1, y1, x2, y2)
+        total_len += seg_len
+        if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+            water_len += seg_len
+        elif use_osm_polyline:
+            from map_preset_loader import preset_has_road_support
+            from map_presets_nyc_road_utils import route_land_segment_on_osm_polyline
+
+            if preset_has_road_support(preset_name) and route_land_segment_on_osm_polyline(
+                game_map, x1, y1, x2, y2, cy,
+            ):
+                osm_polyline_len += seg_len
+            elif _route_land_segment_follows_street(
+                game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm,
+            ):
+                connector_len += seg_len
+            else:
+                connector_len += seg_len
+        elif _route_land_segment_follows_street(
+            game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm,
+        ):
+            osm_polyline_len += seg_len
+        else:
+            connector_len += seg_len
+    return osm_polyline_len, water_len, connector_len, total_len
+
+
+def _ai_route_majority_on_osm_polylines(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> bool:
+    """True when strictly more than 50% of route length is on OSM polylines or over water."""
+    if not route_points or len(route_points) < 2:
+        return True
+    osm_len, water_len, _connector_len, total_len = _route_osm_polyline_water_and_connector_lengths(
+        game_map, route_points, current_year, skip_osm=skip_osm,
+    )
+    if total_len <= 0.0:
+        return True
+    return (osm_len + water_len) / total_len > 0.5 + 1e-12
+
+
+def _route_inter_street_connector_length_fraction(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> float:
+    """Share of route length that is off-street (non-water, not on a street polyline)."""
+    _, off_street_len, total_len = _route_street_water_and_connector_lengths(
+        game_map, route_points, current_year, skip_osm=skip_osm,
+    )
+    if total_len <= 0.0:
+        return 0.0
+    return off_street_len / total_len
+
+
+def _ai_route_street_water_length_exceeds_connectors(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> bool:
+    """True when strictly more than half of route length is on streets or water."""
+    return _ai_route_majority_on_streets_and_water(
+        game_map, route_points, current_year, skip_osm=skip_osm,
+    )
+
+
+def _ai_route_majority_on_streets_and_water(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+    max_connector_fraction: float = None,
+) -> bool:
+    """True when strictly more than 50% of route length is on streets or over water.
+
+    Off-street for AI = any non-water segment not on a street/road polyline (no free exemption).
+    """
+    if not route_points or len(route_points) < 2:
+        return True
+    street_water_len, off_street_len, total_len = _route_street_water_and_connector_lengths(
+        game_map, route_points, current_year, skip_osm=skip_osm,
+    )
+    if total_len <= 0.0:
+        return True
+    # Strictly more than half on street or water.
+    if street_water_len / total_len <= 0.5 + 1e-12:
+        return False
+    if max_connector_fraction is not None:
+        return (off_street_len / total_len) < float(max_connector_fraction) - 1e-9
+    return True
+
+
+def _ai_route_has_excessive_inter_street_connectors(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = False,
+) -> bool:
+    return not _ai_route_majority_on_streets_and_water(
+        game_map, route_points, current_year, skip_osm=skip_osm,
+    )
+
+
+def _ai_route_street_water_requirement_error(
+    game_map: Map,
+    route_points: list,
+    current_year: int,
+    *,
+    skip_osm: bool = True,
+    for_extension: bool = False,
+) -> str | None:
+    """Error message when an AI rail route fails street/water or OSM-polyline rules; None if ok."""
+    if not _ai_route_majority_on_streets_and_water(
+        game_map, route_points, current_year, skip_osm=skip_osm,
+    ):
+        street_water_len, off_street_len, total_len = _route_street_water_and_connector_lengths(
+            game_map, route_points, current_year, skip_osm=skip_osm,
+        )
+        pct = (100.0 * street_water_len / total_len) if total_len > 0 else 0.0
+        kind = "Extensions" if for_extension else "AI lines"
+        return (
+            f"{kind} must be more than 50% on streets or water "
+            f"(off-street = any non-water segment not on a street). "
+            f"This route is only {pct:.0f}% street/water "
+            f"({street_water_len:.2f} on-street/water vs {off_street_len:.2f} off-street)."
+        )
+    if not _ai_route_majority_on_osm_polylines(
+        game_map, route_points, current_year, skip_osm=skip_osm,
+    ):
+        osm_len, water_len, connector_len, total_len = _route_osm_polyline_water_and_connector_lengths(
+            game_map, route_points, current_year, skip_osm=skip_osm,
+        )
+        qualifying = osm_len + water_len
+        pct = (100.0 * qualifying / total_len) if total_len > 0 else 0.0
+        kind = "Extensions" if for_extension else "AI rail lines"
+        return (
+            f"{kind} must be more than 50% on OSM road polylines or water "
+            f"(straight connectors between polylines do not count). "
+            f"This route is only {pct:.0f}% on OSM polylines/water "
+            f"({osm_len:.2f} on OSM polylines, {water_len:.2f} water, "
+            f"{connector_len:.2f} connectors)."
+        )
+    return None
+
+
+def calc_line_maintenance_with_off_street_surcharge(
+    game_map: Map, line, current_year: int,
+) -> int:
+    """Line maintenance including off-street segment surcharge (short connectors exempt)."""
+    if not hasattr(line, 'calc_maitnance'):
+        return 0
+    base = line.calc_maitnance(current_year)
+    route = line.get_route() if hasattr(line, 'get_route') else []
+    if route and len(route) >= 2 and game_map is not None:
+        from game_presets import OFF_STREET_MAINTENANCE_COST_BONUS_PER_FRACTION
+        frac = _route_off_street_length_fraction(game_map, route, current_year)
+        if frac > 0:
+            base = int(round(base * (1.0 + float(OFF_STREET_MAINTENANCE_COST_BONUS_PER_FRACTION) * frac)))
+    return int(base)
+
+
+def _ai_route_fully_follows_streets(
+    game_map: Map, route_points: list, current_year: int, *, skip_osm: bool = False,
+) -> bool:
+    if not route_points or len(route_points) < 2:
+        return True
+    cy = int(current_year)
+    for i in range(len(route_points) - 1):
+        x1, y1 = float(route_points[i][0]), float(route_points[i][1])
+        x2, y2 = float(route_points[i + 1][0]), float(route_points[i + 1][1])
+        if not _route_land_segment_follows_street(
+            game_map, x1, y1, x2, y2, cy, skip_osm=skip_osm,
+        ):
+            return False
+    return True
+
+
+def _enforce_route_street_rules_or_raise(
+    game_map: Map,
+    points: list,
+    *,
+    current_year: int,
+    is_bus_line: bool = False,
+    is_ferry_line: bool = False,
+    for_extension: bool = False,
+    skip_osm: bool = False,
+    for_ai: bool = False,
+) -> None:
+    """Raise ValueError when a land route leaves the street network."""
+    if is_ferry_line or not points or len(points) < 2:
+        return
+    cy = int(current_year)
+    if is_bus_line:
+        if _route_has_off_street_bus_segment(game_map, points, skip_osm=skip_osm, current_year=cy):
+            msg = (
+                "Bus extensions must stay on streets. Turn onto intersecting streets "
+                "at corners — no off-street shortcuts."
+                if for_extension
+                else "Bus routes must stay on streets. Follow road polylines and turn "
+                "onto intersecting streets at corners — no off-street shortcuts."
+            )
+            raise ValueError(msg)
+        return
+    if not for_ai or not _ai_land_straight_limit_applies(game_map):
+        return
+    majority_err = _ai_route_street_water_requirement_error(
+        game_map, points, cy, skip_osm=skip_osm, for_extension=for_extension,
+    )
+    if majority_err:
+        raise ValueError(majority_err)
+    if _ai_route_has_overlong_land_straight_segment(
+        game_map, points, skip_osm=skip_osm, current_year=cy, is_bus_line=False,
+    ):
+        msg = (
+            "Extensions: off-street connectors cannot exceed adjacent on-street segment lengths."
+            if for_extension
+            else "Off-street connectors cannot exceed adjacent on-street segment lengths."
+        )
+        raise ValueError(msg)
+
+
+def _normalize_build_point(pt) -> tuple[float, float]:
+    x, y = pt[0], pt[1]
+    if isinstance(x, (list, tuple)):
+        x, y = float(x[0]), float(x[1])
+    elif hasattr(x, 'x'):
+        x, y = float(x.x), float(x.y)
+    else:
+        x, y = float(x), float(y)
+    return x, y
+
+
+def _assert_points_in_buildable_area(game_map: Map, points: list) -> None:
+    if not points or not hasattr(game_map, 'is_point_in_buildable_area'):
+        return
+    for i, pt in enumerate(points):
+        x, y = _normalize_build_point(pt)
+        if not game_map.is_point_in_buildable_area(x, y):
+            raise ValueError(
+                f"Point {i + 1} at ({x:.1f}, {y:.1f}) is outside the buildable area. "
+                "Lines can only be built within the play area."
+            )
+
+
+def _validate_land_line_route_for_build(
+    game_map: Map,
+    route_points: list,
+    *,
+    current_year: int,
+    is_bus_line: bool,
+    is_ferry_line: bool,
+    player: Player = None,
+    ai_fast: bool = False,
+    skip_osm: bool = False,
+    for_extension: bool = False,
+    elevation_levels: list = None,
+    cost_info: dict = None,
+    use_fast_path: bool = False,
+    human_cost_previewed: bool = False,
+) -> dict:
+    """Shared geometry, street, tile, and land-route checks for create and extend."""
+    if is_ferry_line or not route_points or len(route_points) < 2:
+        return {'success': True}
+
+    if not ai_fast or is_bus_line:
+        _validate_route_geometry(
+            route_points, game_map, is_bus_line=is_bus_line, is_ferry_line=is_ferry_line,
+            skip_osm=skip_osm,
+        )
+    if player is not None and getattr(player, 'is_ai', False) and _ai_route_has_backtracking(route_points, game_map):
         raise ValueError("This route doubles back on itself.")
+    route_for_ai = player is not None and getattr(player, 'is_ai', False)
+    if not ai_fast or is_bus_line:
+        _enforce_route_street_rules_or_raise(
+            game_map, route_points, current_year=current_year,
+            is_bus_line=is_bus_line, is_ferry_line=is_ferry_line,
+            for_extension=for_extension, skip_osm=skip_osm, for_ai=route_for_ai,
+        )
+    if player is not None and getattr(player, 'is_ai', False) and not is_bus_line:
+        majority_err = _ai_route_street_water_requirement_error(
+            game_map, route_points, current_year, skip_osm=True, for_extension=for_extension,
+        )
+        if majority_err:
+            raise ValueError(majority_err)
+
+    if ai_fast and not is_bus_line:
+        return {'success': True}
+    if use_fast_path:
+        return {'success': True}
+
+    if game_map.tile_system and not is_bus_line:
+        if human_cost_previewed:
+            game_map.tile_system._preset_only_water = True
+        elif hasattr(game_map.tile_system, 'set_water_check_deadline'):
+            game_map.tile_system.set_water_check_deadline(5.0)
+    try:
+        if (
+            game_map.tile_system
+            and not is_bus_line
+            and not human_cost_previewed
+        ):
+            game_map.tile_system.pre_cache_route_tiles(route_points, proximity_buffer_m=0.0)
+
+        route_elevs = _normalize_route_elevation_levels(
+            route_points,
+            elevation_levels,
+            is_bus_line=is_bus_line,
+            is_ferry_line=False,
+            cost_info=cost_info,
+        )
+        return _validate_route_streets_on_land(
+            route_points,
+            game_map,
+            current_year,
+            is_bus_line=is_bus_line,
+            is_ferry_line=False,
+            elevation_levels=route_elevs,
+            skip_osm=skip_osm,
+        )
+    finally:
+        if game_map.tile_system:
+            if hasattr(game_map.tile_system, '_preset_only_water'):
+                game_map.tile_system._preset_only_water = False
+            if hasattr(game_map.tile_system, 'clear_water_check_deadline'):
+                game_map.tile_system.clear_water_check_deadline()
+
+
+def _validate_route_streets_on_land(
+    points: list,
+    game_map: Map,
+    current_year: int,
+    *,
+    is_bus_line: bool = False,
+    is_ferry_line: bool = False,
+    elevation_levels: list = None,
+    skip_osm: bool = False,
+) -> dict:
+    """Land segments at street/above_ground must follow streets; underground may tunnel freely."""
+    if is_ferry_line or not points:
+        return {'success': True}
+    preset_name = getattr(game_map, 'map_preset_name', None)
+    if not preset_name:
+        return {'success': True}
+    from map_preset_loader import preset_has_road_support, get_preset_is_point_on_road
+    if not preset_has_road_support(preset_name):
+        return {'success': True}
+
+    ts = getattr(game_map, 'tile_system', None)
+    use_osm = bool(getattr(game_map, 'use_osm', False))
+    kind = 'Bus' if is_bus_line else 'Train'
+    default_elev = 'street' if is_bus_line else 'above_ground'
+    seg_elevs = _normalize_route_elevation_levels(
+        points, elevation_levels, is_bus_line=is_bus_line, is_ferry_line=is_ferry_line,
+    )
+
+    def _segment_requires_streets(seg_idx: int) -> bool:
+        elev = seg_elevs[seg_idx] if seg_idx < len(seg_elevs) else default_elev
+        return _segment_elevation_requires_street_alignment(elev)
+
+    def _point_requires_street_alignment(pt_idx: int) -> bool:
+        if pt_idx <= 0:
+            return _segment_requires_streets(0)
+        if pt_idx >= len(points) - 1:
+            return _segment_requires_streets(len(points) - 2)
+        return _segment_requires_streets(pt_idx - 1) or _segment_requires_streets(pt_idx)
+
+    if len(points) == 1:
+        x, y = points[0]
+        if not _point_requires_street_alignment(0):
+            return {'success': True}
+        if not get_preset_is_point_on_road(preset_name, x, y, current_year, game_map):
+            return {
+                'success': False,
+                'error_message': (
+                    f"{kind} routes must be on streets. Point at ({x:.1f}, {y:.1f}) is not on a road."
+                ),
+            }
+        return {'success': True}
+
+    for i in range(len(points) - 1):
+        x1, y1 = points[i]
+        x2, y2 = points[i + 1]
+        if not _segment_requires_streets(i):
+            continue
+        if _route_segment_is_water_crossing(game_map, x1, y1, x2, y2, skip_osm=skip_osm):
+            continue
+        if is_bus_line:
+            if _bus_land_segment_follows_street(
+                game_map, x1, y1, x2, y2, int(current_year),
+            ):
+                continue
+            if _bus_connector_valid_at_route_index(
+                game_map, points, i, int(current_year), skip_osm=skip_osm,
+            ):
+                continue
+            return {
+                'success': False,
+                'error_message': (
+                    "Bus routes must stay on streets. They may use short connectors (≤2 m) "
+                    "between street segments but cannot cut across blocks. Segment "
+                    f"{i + 1} from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) leaves the street network."
+                ),
+            }
+            continue
+        if not _route_land_segment_follows_street(
+            game_map, x1, y1, x2, y2, int(current_year),
+        ):
+            if (
+                _straight_connector_valid_at_route_index(
+                    game_map, points, i, int(current_year),
+                )
+            ):
+                continue
+            return {
+                'success': False,
+                'error_message': (
+                    f"{kind} routes at street or above-ground level must follow streets on land. "
+                    f"Segment {i + 1} from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is not on a road."
+                ),
+            }
+
+    return {'success': True}
 
 
 def _segment_overlaps_existing_routes(p1, p2, existing_routes: list, tolerance: float) -> bool:
@@ -210,19 +1328,130 @@ def _collect_routes_for_overlap_validation(game_map, build_queue: list, exclude_
     return routes
 
 
+def _extension_attach_from_closest_end(route: list, click_point) -> bool:
+    """True when an extension should connect at the route end (vs route start)."""
+    import math
+    if not route:
+        return True
+    cx, cy = _normalize_route_point(click_point)
+    sx, sy = _normalize_route_point(route[0])
+    ex, ey = _normalize_route_point(route[-1])
+    start_d = math.hypot(cx - sx, cy - sy)
+    end_d = math.hypot(cx - ex, cy - ey)
+    return end_d <= start_d
+
+
 def _ai_merged_line_route(existing_route: list, additional_points: list, extend_from_end: bool) -> list:
-    """Full polyline after an extension (for backtracking validation)."""
+    """Full polyline after an extension (for backtracking / street validation).
+
+    Segments are: existing_end→first new point, then between each new point in order
+    (or last new point→existing_start when extending from the beginning).
+    """
     if not existing_route:
         return list(additional_points or [])
     if not additional_points:
         return list(existing_route)
     if extend_from_end:
-        merged = list(existing_route)
-        merged.extend(additional_points[1:] if len(additional_points) > 1 else additional_points)
-        return merged
-    merged = list(additional_points)
-    merged.extend(existing_route[1:] if len(existing_route) > 1 else existing_route)
-    return merged
+        return list(existing_route) + list(additional_points)
+    return list(additional_points) + list(existing_route)
+
+
+def _normalize_route_point(p) -> tuple:
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        return (float(p[0]), float(p[1]))
+    if hasattr(p, 'x') and hasattr(p, 'y'):
+        return (float(p.x), float(p.y))
+    return (float(p), float(p))
+
+
+def _polyline_metrics(points: list) -> tuple:
+    """Return (total_length, per_segment_lengths) for a route polyline."""
+    import math
+    if not points or len(points) < 2:
+        return 0.0, []
+    lengths = []
+    total = 0.0
+    for i in range(len(points) - 1):
+        x1, y1 = _normalize_route_point(points[i])
+        x2, y2 = _normalize_route_point(points[i + 1])
+        seg_len = math.hypot(x2 - x1, y2 - y1)
+        lengths.append(seg_len)
+        total += seg_len
+    return total, lengths
+
+
+def _line_build_work_units(total_length: float) -> float:
+    from game_presets import LINE_BUILD_SPEED_MULTIPLIER
+    return max(0.25, float(total_length) + 0.25) / float(LINE_BUILD_SPEED_MULTIPLIER)
+
+
+def _batch_polyline_segments_for_build(
+    points: list,
+    elevation_levels: list = None,
+    *,
+    batch_size: int = None,
+    max_batch_length: float = None,
+) -> list:
+    """Group consecutive polyline segments into fewer build-queue jobs."""
+    from game_presets import LINE_BUILD_SEGMENT_BATCH_SIZE, LINE_BUILD_SEGMENT_BATCH_MAX_LENGTH_GRID
+
+    if not points or len(points) < 2:
+        return []
+    if batch_size is None:
+        batch_size = int(LINE_BUILD_SEGMENT_BATCH_SIZE)
+    if max_batch_length is None:
+        max_batch_length = float(LINE_BUILD_SEGMENT_BATCH_MAX_LENGTH_GRID)
+    batch_size = max(1, batch_size)
+    max_batch_length = max(0.05, max_batch_length)
+
+    n_segments = len(points) - 1
+    _, seg_lengths = _polyline_metrics(points)
+    batches = []
+    seg_start = 0
+    while seg_start < n_segments:
+        seg_end = seg_start
+        batch_len = 0.0
+        count = 0
+        while seg_end < n_segments and count < batch_size:
+            next_len = seg_lengths[seg_end] if seg_end < len(seg_lengths) else 0.0
+            if count > 0 and batch_len + next_len > max_batch_length:
+                break
+            batch_len += next_len
+            seg_end += 1
+            count += 1
+        if seg_end == seg_start:
+            seg_end = seg_start + 1
+        batch_points = [_normalize_route_point(p) for p in points[seg_start:seg_end + 1]]
+        seg_elev = None
+        if elevation_levels:
+            seg_elev = list(elevation_levels[seg_start:seg_end])
+        batches.append({
+            'points': batch_points,
+            'segment_index': seg_start,
+            'total_segments': n_segments,
+            'elevation_levels': seg_elev,
+        })
+        seg_start = seg_end
+    return batches
+
+
+def _merge_route_with_completed_build_points(existing_route: list, build_points: list) -> list:
+    """Append a completed line-build batch onto an existing partial route."""
+    if not build_points:
+        return list(existing_route or [])
+    incoming = [_normalize_route_point(p) for p in build_points]
+    route = [_normalize_route_point(p) for p in (existing_route or [])]
+    if not route:
+        return incoming
+    last = route[-1]
+    first = incoming[0]
+    if abs(last[0] - first[0]) < 1e-9 and abs(last[1] - first[1]) < 1e-9:
+        route.extend(incoming[1:])
+    else:
+        for p in incoming:
+            if not route or route[-1] != p:
+                route.append(p)
+    return route
 
 
 def generate_players(player_names: list[str], starting_money: int = 10000, ai_player_indices: list[int] = None, ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, map_preset_name: str = None) -> list[Player]:
@@ -266,17 +1495,20 @@ def generate_players(player_names: list[str], starting_money: int = 10000, ai_pl
                 name = get_transit_company_name(used_names, map_preset_name=map_preset_name)
             focus = (ai_focus_per_player or {}).get(i)
             ai_focus = focus if focus in AI_FOCUSES else random.choice(AI_FOCUSES)
+            from game_presets import AI_DEFAULT_DIFFICULTY
             diff = (ai_difficulty_per_player or {}).get(i)
-            ai_difficulty = diff if diff in AI_DIFFICULTIES else random.choice(AI_DIFFICULTIES)
+            ai_difficulty = diff if diff in AI_DIFFICULTIES else AI_DEFAULT_DIFFICULTY
         else:
             ai_focus = None
             ai_difficulty = None
         used_names.add(name)
         player = Player(player_id=i, money=starting_money, trainsets=starting_trainsets, name=name, line_names=[], is_ai=is_ai, ai_focus=ai_focus, ai_difficulty=ai_difficulty)
         players.append(player)
+    from player_colors import assign_color_indices_for_new_players
+    assign_color_indices_for_new_players(players)
     return players
 
-def setup_game(player_names: list[str], map_width: int = 100, map_height: int = 75, starting_money: Optional[int] = None, worker_replenishment_rate: float = 1.0, natural_disaster_frequency: float = 1.0, use_osm: bool = False, map_center_lat: float = None, map_center_lon: float = None, marketplace_years_visible: int = None, map_preset_name: str = None, line_build_speed_multiplier: float = None, marketplace_bulk_discount_percent: float = None, marketplace_bulk_discount_threshold: int = None, ai_player_indices: list[int] = None, ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, random_ai_spawn_enabled: bool = True, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = 1.0, random_ai_spawn_interval_years: int = 30, default_ai_difficulty_for_spawns: str = 'medium', ai_min_population: int = 100, game_seed: int = None, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None, war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None, ruleset_name: str = None, idle_human_benchmark_enabled: bool = False) -> Game:
+def setup_game(player_names: list[str], map_width: int = 100, map_height: int = 75, starting_money: Optional[int] = None, worker_replenishment_rate: float = 1.0, natural_disaster_frequency: float = 1.0, use_osm: bool = False, map_center_lat: float = None, map_center_lon: float = None, marketplace_years_visible: int = None, map_preset_name: str = None, line_build_speed_multiplier: float = None, marketplace_bulk_discount_percent: float = None, marketplace_bulk_discount_threshold: int = None, ai_player_indices: list[int] = None, ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, random_ai_spawn_enabled: bool = True, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = 1.0, random_ai_spawn_interval_years: int = 30, default_ai_difficulty_for_spawns: str = 'hard', ai_min_population: int = 100, game_seed: int = None, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None, war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None, ruleset_name: str = None, idle_human_benchmark_enabled: bool = False, ai_debug_notifications_enabled: bool = True) -> Game:
     """Create game. Optional overrides for game_presets (line build speed, bulk discount).
     ai_player_indices: list of player indices (0-based) that are AI-controlled.
     ai_focus_per_player: optional dict mapping player_index -> focus for AI players.
@@ -312,7 +1544,7 @@ def setup_game(player_names: list[str], map_width: int = 100, map_height: int = 
         marketplace_years_visible = MARKETPLACE_YEARS_VISIBLE
     marketplace = Marketplace(marketplace_years_visible=marketplace_years_visible)
     initialize_marketplace_trainsets(marketplace, num_players=len(players))
-    game = Game(players=players, game_map=game_map, timeline=timeline, marketplace=marketplace, worker_replenishment_rate=worker_replenishment_rate, natural_disaster_frequency=natural_disaster_frequency, random_ai_spawn_enabled=random_ai_spawn_enabled, merge_enabled=merge_enabled, merge_ai_ai_enabled=merge_ai_ai_enabled, merge_ai_human_enabled=merge_ai_human_enabled, merge_human_human_enabled=merge_human_human_enabled, inflation_rate=inflation_rate, profit_margin=profit_margin, random_ai_spawn_interval_years=random_ai_spawn_interval_years, default_ai_difficulty_for_spawns=default_ai_difficulty_for_spawns, ai_min_population=ai_min_population, game_seed=game_seed, merge_ai_healthy_profit_threshold_pct=merge_ai_healthy_profit_threshold_pct, merge_ai_reject_chance_pct=merge_ai_reject_chance_pct, merge_ai_min_turns_to_live_for_accept=merge_ai_min_turns_to_live_for_accept, merge_ai_min_years_before_consider=merge_ai_min_years_before_consider, merge_ai_auto_fail_first_n_years=merge_ai_auto_fail_first_n_years, war_start_chance_per_year=war_start_chance_per_year, war_end_chance_per_year=war_end_chance_per_year, war_worker_draft_chance_per_year=war_worker_draft_chance_per_year, war_new_worker_cost_multiplier=war_new_worker_cost_multiplier)
+    game = Game(players=players, game_map=game_map, timeline=timeline, marketplace=marketplace, worker_replenishment_rate=worker_replenishment_rate, natural_disaster_frequency=natural_disaster_frequency, random_ai_spawn_enabled=random_ai_spawn_enabled, merge_enabled=merge_enabled, merge_ai_ai_enabled=merge_ai_ai_enabled, merge_ai_human_enabled=merge_ai_human_enabled, merge_human_human_enabled=merge_human_human_enabled, inflation_rate=inflation_rate, profit_margin=profit_margin, random_ai_spawn_interval_years=random_ai_spawn_interval_years, default_ai_difficulty_for_spawns=default_ai_difficulty_for_spawns, ai_min_population=ai_min_population, game_seed=game_seed, merge_ai_healthy_profit_threshold_pct=merge_ai_healthy_profit_threshold_pct, merge_ai_reject_chance_pct=merge_ai_reject_chance_pct, merge_ai_min_turns_to_live_for_accept=merge_ai_min_turns_to_live_for_accept, merge_ai_min_years_before_consider=merge_ai_min_years_before_consider, merge_ai_auto_fail_first_n_years=merge_ai_auto_fail_first_n_years, war_start_chance_per_year=war_start_chance_per_year, war_end_chance_per_year=war_end_chance_per_year, war_worker_draft_chance_per_year=war_worker_draft_chance_per_year, war_new_worker_cost_multiplier=war_new_worker_cost_multiplier, ai_debug_notifications_enabled=ai_debug_notifications_enabled)
     game.ruleset_name = used_ruleset
     game.starting_money = int(starting_money)
     game.idle_human_benchmark_enabled = bool(idle_human_benchmark_enabled)
@@ -338,7 +1570,8 @@ def create_single_ai_player(player_id: int, name: str, starting_money: int, ai_f
         cars = [Railcar("Standard Passenger", 0, earliest_railcar.capacity, earliest_railcar.maitnance_costs)]
         starting_trainsets.append(Trainset(locomotive=earliest_loco, cars=cars))
     focus = ai_focus if ai_focus in AI_FOCUSES else random.choice(AI_FOCUSES)
-    diff = ai_difficulty if ai_difficulty in AI_DIFFICULTIES else random.choice(AI_DIFFICULTIES)
+    from game_presets import AI_DEFAULT_DIFFICULTY
+    diff = ai_difficulty if ai_difficulty in AI_DIFFICULTIES else AI_DEFAULT_DIFFICULTY
     return Player(player_id=player_id, money=starting_money, trainsets=starting_trainsets, name=name, line_names=[], is_ai=True, ai_focus=focus, ai_difficulty=diff)
 
 
@@ -346,6 +1579,7 @@ def initialize_marketplace_trainsets(marketplace: Marketplace, num_players: int 
     """Initialize marketplace using the new category-based generation system.
     This ensures proper categorization and availability rules from the start."""
     current_year = 1830
+    
     # Use the new category-based generation system
     marketplace.generate_trainsets_based_on_discoveries(current_year)
     
@@ -437,9 +1671,23 @@ def _merge_company_names(name_a: str, name_b: str) -> str:
     return f"{first_part} {second_part}".strip()
 
 
+MAP_DISPLAY_MAX_POPULATION_POINTS = 3000
+
+
+def cap_population_points_for_map_display(
+    population_data: list[dict],
+    max_points: int = MAP_DISPLAY_MAX_POPULATION_POINTS,
+) -> list[dict]:
+    """Cap population markers for map HTML so large presets stay fast and fit in memory."""
+    if not population_data or len(population_data) <= max_points:
+        return population_data
+    ranked = sorted(population_data, key=lambda p: int(p.get('pop') or 0), reverse=True)
+    return ranked[:max_points]
+
+
 class Operations:    
     def __init__(self, player_names: list[str], map_width: int = 100, map_height: int = 100, starting_money: Optional[int] = None, worker_replenishment_rate: float = 1.0, natural_disaster_frequency: float = 1.0, use_osm: bool = False, map_center_lat: float = None, map_center_lon: float = None, marketplace_years_visible: int = None, map_preset_name: str = None, line_build_speed_multiplier: float = None, marketplace_bulk_discount_percent: float = None, marketplace_bulk_discount_threshold: int = None, ai_player_indices: list[int] = None,
-        ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, random_ai_spawn_enabled: bool = True, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = 1.0, random_ai_spawn_interval_years: int = 30, default_ai_difficulty_for_spawns: str = 'medium', ai_min_population: int = 100, game_seed: int = None, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None,         war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None, ruleset_name: str = None, idle_human_benchmark_enabled: bool = False):
+        ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, random_ai_spawn_enabled: bool = True, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = 1.0, random_ai_spawn_interval_years: int = 30, default_ai_difficulty_for_spawns: str = 'hard', ai_min_population: int = 100, game_seed: int = None, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None,         war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None, ruleset_name: str = None, idle_human_benchmark_enabled: bool = False, ai_debug_notifications_enabled: bool = True):
         """Create Operations (game logic). Game is playable without qt.py.
         
         map_preset_name: Optional preset id ('standard', 'nyc', 'ny_metro') - uses
@@ -473,7 +1721,7 @@ class Operations:
         if ruleset_name is None:
             ruleset_name = get_active_ruleset()
         self.ruleset_name = ruleset_name
-        self.game = setup_game(player_names, map_width, map_height, starting_money, worker_replenishment_rate, natural_disaster_frequency, use_osm=use_osm, map_center_lat=map_center_lat, map_center_lon=map_center_lon, marketplace_years_visible=marketplace_years_visible, map_preset_name=map_preset_name, line_build_speed_multiplier=line_build_speed_multiplier, marketplace_bulk_discount_percent=marketplace_bulk_discount_percent, marketplace_bulk_discount_threshold=marketplace_bulk_discount_threshold, ai_player_indices=ai_player_indices, ai_focus_per_player=ai_focus_per_player, ai_difficulty_per_player=ai_difficulty_per_player, random_ai_spawn_enabled=random_ai_spawn_enabled, merge_enabled=merge_enabled, merge_ai_ai_enabled=merge_ai_ai_enabled, merge_ai_human_enabled=merge_ai_human_enabled, merge_human_human_enabled=merge_human_human_enabled, inflation_rate=inflation_rate, profit_margin=profit_margin, random_ai_spawn_interval_years=random_ai_spawn_interval_years, default_ai_difficulty_for_spawns=default_ai_difficulty_for_spawns, ai_min_population=ai_min_population, game_seed=game_seed, merge_ai_healthy_profit_threshold_pct=merge_ai_healthy_profit_threshold_pct, merge_ai_reject_chance_pct=merge_ai_reject_chance_pct, merge_ai_min_turns_to_live_for_accept=merge_ai_min_turns_to_live_for_accept, merge_ai_min_years_before_consider=merge_ai_min_years_before_consider, merge_ai_auto_fail_first_n_years=merge_ai_auto_fail_first_n_years, war_start_chance_per_year=war_start_chance_per_year, war_end_chance_per_year=war_end_chance_per_year, war_worker_draft_chance_per_year=war_worker_draft_chance_per_year, war_new_worker_cost_multiplier=war_new_worker_cost_multiplier, ruleset_name=ruleset_name, idle_human_benchmark_enabled=idle_human_benchmark_enabled)
+        self.game = setup_game(player_names, map_width, map_height, starting_money, worker_replenishment_rate, natural_disaster_frequency, use_osm=use_osm, map_center_lat=map_center_lat, map_center_lon=map_center_lon, marketplace_years_visible=marketplace_years_visible, map_preset_name=map_preset_name, line_build_speed_multiplier=line_build_speed_multiplier, marketplace_bulk_discount_percent=marketplace_bulk_discount_percent, marketplace_bulk_discount_threshold=marketplace_bulk_discount_threshold, ai_player_indices=ai_player_indices, ai_focus_per_player=ai_focus_per_player, ai_difficulty_per_player=ai_difficulty_per_player, random_ai_spawn_enabled=random_ai_spawn_enabled, merge_enabled=merge_enabled, merge_ai_ai_enabled=merge_ai_ai_enabled, merge_ai_human_enabled=merge_ai_human_enabled, merge_human_human_enabled=merge_human_human_enabled, inflation_rate=inflation_rate, profit_margin=profit_margin, random_ai_spawn_interval_years=random_ai_spawn_interval_years, default_ai_difficulty_for_spawns=default_ai_difficulty_for_spawns, ai_min_population=ai_min_population, game_seed=game_seed, merge_ai_healthy_profit_threshold_pct=merge_ai_healthy_profit_threshold_pct, merge_ai_reject_chance_pct=merge_ai_reject_chance_pct, merge_ai_min_turns_to_live_for_accept=merge_ai_min_turns_to_live_for_accept, merge_ai_min_years_before_consider=merge_ai_min_years_before_consider, merge_ai_auto_fail_first_n_years=merge_ai_auto_fail_first_n_years, war_start_chance_per_year=war_start_chance_per_year, war_end_chance_per_year=war_end_chance_per_year, war_worker_draft_chance_per_year=war_worker_draft_chance_per_year, war_new_worker_cost_multiplier=war_new_worker_cost_multiplier, ruleset_name=ruleset_name, idle_human_benchmark_enabled=idle_human_benchmark_enabled, ai_debug_notifications_enabled=ai_debug_notifications_enabled)
         # Warm road index, point-area map, AI road features, and population sort caches at init
         # (avoids multi-second cold loads on first year advance / first AI turn).
         _warm_preset = map_preset_name or getattr(self.game.get_map(), "map_preset_name", None)
@@ -497,6 +1745,105 @@ class Operations:
     
     def get_game(self) -> Game:
         return self.game
+
+    def get_runtime_game_settings(self) -> dict:
+        """Snapshot of game settings that can be changed during play."""
+        import game_presets
+        g = self.game
+        mp = g.marketplace
+        return {
+            'ai_debug_notifications_enabled': bool(getattr(g, 'ai_debug_notifications_enabled', True)),
+            'random_ai_spawn_enabled': bool(getattr(g, 'random_ai_spawn_enabled', False)),
+            'random_ai_spawn_interval_years': int(getattr(g, 'random_ai_spawn_interval_years', 30)),
+            'ai_min_population': int(getattr(g, 'ai_min_population', 100)),
+            'merge_enabled': bool(getattr(g, 'merge_enabled', False)),
+            'merge_ai_ai_enabled': bool(getattr(g, 'merge_ai_ai_enabled', True)),
+            'merge_ai_human_enabled': bool(getattr(g, 'merge_ai_human_enabled', True)),
+            'merge_human_human_enabled': bool(getattr(g, 'merge_human_human_enabled', True)),
+            'merge_ai_healthy_profit_threshold_pct': float(getattr(g, 'merge_ai_healthy_profit_threshold_pct', 25.0)),
+            'merge_ai_reject_chance_pct': float(getattr(g, 'merge_ai_reject_chance_pct', 90.0)),
+            'merge_ai_min_turns_to_live_for_accept': int(getattr(g, 'merge_ai_min_turns_to_live_for_accept', 10)),
+            'merge_ai_min_years_before_consider': int(getattr(g, 'merge_ai_min_years_before_consider', 0)),
+            'merge_ai_auto_fail_first_n_years': int(getattr(g, 'merge_ai_auto_fail_first_n_years', 0)),
+            'worker_replenishment_rate': float(getattr(g, 'worker_replenishment_rate', 1.0)),
+            'natural_disaster_frequency': float(getattr(g.event_system, 'natural_disaster_frequency', 1.0)),
+            'inflation_rate': float(getattr(g, 'inflation_rate', 1.0)),
+            'profit_margin': float(getattr(g, 'profit_margin', 1.0)),
+            'line_build_speed_multiplier': float(game_presets.LINE_BUILD_SPEED_MULTIPLIER),
+            'marketplace_years_visible': int(getattr(mp, 'marketplace_years_visible', game_presets.MARKETPLACE_YEARS_VISIBLE)),
+            'marketplace_bulk_discount_percent': float(game_presets.MARKETPLACE_BULK_DISCOUNT_PERCENT) * 100.0,
+            'marketplace_bulk_discount_threshold': int(game_presets.MARKETPLACE_BULK_DISCOUNT_THRESHOLD),
+            'war_start_chance_per_year': float(getattr(g, 'war_start_chance_per_year', 0.0)),
+            'war_end_chance_per_year': float(getattr(g, 'war_end_chance_per_year', 0.0)),
+            'war_worker_draft_chance_per_year': float(getattr(g, 'war_worker_draft_chance_per_year', 0.0)),
+            'war_new_worker_cost_multiplier': float(getattr(g, 'war_new_worker_cost_multiplier', 1.0)),
+        }
+
+    def apply_runtime_game_settings(self, settings: dict) -> None:
+        """Apply in-game settings changes to the live game."""
+        import random
+        import game_presets
+        from inflation_utils import set_inflation_rate_multiplier
+
+        g = self.game
+        if 'ai_debug_notifications_enabled' in settings:
+            g.ai_debug_notifications_enabled = bool(settings['ai_debug_notifications_enabled'])
+        if 'ai_min_population' in settings:
+            g.ai_min_population = max(0, int(settings['ai_min_population']))
+        if 'random_ai_spawn_interval_years' in settings:
+            g.random_ai_spawn_interval_years = max(5, min(200, int(settings['random_ai_spawn_interval_years'])))
+        if 'random_ai_spawn_enabled' in settings:
+            g.random_ai_spawn_enabled = bool(settings['random_ai_spawn_enabled'])
+            if not g.random_ai_spawn_enabled:
+                g._next_random_ai_spawn_year = None
+            elif getattr(g, '_next_random_ai_spawn_year', None) is None:
+                interval = int(getattr(g, 'random_ai_spawn_interval_years', 30))
+                half = max(5, interval // 2)
+                g._next_random_ai_spawn_year = int(self.get_year()) + random.randint(interval - half, interval + half)
+        if 'merge_enabled' in settings:
+            g.merge_enabled = bool(settings['merge_enabled'])
+        if 'merge_ai_ai_enabled' in settings:
+            g.merge_ai_ai_enabled = bool(settings['merge_ai_ai_enabled'])
+        if 'merge_ai_human_enabled' in settings:
+            g.merge_ai_human_enabled = bool(settings['merge_ai_human_enabled'])
+        if 'merge_human_human_enabled' in settings:
+            g.merge_human_human_enabled = bool(settings['merge_human_human_enabled'])
+        if 'merge_ai_healthy_profit_threshold_pct' in settings:
+            g.merge_ai_healthy_profit_threshold_pct = max(0.0, min(100.0, float(settings['merge_ai_healthy_profit_threshold_pct'])))
+        if 'merge_ai_reject_chance_pct' in settings:
+            g.merge_ai_reject_chance_pct = max(0.0, min(100.0, float(settings['merge_ai_reject_chance_pct'])))
+        if 'merge_ai_min_turns_to_live_for_accept' in settings:
+            g.merge_ai_min_turns_to_live_for_accept = max(0, min(200, int(settings['merge_ai_min_turns_to_live_for_accept'])))
+        if 'merge_ai_min_years_before_consider' in settings:
+            g.merge_ai_min_years_before_consider = max(0, min(50, int(settings['merge_ai_min_years_before_consider'])))
+        if 'merge_ai_auto_fail_first_n_years' in settings:
+            g.merge_ai_auto_fail_first_n_years = max(0, min(50, int(settings['merge_ai_auto_fail_first_n_years'])))
+        if 'worker_replenishment_rate' in settings:
+            g.worker_replenishment_rate = max(0.1, min(5.0, float(settings['worker_replenishment_rate'])))
+        if 'natural_disaster_frequency' in settings:
+            freq = max(0.1, min(5.0, float(settings['natural_disaster_frequency'])))
+            g.event_system.natural_disaster_frequency = freq
+        if 'inflation_rate' in settings:
+            g.inflation_rate = max(0.1, min(5.0, float(settings['inflation_rate'])))
+            set_inflation_rate_multiplier(g.inflation_rate)
+        if 'profit_margin' in settings:
+            g.profit_margin = max(0.25, min(5.0, float(settings['profit_margin'])))
+        if 'line_build_speed_multiplier' in settings:
+            game_presets.LINE_BUILD_SPEED_MULTIPLIER = max(0.5, min(5.0, float(settings['line_build_speed_multiplier'])))
+        if 'marketplace_years_visible' in settings:
+            g.marketplace.marketplace_years_visible = max(1, min(200, int(settings['marketplace_years_visible'])))
+        if 'marketplace_bulk_discount_percent' in settings:
+            game_presets.MARKETPLACE_BULK_DISCOUNT_PERCENT = max(0.0, min(100.0, float(settings['marketplace_bulk_discount_percent']))) / 100.0
+        if 'marketplace_bulk_discount_threshold' in settings:
+            game_presets.MARKETPLACE_BULK_DISCOUNT_THRESHOLD = max(1, int(settings['marketplace_bulk_discount_threshold']))
+        if 'war_start_chance_per_year' in settings:
+            g.war_start_chance_per_year = max(0.0, min(1.0, float(settings['war_start_chance_per_year'])))
+        if 'war_end_chance_per_year' in settings:
+            g.war_end_chance_per_year = max(0.0, min(1.0, float(settings['war_end_chance_per_year'])))
+        if 'war_worker_draft_chance_per_year' in settings:
+            g.war_worker_draft_chance_per_year = max(0.0, min(1.0, float(settings['war_worker_draft_chance_per_year'])))
+        if 'war_new_worker_cost_multiplier' in settings:
+            g.war_new_worker_cost_multiplier = max(1.0, min(3.0, float(settings['war_new_worker_cost_multiplier'])))
     
     def get_players(self) -> list[Player]:
         players = self.game.get_players()
@@ -559,9 +1906,7 @@ class Operations:
         for line_name in player.get_line_names():
             line = self.game.get_map().get_lines_by_name().get(line_name)
             if line:
-                # Use cached profit if available, otherwise 0
-                if hasattr(line, '_cached_profit') and hasattr(line, '_cached_profit_year') and line._cached_profit_year == current_year:
-                    total_profit += line._cached_profit
+                total_profit += self.calc_line_profit(line, current_year)
         
         return total_profit
     
@@ -576,6 +1921,133 @@ class Operations:
             if railcar.name != loco.associated_railcar_name:
                 raise ValueError(f"{loco.name} can only use '{loco.associated_railcar_name}' railcars, but '{railcar.name}' was provided")
         return trainset.add_railcar(railcar)
+
+    def get_add_railcar_info(self, player: Player) -> dict:
+        """Trainsets that can accept another railcar, and spare railcars in inventory."""
+        eligible_trainsets = []
+        for ts in self.get_player_trainsets(player):
+            loco = self.get_trainset_locomotive(ts)
+            if not loco or not getattr(loco, 'can_have_railcars', True):
+                continue
+            max_cars = loco.max_cars if loco.max_cars is not None else Trainset.DEFAULT_MAX_RAILCARS
+            if len(self.get_trainset_cars(ts)) < max_cars:
+                eligible_trainsets.append(ts)
+        railcars = list(getattr(player, 'railcars', []) or [])
+        return {'trainsets': eligible_trainsets, 'railcars': railcars}
+
+    def _compatible_railcars_for_trainset_locomotive(self, locomotive, railcars: list) -> list:
+        if not locomotive or not getattr(locomotive, 'can_have_railcars', True):
+            return []
+        assoc = getattr(locomotive, 'associated_railcar_name', None)
+        if assoc:
+            return [c for c in railcars if getattr(c, 'name', None) == assoc]
+        return list(railcars)
+
+    def _compatible_locomotives_for_trainset(self, trainset: Trainset, locomotives: list) -> list:
+        cars = self.get_trainset_cars(trainset)
+        compatible = []
+        for loco in locomotives:
+            if not getattr(loco, 'can_have_railcars', True):
+                if cars:
+                    continue
+            else:
+                max_cars = loco.max_cars if loco.max_cars is not None else Trainset.DEFAULT_MAX_RAILCARS
+                if len(cars) > max_cars:
+                    continue
+                assoc = getattr(loco, 'associated_railcar_name', None)
+                if assoc and any(getattr(c, 'name', None) != assoc for c in cars):
+                    continue
+            compatible.append(loco)
+        return compatible
+
+    def get_modify_trainset_info(self, player: Player, trainset: Trainset) -> dict:
+        """Inventory and options for modifying a trainset in place."""
+        if trainset not in self.get_player_trainsets(player):
+            raise ValueError("Trainset not owned by player")
+        loco = self.get_trainset_locomotive(trainset)
+        cars = list(self.get_trainset_cars(trainset))
+        spare_locomotives = list(getattr(player, 'locomotives', []) or [])
+        spare_railcars = list(getattr(player, 'railcars', []) or [])
+        max_cars = Trainset.DEFAULT_MAX_RAILCARS
+        can_add_cars = False
+        if loco and getattr(loco, 'can_have_railcars', True):
+            max_cars = loco.max_cars if loco.max_cars is not None else Trainset.DEFAULT_MAX_RAILCARS
+            can_add_cars = len(cars) < max_cars
+        return {
+            'trainset': trainset,
+            'locomotive': loco,
+            'cars': cars,
+            'max_cars': max_cars,
+            'can_add_cars': can_add_cars,
+            'can_remove_cars': bool(cars),
+            'compatible_locomotives': self._compatible_locomotives_for_trainset(trainset, spare_locomotives),
+            'compatible_railcars': self._compatible_railcars_for_trainset_locomotive(loco, spare_railcars) if can_add_cars else [],
+        }
+
+    def add_railcar_to_trainset_for_player(self, player: Player, trainset: Trainset, railcar: Railcar) -> dict:
+        """Move a spare railcar from player inventory onto a trainset."""
+        if trainset not in self.get_player_trainsets(player):
+            raise ValueError("Trainset not owned by player")
+        railcars = getattr(player, 'railcars', None) or []
+        if railcar not in railcars:
+            raise ValueError("Railcar not in player inventory")
+        if not self.add_railcar_to_trainset(trainset, railcar):
+            raise ValueError("Cannot add railcar (trainset at capacity or locomotive cannot pull cars)")
+        railcars.remove(railcar)
+        return {
+            'capacity': trainset.get_capacity(),
+            'cars_count': len(self.get_trainset_cars(trainset)),
+        }
+
+    def remove_railcar_from_trainset_for_player(
+        self, player: Player, trainset: Trainset, railcar: Railcar = None, index: int = -1,
+    ) -> dict:
+        """Remove a railcar from a trainset back into player inventory."""
+        if trainset not in self.get_player_trainsets(player):
+            raise ValueError("Trainset not owned by player")
+        removed = trainset.remove_railcar(railcar=railcar, index=index)
+        if removed is None:
+            raise ValueError("No railcar to remove")
+        self.acquire_railcar_for_player(player, removed)
+        return {
+            'railcar_name': getattr(removed, 'name', 'Railcar'),
+            'capacity': trainset.get_capacity(),
+            'cars_count': len(self.get_trainset_cars(trainset)),
+        }
+
+    def replace_trainset_locomotive_for_player(
+        self, player: Player, trainset: Trainset, new_locomotive: Locomotive,
+    ) -> dict:
+        """Swap the trainset locomotive with one from player inventory."""
+        if trainset not in self.get_player_trainsets(player):
+            raise ValueError("Trainset not owned by player")
+        locomotives = getattr(player, 'locomotives', None) or []
+        if new_locomotive not in locomotives:
+            raise ValueError("Locomotive not in player inventory")
+        if new_locomotive is trainset.locomotive:
+            raise ValueError("Trainset already uses this locomotive")
+        compatible = self._compatible_locomotives_for_trainset(trainset, [new_locomotive])
+        if not compatible:
+            raise ValueError("Locomotive is not compatible with this trainset's railcars")
+        line_name = trainset.get_line_assignment()
+        if line_name:
+            target_line = self.get_map_lines().get(line_name)
+            if target_line:
+                if getattr(new_locomotive, 'needs_overhead_wire', False) and not getattr(target_line, 'has_overhead_wire', False):
+                    raise ValueError("This locomotive requires overhead wire which the assigned line does not have.")
+                if getattr(new_locomotive, 'needs_third_rail', False) and not getattr(target_line, 'has_third_rail', False):
+                    raise ValueError("This locomotive requires a third rail which the assigned line does not have.")
+        old_locomotive = trainset.locomotive
+        locomotives.remove(new_locomotive)
+        trainset.locomotive = new_locomotive
+        trainset.capacity = trainset.calc_capacity()
+        trainset.maitnance_costs = trainset.calc_maitnance_costs()
+        self.acquire_locomotive_for_player(player, old_locomotive)
+        return {
+            'old_locomotive_name': getattr(old_locomotive, 'name', 'Locomotive'),
+            'new_locomotive_name': getattr(new_locomotive, 'name', 'Locomotive'),
+            'capacity': trainset.get_capacity(),
+        }
     
     def assemble_trainset_complete(self, player: Player, locomotive: Locomotive, railcars: list[Railcar]) -> dict:
         """Complete trainset assembly operation. Returns dict with result info.
@@ -725,8 +2197,9 @@ class Operations:
         line.owner = player
         if line.name not in player.get_line_names():
             player.acquire_line(line)
-        if line.name not in self.game.get_map().get_lines_by_name():
-            self.game.get_map().add_line(line)
+        # Lines listed on the marketplace are removed from the map; always restore after purchase.
+        self.add_line_to_map(line)
+        self.invalidate_ridership_cache()
         return line
     
     def create_trainset(self, locomotive: Locomotive, cars: list[Railcar], line_assignment: str=None) -> Trainset:
@@ -762,6 +2235,17 @@ class Operations:
         trainset.assign_to_line(line_name)
         if trainset not in target_line.vehicles:
             target_line.vehicles.append(trainset)
+
+    def unassign_trainset_complete(self, trainset: Trainset) -> dict:
+        """Unassign a trainset from its current line and remove it from line vehicles."""
+        line_name = trainset.get_line_assignment()
+        if not line_name:
+            raise ValueError("Trainset is not assigned to a line")
+        line = self.game.get_map().get_lines_by_name().get(line_name)
+        if line and trainset in line.vehicles:
+            line.vehicles.remove(trainset)
+        trainset.assign_to_line(None)
+        return {'line_name': line_name}
 
     def get_player_by_id(self, player_id: int) -> Player:
         for p in self.game.get_players():
@@ -927,6 +2411,30 @@ class Operations:
                     category="World",
                 )
 
+        for w in payload.get('strike_warnings') or []:
+            msg = str(w.get('message') or '').strip()
+            if msg:
+                first_line = msg.split('\n', 1)[0].strip()
+                _add(
+                    f"Labor Desk: {first_line}" if first_line else "Labor Desk: Strike Vote Looms",
+                    msg.replace('\n', ' '),
+                    category="Labor",
+                )
+        for sm in payload.get('strike_messages') or []:
+            pname = sm.get('player_name', 'Operator')
+            wname = sm.get('worker_name', 'Worker')
+            qty = int(sm.get('quantity', 0) or 0)
+            turns = int(sm.get('turns_remaining', 0) or 0)
+            demand = float(sm.get('demanded_multiplier', 0) or 0)
+            _add(
+                f"Strike Halts Service at {pname}",
+                (
+                    f"{qty} {wname}(s) walked off the job for {turns} more turn(s), "
+                    f"demanding {demand:.2f}x base pay."
+                ),
+                category="Labor",
+                )
+
         self._add_company_ranking_and_venture_news(new_year, payload, _add)
         self._add_government_and_politics_news(new_year, payload, _add)
 
@@ -960,6 +2468,11 @@ class Operations:
         if random.random() < 0.4 and oddity_eligible:
             h, b = random.choice(oddity_eligible)
             _add(h, b, category="Oddities")
+
+        from game_presets import NEWS_LOG_MAX_ENTRIES
+        max_entries = int(NEWS_LOG_MAX_ENTRIES)
+        if max_entries > 0 and len(self._news_log) > max_entries:
+            self._news_log = self._news_log[-max_entries:]
 
         return articles
 
@@ -1015,13 +2528,45 @@ class Operations:
                     category="Politics",
                 )
 
+        players_by_id = {self.get_player_id(p): p for p in self.get_players()}
+
+        gov_laws = payload.get('government_laws') or {}
+        if gov_laws:
+            favored_names = []
+            unfavored_names = []
+            grants = gov_laws.get('grants') or {}
+            tax_mods = gov_laws.get('tax_modifiers') or {}
+            for pid, grant in grants.items():
+                if grant and pid in players_by_id:
+                    favored_names.append(self.get_player_name(players_by_id[pid]))
+            for pid, mod in tax_mods.items():
+                if mod and mod > 1.0 and pid in players_by_id:
+                    name = self.get_player_name(players_by_id[pid])
+                    if name not in unfavored_names:
+                        unfavored_names.append(name)
+            if favored_names:
+                _add(
+                    "Legislature: Annual Transit Relief Package",
+                    "The government enacted favorable property-tax relief, transit subsidies, "
+                    f"maintenance credits, and lawsuit protections for {', '.join(favored_names)}.",
+                    category="Politics",
+                )
+            if unfavored_names:
+                _add(
+                    "Legislature: Regulatory Burden Increased",
+                    "Higher property taxes, heavier maintenance assessments, and increased "
+                    f"lawsuit scrutiny target {', '.join(unfavored_names)} under the annual slate.",
+                    category="Politics",
+                )
+
         law_labels = {
             'reduce_property_tax_15': '15% property tax reduction',
             'reduce_property_tax_5': '5% property tax reduction',
             'increase_property_tax_15': '15% property tax increase',
-            'increase_property_tax_5': '15% property tax increase',
+            'increase_property_tax_5': '5% property tax increase',
+            'tax_break': 'one-year tax holiday',
+            'audit_target': 'tax audit order',
         }
-        players_by_id = {self.get_player_id(p): p for p in self.get_players()}
         for eff in payload.get('new_government_laws', []) or []:
             law_type = eff.get('type', 'law')
             label = law_labels.get(law_type, law_type.replace('_', ' '))
@@ -1160,7 +2705,7 @@ class Operations:
         """Return effective construction cost for player. AI difficulty applies: hard=0.85x, easy=1.15x."""
         if not getattr(player, 'is_ai', False):
             return base_cost
-        diff = getattr(player, 'ai_difficulty', None) or 'medium'
+        diff = getattr(player, 'ai_difficulty', None) or 'hard'
         mult = AI_DIFFICULTY_COST_MULTIPLIER.get(diff, 1.0)
         return max(1, int(base_cost * mult))
 
@@ -1168,7 +2713,7 @@ class Operations:
         """Return effective marketplace price for player. AI difficulty applies: hard=0.85x, easy=1.1x."""
         if not getattr(player, 'is_ai', False):
             return base_price
-        diff = getattr(player, 'ai_difficulty', None) or 'medium'
+        diff = getattr(player, 'ai_difficulty', None) or 'hard'
         mult = AI_DIFFICULTY_MARKETPLACE_MULTIPLIER.get(diff, 1.0)
         return max(1, int(base_price * mult))
 
@@ -1177,36 +2722,60 @@ class Operations:
         base = self.get_lobby_success_chance(amount, option_id)
         if not getattr(player, 'is_ai', False):
             return base
-        diff = getattr(player, 'ai_difficulty', None) or 'medium'
+        diff = getattr(player, 'ai_difficulty', None) or 'hard'
         bonus = AI_DIFFICULTY_LOBBY_BONUS.get(diff, 0.0)
         return min(0.95, max(0.05, base + bonus))
 
     def acquire_line_for_player(self, player: Player, line: Line):
         player.acquire_line(line)
 
+    @staticmethod
+    def _stamp_vehicle_purchase_year(vehicle, purchase_year: int) -> None:
+        """Record when rolling stock entered service (maintenance aging uses this, not invention year)."""
+        try:
+            py = int(purchase_year)
+        except (TypeError, ValueError):
+            return
+        from vehicle import Trainset
+        if isinstance(vehicle, Trainset):
+            vehicle.purchase_year = py
+            loco = getattr(vehicle, 'locomotive', None)
+            if loco is not None:
+                loco.purchase_year = py
+            for rc in getattr(vehicle, 'railcars', None) or []:
+                rc.purchase_year = py
+            return
+        if hasattr(vehicle, 'purchase_year'):
+            vehicle.purchase_year = py
+
     def acquire_trainset_for_player(self, player: Player, trainset: Trainset):
+        self._stamp_vehicle_purchase_year(trainset, self.get_year())
         player.aquire_trainset(trainset)
     
     def acquire_locomotive_for_player(self, player: Player, locomotive: Locomotive):
         """Add a locomotive to player's inventory (stored separately, can be assembled later)"""
+        self._stamp_vehicle_purchase_year(locomotive, self.get_year())
         if not hasattr(player, 'locomotives'):
             player.locomotives = []
         player.locomotives.append(locomotive)
     
     def acquire_railcar_for_player(self, player: Player, railcar: Railcar):
         """Add a railcar to player's inventory (stored separately, can be assembled later)"""
+        self._stamp_vehicle_purchase_year(railcar, self.get_year())
         if not hasattr(player, 'railcars'):
             player.railcars = []
         player.railcars.append(railcar)
 
     def acquire_bus_for_player(self, player: Player, bus):
         """Add a bus to player inventory (used on bus lines)."""
+        self._stamp_vehicle_purchase_year(bus, self.get_year())
         if not hasattr(player, 'buses'):
             player.buses = []
         player.buses.append(bus)
 
     def acquire_ferry_for_player(self, player: Player, ferry):
         """Add a ferry vessel to player inventory (used on ferry lines)."""
+        self._stamp_vehicle_purchase_year(ferry, self.get_year())
         if not hasattr(player, 'ferries'):
             player.ferries = []
         player.ferries.append(ferry)
@@ -1232,6 +2801,10 @@ class Operations:
     
     def get_player_id(self, player: Player) -> int:
         return player.get_player_id()
+
+    def get_player_color_index(self, player: Player) -> int:
+        from player_colors import get_player_color_index
+        return get_player_color_index(player)
     
     def get_trainset_capacity(self, trainset: Trainset) -> int:
         return trainset.get_capacity()
@@ -1239,18 +2812,26 @@ class Operations:
     def get_trainset_line_assignment(self, trainset: Trainset) -> str:
         return trainset.get_line_assignment()
     
+    def _line_profit_from_cache(self, line: Line, current_year: int):
+        """Year-end cached profit for this calendar year or the prior year (in-year turns)."""
+        if not hasattr(line, '_cached_profit') or not hasattr(line, '_cached_profit_year'):
+            return None
+        cy = int(current_year)
+        cached_year = int(line._cached_profit_year)
+        if cached_year == cy or cached_year == cy - 1:
+            return int(line._cached_profit or 0)
+        return None
+    
     def calc_line_profit(self, line: Line, current_year: int = None) -> int:
-        """Calculate profit for a line. Uses cached value if available to avoid expensive calculations.
-        If not cached, returns 0 to prevent freezes."""
+        """Line profit from year-end cache (no ridership re-simulation here)."""
         if current_year is None:
             current_year = self.game.get_year()
-        
-        # CRITICAL: Only use cached profit - never calculate here to avoid freezes
-        # Profit must be pre-calculated during year advance
-        if hasattr(line, '_cached_profit') and hasattr(line, '_cached_profit_year') and line._cached_profit_year == current_year:
-            return line._cached_profit
-        else:
-            # No cache - return 0 to avoid expensive calculation
+        cached = self._line_profit_from_cache(line, current_year)
+        if cached is not None:
+            return cached
+        stored = getattr(line, 'profit', None)
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool):
+            return int(stored)
             return 0
     
     def extend_line_route_from_beginning(self, line: Line, additional_points: list):
@@ -1368,8 +2949,91 @@ class Operations:
             keys.add(_norm_display_name((build.get("data") or {}).get("name", "")))
         return keys
 
+    def _station_serves_line_outside(self, served_line_names: list, new_line_names: set) -> bool:
+        return any(ln not in new_line_names for ln in (served_line_names or []))
+
+    def find_nearby_transfer_station_name(
+        self,
+        x: float,
+        y: float,
+        line_names: list,
+        max_distance_m: float = None,
+    ) -> Optional[str]:
+        """Return the name of the nearest station on another line within max_distance_m, or None."""
+        from game_presets import AI_STATION_TRANSFER_NAME_MAX_DISTANCE_M
+
+        max_m = float(max_distance_m if max_distance_m is not None else AI_STATION_TRANSFER_NAME_MAX_DISTANCE_M)
+        new_lines = set(line_names or [])
+        if not new_lines:
+            return None
+        best_name = None
+        best_d = max_m + 1.0
+        game_map = self.game.get_map()
+
+        def _consider(st_name: str, sx: float, sy: float, served: list) -> None:
+            nonlocal best_name, best_d
+            if not self._station_serves_line_outside(served, new_lines):
+                return
+            name = (st_name or "").strip()
+            if not name:
+                return
+            d = self._direct_distance_between_stop_positions_m(x, y, sx, sy)
+            if d <= max_m and d < best_d:
+                best_d = d
+                best_name = name
+
+        for line_name, line in (game_map.get_lines_by_name() or {}).items():
+            for station in (line.get_stations() or []):
+                served = getattr(station, "line_names", None) or (
+                    station.get_line_names() if hasattr(station, "get_line_names") else [line_name]
+                )
+                sx = float(station.get_x() if hasattr(station, "get_x") else getattr(station, "x", 0))
+                sy = float(station.get_y() if hasattr(station, "get_y") else getattr(station, "y", 0))
+                _consider(getattr(station, "name", ""), sx, sy, served)
+
+        for build in self.game.build_queue or []:
+            if build.get("type") != "station":
+                continue
+            data = build.get("data") or {}
+            served = data.get("line_names") or []
+            try:
+                qx = float(data.get("x"))
+                qy = float(data.get("y"))
+            except (TypeError, ValueError):
+                continue
+            _consider(data.get("name", ""), qx, qy, served)
+
+        return best_name
+
+    def station_transfer_name_reuse_allowed(
+        self,
+        player: Player,
+        station_name: str,
+        x: float,
+        y: float,
+        line_names: list,
+        max_distance_m: float = None,
+    ) -> bool:
+        """True when station_name matches a nearby stop on another line (transfer-hub naming)."""
+        from game_presets import AI_STATION_TRANSFER_NAME_MAX_DISTANCE_M
+
+        target = _norm_display_name(station_name)
+        if not target:
+            return False
+        nearby = self.find_nearby_transfer_station_name(
+            float(x), float(y), list(line_names or []), max_distance_m=max_distance_m,
+        )
+        return bool(nearby) and _norm_display_name(nearby) == target
+
     def assert_station_name_unique_for_player(
-        self, player: Player, station_name: str, exclude_station=None, exclude_pending_station_build=None
+        self,
+        player: Player,
+        station_name: str,
+        exclude_station=None,
+        exclude_pending_station_build=None,
+        x: float = None,
+        y: float = None,
+        line_names: list = None,
     ) -> None:
         if not (station_name or "").strip():
             raise ValueError("Station name cannot be empty.")
@@ -1379,6 +3043,15 @@ class Operations:
             exclude_station=exclude_station,
             exclude_pending_station_build=exclude_pending_station_build,
         ):
+            if (
+                x is not None
+                and y is not None
+                and line_names
+                and self.station_transfer_name_reuse_allowed(
+                    player, station_name, float(x), float(y), list(line_names),
+                )
+            ):
+                return
             raise ValueError(
                 "You already have a station or a station in your build queue with this name "
                 "(names are compared case-insensitively)."
@@ -1483,14 +3156,112 @@ class Operations:
     def get_marketplace(self) -> Marketplace:
         return self.game.get_marketplace()
 
-    def add_line_to_marketplace(self, line: Line):
-        self.game.get_marketplace().add_line(line)
+    def add_line_to_marketplace(self, line: Line, seller: str = None):
+        owner = self.get_line_owner(line) if hasattr(self, 'get_line_owner') else getattr(line, 'owner', None)
+        if seller is None and owner is not None:
+            seller = self.get_player_name(owner)
+        if seller is None:
+            seller = "Manufacturer"
+        current_year = self.get_year()
+        self.game.get_marketplace().add_line(line, current_year=current_year, seller=seller)
+
+    def sell_player_line_to_marketplace(self, player: Player, line_name: str) -> dict:
+        """List a player-owned line on the marketplace and remove it from the map."""
+        if not line_name:
+            raise ValueError("Line name required")
+        game_map = self.get_map()
+        line = game_map.get_lines_by_name().get(line_name)
+        if line is not None:
+            owner = self.get_line_owner(line) if hasattr(self, 'get_line_owner') else getattr(line, 'owner', None)
+            if owner is not None and owner != player:
+                raise ValueError(f"Player does not own line '{line_name}'")
+            for ts in list(player.get_trainsets()):
+                if ts.get_line_assignment() == line_name:
+                    try:
+                        self.unassign_trainset_complete(ts)
+                    except ValueError:
+                        pass
+        cancelled = []
+        queue = self.get_build_queue() if hasattr(self, 'get_build_queue') else []
+        for idx in range(len(queue) - 1, -1, -1):
+            build = queue[idx]
+            if build.get('player') != player:
+                continue
+            data = build.get('data') or {}
+            matches = (
+                (build.get('type') == 'line' and data.get('name') == line_name)
+                or (build.get('type') == 'line_extension' and data.get('line_name') == line_name)
+                or (build.get('type') == 'station' and line_name in (data.get('line_names') or []))
+            )
+            if matches:
+                cancelled.append(self.cancel_build(idx))
+        if line is None:
+            return {
+                'success': True,
+                'line_name': line_name,
+                'listed': False,
+                'cancelled_builds': len(cancelled),
+            }
+        current_year = self.get_year()
+        seller = self.get_player_name(player)
+        self.get_marketplace().add_line(line, current_year=current_year, seller=seller)
+        if line_name in player.get_line_names():
+            player.remove_line(line_name)
+        self.delete_line_from_map(line)
+        return {
+            'success': True,
+            'line_name': line_name,
+            'listed': True,
+            'cancelled_builds': len(cancelled),
+        }
 
     def get_timeline_start_year(self) -> int:
         return self.game.get_timeline().get_start_year()
     
     def get_timeline_end_year(self) -> int:
         return self.game.get_timeline().get_end_year()
+
+    def get_inflation_factor_for_economy(self, max_factor: float = 10.0) -> float:
+        from inflation_utils import get_inflation_factor
+        return get_inflation_factor(
+            self.get_year(),
+            start_year=self.get_timeline_start_year(),
+            end_year=self.get_timeline_end_year(),
+            max_factor=max_factor,
+        )
+
+    def inflate_economic_value(self, base_amount: float, max_factor: float = 10.0) -> int:
+        from inflation_utils import inflate_economic_value
+        return inflate_economic_value(
+            base_amount,
+            self.get_year(),
+            start_year=self.get_timeline_start_year(),
+            end_year=self.get_timeline_end_year(),
+            max_factor=max_factor,
+        )
+
+    def get_nominal_fare_cap(self, year: int = None) -> tuple[float, float]:
+        from inflation_utils import get_nominal_fare_cap
+        y = int(self.get_year() if year is None else year)
+        return get_nominal_fare_cap(
+            y,
+            start_year=self.get_timeline_start_year(),
+            end_year=self.get_timeline_end_year(),
+        )
+
+    def get_timeline_fare_target(self, year: int = None) -> int:
+        from inflation_utils import get_timeline_fare_target
+        y = int(self.get_year() if year is None else year)
+        return get_timeline_fare_target(
+            y,
+            start_year=self.get_timeline_start_year(),
+            end_year=self.get_timeline_end_year(),
+        )
+
+    def apply_timeline_fare_to_line(self, line, year: int = None) -> None:
+        """Set a new line's fare to the low early-game target for the calendar year."""
+        if line is not None and hasattr(line, 'fare'):
+            line.fare = self.get_timeline_fare_target(year)
 
     def _calendar_years_since_timeline_start(self) -> int:
         return self.get_year() - self.get_timeline_start_year()
@@ -1617,7 +3388,9 @@ class Operations:
         """Estimate next year's total costs (taxes, maintenance, workers) without side effects.
         Used by AI for survival reserve. extra_workers_estimate: buffer for workers AI might rent this turn."""
         game = self.game
-        poll_tax, property_tax, income_tax = game.calc_taxes(player, next_year, 0)
+        current_year = int(next_year) - 1
+        player_profit = self.calc_player_profit(player, current_year) if hasattr(self, 'calc_player_profit') else 0
+        poll_tax, property_tax, income_tax = game.calc_taxes(player, next_year, player_profit)
         taxes = poll_tax + property_tax + income_tax
         line_maint = game.calc_maitnance_by_player(player) or 0
         trainset_maint = game.calc_trainset_maintenance(player) or 0
@@ -1693,8 +3466,21 @@ class Operations:
         if trainset in player.trainsets:
             player.trainsets.remove(trainset)
     
+    def player_has_active_worker_strike(self, player: Player) -> bool:
+        """True when any rented worker type is currently on strike."""
+        rentals = getattr(player, 'worker_rentals', None) or {}
+        for rental in rentals.values():
+            if rental and hasattr(rental, 'is_on_strike') and rental.is_on_strike():
+                return True
+        return False
+    
     def rent_workers_for_player(self, player: Player, worker_type, quantity: int, current_year: int):
-        """Rent workers for a player"""
+        """Rent workers for a player. Blocked while any worker strike is in progress."""
+        if self.player_has_active_worker_strike(player):
+            raise ValueError(
+                "Cannot hire workers while a strike is in progress. "
+                "Raise salaries in the Workers tab to end the strike first."
+            )
         player.rent_workers(worker_type, quantity, current_year)
         if getattr(self.game, 'war_active', False) and worker_type.name in player.worker_rentals:
             mult = float(getattr(self.game, 'war_new_worker_cost_multiplier', 1.25))
@@ -1841,9 +3627,23 @@ class Operations:
             'player_id': self.get_player_id(player),
         }
 
-    def set_line_fare(self, line, fare: int):
-        """Set the fare for a line"""
-        line.fare = fare
+    def set_line_fare(self, line, fare: float):
+        """Set the fare for a line (rounded to nearest $0.25)."""
+        from inflation_utils import round_fare_to_quarter
+        line.fare = round_fare_to_quarter(fare)
+
+    def get_line_fare(self, line) -> float:
+        from inflation_utils import round_fare_to_quarter
+        return round_fare_to_quarter(getattr(line, 'fare', 0) or 0)
+
+    def set_worker_salary_multiplier(self, worker_type_name: str, multiplier: float) -> None:
+        """Set salary multiplier for a worker type (shared across players, same as Workers tab)."""
+        from worker import CONSTRUCTION_WORKER, ENGINEER, LAWYER, MAINTENANCE_WORKER
+        for wt in (ENGINEER, CONSTRUCTION_WORKER, MAINTENANCE_WORKER, LAWYER):
+            if wt.name == worker_type_name:
+                wt.set_salary_multiplier(float(multiplier))
+                return
+        raise ValueError(f"Unknown worker type: {worker_type_name!r}")
     
     def set_line_overhead_wire(self, line, has_wire: bool):
         """Set whether a line has overhead wire"""
@@ -1854,8 +3654,14 @@ class Operations:
         line.has_third_rail = has_rail
     
     def unassign_trainset_from_line(self, trainset, line_name: str = None):
-        """Unassign a trainset from a line"""
-        trainset.assign_to_line(line_name)
+        """Unassign a trainset from a line (or its current line when line_name is None)."""
+        if line_name is None:
+            line_name = trainset.get_line_assignment()
+        if line_name:
+            line = self.game.get_map().get_lines_by_name().get(line_name)
+            if line and trainset in line.vehicles:
+                line.vehicles.remove(trainset)
+        trainset.assign_to_line(None)
     
     def remove_lawsuit_excuse_from_player(self, player: Player, excuse):
         """Remove a lawsuit excuse from a player"""
@@ -1977,6 +3783,28 @@ class Operations:
     def get_station_name(self, station) -> str:
         """Get station name"""
         return station.name
+
+    def get_station_throughput(self, station, current_year: int = None) -> int:
+        """Estimated annual passenger throughput at a station (share of serving lines' ridership)."""
+        line_names = getattr(station, 'line_names', None) or (
+            station.get_line_names() if hasattr(station, 'get_line_names') else []
+        )
+        if not line_names:
+            return 0
+        if current_year is None:
+            current_year = self.get_year()
+        ridership_data = self.get_ridership_data_for_year(current_year)
+        map_lines = self.get_map_lines() or {}
+        total = 0
+        for line_name in line_names:
+            line = map_lines.get(line_name)
+            if not line:
+                continue
+            passengers = int(ridership_data.get(line_name, 0) or 0)
+            stations = line.get_stations() if hasattr(line, 'get_stations') else (getattr(line, 'stations', None) or [])
+            share = max(1, len(stations))
+            total += passengers // share
+        return total
     
     def close_station(self, player, station) -> dict:
         """Close a station. Fails if station serves a line owned by another player.
@@ -2016,14 +3844,11 @@ class Operations:
     
     def calc_line_maintenance(self, line, current_year: int = None) -> int:
         """Full line maintenance including schedule operating cost when ``current_year`` is set (matches year-end finances)."""
-        if not hasattr(line, 'calc_maitnance'):
-            return 0
         if current_year is None and self.game is not None:
             current_year = self.game.get_year()
-        return line.calc_maitnance(current_year)
-    
-    def get_line_fare(self, line) -> int:
-        return line.fare
+        return calc_line_maintenance_with_off_street_surcharge(
+            self.get_map(), line, int(current_year or 0),
+        )
     
     def marketplace_add_trainsets_for_new_technology(self, new_year: int, newly_available: list):
         marketplace = self.game.get_marketplace()
@@ -2483,13 +4308,11 @@ class Operations:
                 )
             )
             self.game._government_laws = gov.pass_annual_laws(new_year, eliminated_player_ids=eliminated_ids)
-            # Government passes random laws on average every 3 turns (~33% per year)
             new_government_laws = []
-            if random.random() < 1.0 / 3.0:
-                random_effects = gov.pass_random_government_laws(new_year, eliminated_player_ids=eliminated_ids)
-                if random_effects:
-                    new_government_laws = random_effects
-                    self._apply_random_government_law_effects(new_year, random_effects)
+            random_effects = gov.pass_random_government_laws(new_year, eliminated_player_ids=eliminated_ids)
+            if random_effects:
+                new_government_laws = random_effects
+                self._apply_random_government_law_effects(new_year, random_effects)
             self.game._new_government_laws_this_year = new_government_laws
         else:
             self.game._government_laws = {}
@@ -2766,7 +4589,7 @@ class Operations:
 
     def _process_ai_doomed_merges(self) -> list:
         """Before elimination, merge pairs of AIs that are effectively bankrupt.
-        Any two AI players with money <= 0 this year have a high (90%) chance to merge instead of both dying.
+        Any two AI players with money < 0 this year have a high (90%) chance to merge instead of both dying.
         Returns list of (acquirer, target) pairs that were merged."""
         if not getattr(self.game, 'merge_enabled', False) or not getattr(self.game, 'merge_ai_ai_enabled', True):
             return []
@@ -2774,8 +4597,8 @@ class Operations:
             return []
         import random as _r
         ais = [p for p in self.get_active_players() if getattr(p, 'is_ai', False)]
-        # "Doomed" = zero or negative cash after finances
-        doomed = [a for a in ais if self.get_player_money(a) <= 0 and not self.is_player_eliminated(a)]
+        # "Doomed" = negative cash after finances (same threshold as bankruptcy)
+        doomed = [a for a in ais if self.get_player_money(a) < 0 and not self.is_player_eliminated(a)]
         if len(doomed) < 2:
             return []
         merged = []
@@ -2967,8 +4790,10 @@ class Operations:
         player_id = max((p.get_player_id() for p in self.get_players()), default=-1) + 1
         # Late-joining AIs get 50% of starting money
         starting_money = max(5000, STARTING_MONEY // 2)
-        default_diff = getattr(self.game, 'default_ai_difficulty_for_spawns', 'medium')
+        default_diff = getattr(self.game, 'default_ai_difficulty_for_spawns', 'hard')
         new_player = create_single_ai_player(player_id, name, starting_money, ai_difficulty=default_diff)
+        from player_colors import next_available_color_index, assign_player_color_index
+        assign_player_color_index(new_player, next_available_color_index(self.get_players()))
         # ai.run_ai_turn treats join year like a first-line opener (must queue/build a line on first turn).
         try:
             new_player._ai_join_game_year = int(current_year)
@@ -3494,7 +5319,8 @@ class Operations:
         return {'success': False, 'message': 'Unknown law type.'}
 
     def get_government_funding_amount(self) -> int:
-        return getattr(self, '_government_funding_amount', 50000)
+        base = getattr(self, '_government_funding_amount', 50000)
+        return self.inflate_economic_value(base, max_factor=10.0)
 
     def get_government_seats_for_display(self, player: Player) -> list:
         """Return list of (is_favorable, is_tiebreaker) for government tab."""
@@ -3597,7 +5423,7 @@ class Operations:
         return trainset.get_capacity()
     
     def get_trainset_maintenance_costs(self, trainset) -> int:
-        return trainset.get_maitnance_costs()
+        return trainset.get_maitnance_costs(self.get_year())
     
     def get_vehicle_name(self, vehicle) -> str:
         return vehicle.name
@@ -3714,18 +5540,37 @@ class Operations:
         map_width = game_map.width if hasattr(game_map, 'width') and game_map.width else 50
         map_height = game_map.height if hasattr(game_map, 'height') and game_map.height else 50
         grid_size = max(map_width, map_height)
-        from map_preset_loader import preset_has_water_areas
+        from map_preset_loader import get_map_bounds
         preset_name = getattr(game_map, 'map_preset_name', None)
-        is_water_preset = preset_has_water_areas(preset_name) if preset_name else False
+        preset_bounds = get_map_bounds(preset_name) if preset_name else None
+        use_preset_bounds = bool(
+            preset_bounds
+            and all(k in preset_bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon'))
+            and map_width and map_height
+        )
         
         grid_points = []
         for lat, lon in latlon_points:
-            x, y = game_map.osm_integration.convert_latlon_to_grid(
-                lat, lon, center_lat, center_lon, grid_size,
-                map_width=game_map.width, map_height=game_map.height,
-                is_nyc_proper=is_water_preset
-            )
-            grid_points.append((x, y))
+            if use_preset_bounds:
+                y = (
+                    (lat - preset_bounds['min_lat'])
+                    / (preset_bounds['max_lat'] - preset_bounds['min_lat'])
+                    * map_height
+                )
+                x = (
+                    (lon - preset_bounds['min_lon'])
+                    / (preset_bounds['max_lon'] - preset_bounds['min_lon'])
+                    * map_width
+                )
+                x = max(0.0, min(float(map_width), float(x)))
+                y = max(0.0, min(float(map_height), float(y)))
+                grid_points.append((x, y))
+            else:
+                x, y = game_map.osm_integration.convert_latlon_to_grid(
+                    lat, lon, center_lat, center_lon, grid_size,
+                    map_width=game_map.width, map_height=game_map.height,
+                )
+                grid_points.append((x, y))
         
         return grid_points
     
@@ -3778,7 +5623,10 @@ class Operations:
         return result
 
     def _segment_in_water_for_disaster(self, p1, p2, game_map, preset_name: str = None) -> bool:
-        """True if segment from p1 to p2 is in water. Used for disaster repair to avoid street-on-water error."""
+        """True if segment from p1 to p2 is in water. Used for disaster repair to avoid street-on-water error.
+
+        Uses preset/tile cache only (skip_osm=True) so UI elevation prompts never block on Overpass.
+        """
         def _pt(p):
             if hasattr(p, 'x') and hasattr(p, 'y'):
                 return float(p.x), float(p.y)
@@ -3787,16 +5635,119 @@ class Operations:
         x2, y2 = _pt(p2)
         mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
         if game_map.tile_system:
-            return (game_map.tile_system.is_point_in_water(x1, y1) or
-                    game_map.tile_system.is_point_in_water(x2, y2) or
-                    game_map.tile_system.is_point_in_water(mid_x, mid_y))
+            try:
+                return (
+                    game_map.tile_system.is_point_in_water(x1, y1, skip_osm=True)
+                    or game_map.tile_system.is_point_in_water(x2, y2, skip_osm=True)
+                    or game_map.tile_system.is_point_in_water(mid_x, mid_y, skip_osm=True)
+                )
+            except TypeError:
+                return (
+                    game_map.tile_system.is_point_in_water(x1, y1)
+                    or game_map.tile_system.is_point_in_water(x2, y2)
+                    or game_map.tile_system.is_point_in_water(mid_x, mid_y)
+                )
         if preset_name:
             from map_preset_loader import preset_has_water_areas, preset_is_point_in_water
             if preset_has_water_areas(preset_name):
-                return (preset_is_point_in_water(preset_name, x1, y1, game_map) or
-                        preset_is_point_in_water(preset_name, x2, y2, game_map) or
-                        preset_is_point_in_water(preset_name, mid_x, mid_y, game_map))
+                return (
+                    preset_is_point_in_water(preset_name, x1, y1, game_map, skip_osm=True)
+                    or preset_is_point_in_water(preset_name, x2, y2, game_map, skip_osm=True)
+                    or preset_is_point_in_water(preset_name, mid_x, mid_y, game_map, skip_osm=True)
+                )
         return False
+
+    def segment_is_over_water_not_bridge(self, p1, p2) -> bool:
+        """True when a segment crosses open water (not a bridge). Preset-only (no OSM)."""
+        game_map = self.game.get_map()
+        preset_name = getattr(game_map, 'map_preset_name', None)
+        if not self._segment_in_water_for_disaster(p1, p2, game_map, preset_name):
+            return False
+        def _pt(p):
+            if hasattr(p, 'x') and hasattr(p, 'y'):
+                return float(p.x), float(p.y)
+            return float(p[0]), float(p[1])
+        x1, y1 = _pt(p1)
+        x2, y2 = _pt(p2)
+        mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
+        if preset_name:
+            from map_preset_loader import get_preset_is_point_on_bridge
+            if get_preset_is_point_on_bridge(preset_name, mid_x, mid_y, self.get_year(), game_map):
+                return False
+            if _segment_on_bridge_or_tunnel(game_map, x1, y1, x2, y2, self.get_year()):
+                return False
+        return True
+
+    def get_segment_elevation_options(self, p1, p2, *, is_bus_line: bool = False) -> tuple:
+        """Return (allowed_elevations, default_elevation) for one route segment.
+
+        When a segment cannot be at street level (e.g. over water) the constructor
+        defaults it to 'underground' rather than an elevated structure.
+        """
+        if self.segment_is_over_water_not_bridge(p1, p2):
+            return list(_WATER_SEGMENT_ELEVATIONS), 'underground'
+        return list(_LAND_SEGMENT_ELEVATIONS), 'street'
+
+    def get_line_creation_elevation_specs(self, points: list) -> list:
+        """One elevation spec per segment for a new line."""
+        specs = []
+        for i in range(len(points) - 1):
+            p1, p2 = points[i], points[i + 1]
+            specs.append({
+                'label': (
+                    f"Segment {i + 1} ({float(p1[0]):.1f}, {float(p1[1]):.1f})"
+                    f" → ({float(p2[0]):.1f}, {float(p2[1]):.1f})"
+                ),
+                'p1': p1,
+                'p2': p2,
+            })
+        return specs
+
+    def get_extension_elevation_specs(
+        self, line_name: str, new_points: list, extend_from_end: bool,
+    ) -> list:
+        """One elevation spec per extension point (segment starting at that point)."""
+        route = self.get_line_route_including_extensions(line_name)
+        if not route:
+            line = self.get_map_lines().get(line_name)
+            route = list(self.get_line_route(line) or []) if line else []
+        specs = []
+        if extend_from_end:
+            if new_points:
+                specs.append({
+                    'label': (
+                        f"Point 1 ({float(new_points[0][0]):.1f}, {float(new_points[0][1]):.1f})"
+                        " — connection from line"
+                    ),
+                    'p1': route[-1] if route else new_points[0],
+                    'p2': new_points[0],
+                })
+            for i in range(1, len(new_points)):
+                p1, p2 = new_points[i - 1], new_points[i]
+                specs.append({
+                    'label': f"Point {i + 1} ({float(p2[0]):.1f}, {float(p2[1]):.1f})",
+                    'p1': p1,
+                    'p2': p2,
+                })
+        else:
+            for i in range(len(new_points) - 1):
+                p1, p2 = new_points[i], new_points[i + 1]
+                specs.append({
+                    'label': f"Point {i + 1} ({float(p1[0]):.1f}, {float(p1[1]):.1f})",
+                    'p1': p1,
+                    'p2': p2,
+                })
+            if new_points and route:
+                p1 = new_points[-1]
+                specs.append({
+                    'label': (
+                        f"Point {len(new_points)} ({float(p1[0]):.1f}, {float(p1[1]):.1f})"
+                        " — connection to line"
+                    ),
+                    'p1': p1,
+                    'p2': route[0],
+                })
+        return specs
 
     def calculate_line_cost(self, points: list, elevation_levels: list = None, is_bus_line: bool = False, is_ferry_line: bool = False) -> dict:
         """Calculate line creation cost based on points, terrain, and elevation.
@@ -3861,7 +5812,8 @@ class Operations:
         # Line creation cost: more expensive (1.5x base) for balance; profit margin increased to compensate.
         LINE_COST_MULTIPLIER = 1.5
         if is_ferry_line:
-            self._validate_ferry_route(points)
+            # Fast cost preview only — full 60 m water validation runs in create_line_complete.
+            # Calling _validate_ferry_route here blocks the UI for minutes on OSM maps.
             ferry_cost = max(15, int(total_length * 40 * 0.8 * LINE_COST_MULTIPLIER))
             return {
                 'cost': ferry_cost,
@@ -3887,7 +5839,7 @@ class Operations:
         try:
             if game_map.tile_system:
                 game_map.tile_system.pre_cache_route_tiles(
-                    points, proximity_buffer_m=0.0, max_osm_queries=999
+                    points, proximity_buffer_m=0.0, max_osm_queries=0,
                 )
 
             road_cache = {}
@@ -3939,16 +5891,39 @@ class Operations:
         
             total_cost = 0
             water_segments_count = 0  # Track consecutive water segments for exponential pricing
+            # Segments that run on top of an existing line's track reuse it (shared tracks).
+            shared_threshold = self._shared_track_threshold_grid()
+            shared_routes = self._existing_track_segments_for_sharing()
             if len(points) > 1:
                 for i in range(len(points) - 1):
                     x1, y1 = points[i]
                     x2, y2 = points[i+1]
                     segment_length = math.hypot(x2 - x1, y2 - y1)
-                
+
+                    # Shared track: if this segment reuses an existing line's track, only a
+                    # small connection cost applies. Once track reuse is confirmed, the
+                    # terrain/water/road/bridge checks below are unnecessary, so skip them.
+                    if (
+                        not is_ferry_line
+                        and shared_routes
+                        and self._segment_reuses_existing_track(
+                            x1, y1, x2, y2, shared_routes, shared_threshold,
+                        )
+                    ):
+                        total_cost += int(
+                            road_cost_per_unit * segment_length
+                            * SHARED_TRACK_COST_FACTOR * event_cost_multiplier
+                        )
+                        water_segments_count = 0
+                        continue
+
                     # Check terrain for midpoint of segment
                     mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
                     mid_on_road = is_point_on_road(mid_x, mid_y)
                     mid_on_bridge = is_point_on_bridge(mid_x, mid_y)
+                    on_bridge_or_tunnel = mid_on_bridge or _segment_on_bridge_or_tunnel(
+                        game_map, x1, y1, x2, y2, current_year,
+                    )
                     mid_has_buildings = has_buildings(mid_x, mid_y)
                     
                     # Get elevation for this segment
@@ -3966,7 +5941,6 @@ class Operations:
                             # Preset-only: use segment length as approximation (avoids slow tile walk)
                             water_tile_count = max(1, int(segment_length * 2)) if game_map.tile_system._preset_only_water else game_map.tile_system.get_water_segment_count(x1, y1, x2, y2)
                         else:
-                            mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
                             if game_map.tile_system.is_point_in_water(mid_x, mid_y):
                                 segment_in_water = True
                                 water_tile_count = max(1, int(segment_length * 2)) if game_map.tile_system._preset_only_water else game_map.tile_system.get_water_segment_count(x1, y1, x2, y2)
@@ -3975,12 +5949,12 @@ class Operations:
                         point2_in_water = is_point_in_water(x2, y2)
                         segment_in_water = point1_in_water or point2_in_water
                     
-                    # CRITICAL: No ground level ('street') on water - must be above_ground or underground
-                    if segment_in_water and not mid_on_bridge and elevation == 'street':
+                    # Street level on open water is invalid; bridges and tunnels may use street elevation.
+                    if segment_in_water and not on_bridge_or_tunnel and elevation == 'street':
                         raise ValueError(f"Cannot build at street level on water. Segment from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is in water. Use 'above_ground' or 'underground' instead.")
                     
                     # Track water segments for exponential pricing
-                    if segment_in_water and not mid_on_bridge:
+                    if segment_in_water and not on_bridge_or_tunnel:
                         if game_map.tile_system:
                             water_segments_count += water_tile_count
                         else:
@@ -3993,7 +5967,7 @@ class Operations:
                         base_cost_per_unit = water_cost_per_unit
                     elif mid_on_road:
                         base_cost_per_unit = road_cost_per_unit
-                    elif segment_in_water and not mid_on_bridge:
+                    elif segment_in_water and not on_bridge_or_tunnel:
                         # Cap exponent to avoid overflow (water_segments_count can be large for long segments)
                         capped_count = min(water_segments_count, 20)
                         exponential_multiplier = 1.5 ** capped_count
@@ -4007,6 +5981,11 @@ class Operations:
                     elevation_mult = elevation_multipliers.get(elevation, 1.0)
                     base_cost *= elevation_mult
                     base_cost *= event_cost_multiplier
+                    if not is_ferry_line:
+                        base_cost *= _off_street_segment_cost_multiplier(
+                            game_map, x1, y1, x2, y2, current_year,
+                            is_bus_line=is_bus_line,
+                        )
                     total_cost += int(base_cost)
             
             # Bus lines are 50% cheaper
@@ -4135,92 +6114,36 @@ class Operations:
                             )
 
     def _ferry_segment_interior_in_water(self, tile_system, x1: float, y1: float, x2: float, y2: float) -> bool:
-        """True when most interior samples along the segment are in water tiles (not merely near water)."""
-        if not tile_system:
-            return False
-        hits = 0
-        total = 0
-        end_trim = 0.12
-        for k in range(1, 13):
-            t = end_trim + (1.0 - 2.0 * end_trim) * (k / 12.0)
-            sx = x1 + t * (x2 - x1)
-            sy = y1 + t * (y2 - y1)
-            total += 1
-            try:
-                in_w = bool(tile_system.is_point_in_water(sx, sy, skip_osm=False))
-            except TypeError:
-                in_w = bool(tile_system.is_point_in_water(sx, sy))
-            if in_w:
-                hits += 1
-        return total > 0 and (hits / total) >= 0.85
+        """Deprecated wrapper — use _ferry_segment_crosses_open_water."""
+        game_map = self.game.get_map()
+        return _ferry_segment_crosses_open_water(game_map, x1, y1, x2, y2)
 
     def _validate_ferry_route(self, points: list) -> dict:
-        """Validate that a ferry route is within 60m of water. Returns dict with success status and error message.
-        All game logic for ferry validation is here - uses tile_system if available.
-        Optimized to use segment-based checking and pre-caching for speed.
-        
-        Args:
-            points: List of (x, y) coordinate tuples for the ferry route
-            
-        Returns:
-            dict with 'success' (bool) and 'error_message' (str, if failed)
-        """
-        import math
+        """Validate ferry route: endpoints near water; segment interior mostly open water."""
         game_map = self.game.get_map()
-        
-        # OPTIMIZATION: Tile system is already initialized and pre-cached in create_line_complete
-        # No need to ensure or pre-cache again
-        
-        # Validate input
+
         if not points:
             raise ValueError("Ferry route must have at least one point")
-        
-        MAX_DISTANCE_M = 60.0
-        if game_map.tile_system:
-            # OPTIMIZATION: Tiles are already pre-cached in create_line_complete
-            # No need to pre-cache again - reuse existing cache
-            # OPTIMIZATION: Check points once - is_point_near_water already checks is_point_in_water internally
-            # No need to call both - this eliminates redundant checks
-            for i, (x, y) in enumerate(points):
-                # is_point_near_water checks if point is in water first, then checks nearby tiles
-                # This is more efficient than calling is_point_in_water separately
-                if not game_map.tile_system.is_point_near_water(x, y, MAX_DISTANCE_M, skip_osm=False):
-                    raise ValueError(
-                        f"Ferry routes must be within 60m of water. Point {i+1} at ({x:.1f}, {y:.1f}) is too far from water (on land)."
+        if len(points) < 2:
+            raise ValueError("Ferry route must have at least two points.")
+
+        for i, (x, y) in enumerate(points):
+            if not _ferry_point_near_water(game_map, float(x), float(y)):
+                raise ValueError(
+                    f"Ferry routes must be within 60m of water. Point {i + 1} at ({float(x):.1f}, {float(y):.1f}) "
+                    f"is too far from water (on land)."
                     )
             
-            # Always validate segments. Even if endpoints are on/near water, the segment
-            # may still pass over land (e.g., cutting across a peninsula), so we must
-            # check segment proximity to prevent false accepts.
-            for i in range(len(points) - 1):
-                x1, y1 = points[i]
-                x2, y2 = points[i + 1]
+        for i in range(len(points) - 1):
+            x1, y1 = float(points[i][0]), float(points[i][1])
+            x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
+            if not _ferry_segment_crosses_open_water(game_map, x1, y1, x2, y2):
+                raise ValueError(
+                    f"Ferry routes must cross open water. Segment {i + 1} from ({x1:.1f}, {y1:.1f}) to "
+                    f"({x2:.1f}, {y2:.1f}) is not a valid water crossing."
+                )
 
-                if not game_map.tile_system.is_segment_near_water(x1, y1, x2, y2, MAX_DISTANCE_M, skip_osm=False):
-                    raise ValueError(
-                        f"Ferry routes must be within 60m of water. Segment {i+1} from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is too far from water (passes through land)."
-                    )
-                # Reject shore-hugging "ferries": every point can be within 60m of water while the path stays on land.
-                if not game_map.tile_system.ferry_corridor_interior_mostly_water(
-                    x1, y1, x2, y2, skip_osm=False, min_fraction=0.88
-                ):
-                    raise ValueError(
-                        f"Ferry routes must cross open water, not run over land along the coast. "
-                        f"Segment {i+1} from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is invalid."
-                    )
-                if not self._ferry_segment_interior_in_water(
-                    game_map.tile_system, x1, y1, x2, y2
-                ):
-                    raise ValueError(
-                        f"Ferry routes must run through open water, not along streets near the shore. "
-                        f"Segment {i+1} from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is on land."
-                    )
-
-            return {'success': True}  # All checks passed
-        else:
-            # Tile system not available - use fallback validation
-            # This is less accurate but prevents blocking
-            return self._validate_ferry_route_fallback(points, game_map, MAX_DISTANCE_M)
+        return {'success': True}
 
     def _require_ferry_terminal_near_coast(self, game_map, grid_x: float, grid_y: float) -> None:
         """Ferry stations must be within 60 m of water (same rule as ferry line geometry)."""
@@ -4232,6 +6155,35 @@ class Operations:
             raise ValueError(
                 "Ferry terminals must be within 60 m of the coast or navigable water."
             )
+
+    def _require_station_not_in_deep_water(self, game_map, grid_x: float, grid_y: float) -> None:
+        """Stations in water must be within STATION_MAX_WATER_DISTANCE_TO_LAND_M of land."""
+        preset_name = getattr(game_map, "map_preset_name", None)
+        from map_preset_loader import preset_has_water_areas
+        if not (preset_name and preset_has_water_areas(preset_name)):
+            return
+        gx, gy = float(grid_x), float(grid_y)
+        max_m = float(STATION_MAX_WATER_DISTANCE_TO_LAND_M)
+        ts = getattr(game_map, "tile_system", None)
+        if ts and hasattr(ts, "is_point_in_water"):
+            try:
+                in_water = bool(ts.is_point_in_water(gx, gy, skip_osm=True))
+            except TypeError:
+                in_water = bool(ts.is_point_in_water(gx, gy))
+            if not in_water:
+                return
+            if hasattr(ts, "is_point_near_land"):
+                if not ts.is_point_near_land(gx, gy, max_m, skip_osm=True):
+                    raise ValueError(
+                        f"Stations cannot be built in water more than {int(max_m)} m from land."
+                    )
+                return
+        if preset_name:
+            from map_preset_loader import preset_is_point_in_water
+            if preset_is_point_in_water(preset_name, gx, gy, game_map, skip_osm=True):
+                raise ValueError(
+                    f"Stations cannot be built in water more than {int(max_m)} m from land."
+                )
     
     def _validate_ferry_route_fallback(self, points: list, game_map, MAX_DISTANCE_M: float) -> dict:
         """Fallback ferry validation when tile system is not available.
@@ -4286,81 +6238,15 @@ class Operations:
         return {'success': True}  # All checks passed
     
     def _validate_bus_route(self, points: list) -> dict:
-        """Validate that a bus route follows streets (roads) and is not in water.
-
-        - NYC maps: uses `is_point_on_road_at_year` (fast, no OSM).
-        - Other maps: currently allows the route (no reliable non-OSM road data).
-        - All maps: bus stops (points) cannot be in water; segments that cross water
-          with both endpoints on land are allowed (bridges).
-        """
-        if not points:
-            raise ValueError("Bus route must have at least one point")
-
+        """Validate bus routes: land segments on streets; water crossings may be straight."""
         game_map = self.game.get_map()
-        current_year = self.game.get_year()
-        
-        # CRITICAL: Bus lines cannot have stops in water - check every point
-        # Segments that cross water with both endpoints on land are allowed (bridges)
-        # OPTIMIZATION: For bus lines, we can skip tile system checks if not using OSM
-        # If OSM is disabled, skip water checks (bus lines are assumed to be on roads/land)
-        
-        # Check if any points (bus stops) are in water using tile system if available
-        if game_map.tile_system and game_map.use_osm:
-            
-            # Check all points are not in water - bus stops cannot be in water
-            for i, (x, y) in enumerate(points):
-                if game_map.tile_system.is_point_in_water(x, y, skip_osm=False):
-                    return {
-                        'success': False,
-                        'error_message': f"Bus routes cannot be in water. Point {i+1} at ({x:.1f}, {y:.1f}) is in water."
-                    }
-            
-            # Do NOT reject segments that traverse water tiles when both endpoints are on land.
-            # Those are bridges (road over water) and are allowed.
-            # Only point-in-water check above is applied; no segment water check.
-        else:
-            # Fallback: use shared water checking method (when no tile system)
-            water_cache = {}
-            def is_point_in_water_fallback(x, y):
-                return self._is_point_in_water_cached(x, y, game_map, water_cache)
-            
-            # Check points only - bus stops cannot be in water
-            # Do not check segment midpoints; segments crossing water (bridges) are allowed
-            for i, (x, y) in enumerate(points):
-                if is_point_in_water_fallback(x, y):
-                    return {
-                        'success': False,
-                        'error_message': f"Bus routes cannot be in water. Point {i+1} at ({x:.1f}, {y:.1f}) is in water."
-                    }
-
-        # Check if route follows roads (for road-capable presets)
-        preset_name = getattr(game_map, 'map_preset_name', None)
-        if preset_name:
-            from map_preset_loader import preset_has_road_support, get_preset_is_point_on_road
-            if preset_has_road_support(preset_name):
-                if len(points) == 1:
-                    x, y = points[0]
-                    if not get_preset_is_point_on_road(preset_name, x, y, current_year, game_map):
-                        return {
-                            "success": False,
-                            "error_message": f"Bus routes must be on streets. Point at ({x:.1f}, {y:.1f}) is not on a road."
-                        }
-                    return {"success": True}
-
-                for i in range(len(points) - 1):
-                    x1, y1 = points[i]
-                    x2, y2 = points[i + 1]
-                    mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
-                    if not get_preset_is_point_on_road(preset_name, mid_x, mid_y, current_year, game_map):
-                        return {
-                            "success": False,
-                            "error_message": (
-                                "Bus routes must be on streets. "
-                                f"Segment {i + 1} from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is not on a road."
-                            ),
-                        }
-
-        return {"success": True}
+        return _validate_route_streets_on_land(
+            points,
+            game_map,
+            self.game.get_year(),
+            is_bus_line=True,
+            is_ferry_line=False,
+        )
 
     def _ai_guard_normalize_xy(self, x, y) -> tuple:
         if isinstance(x, (list, tuple)):
@@ -4433,6 +6319,160 @@ class Operations:
                 acc += sl
         return int(best)
 
+    def _ai_planned_transfer_revenue_at_endpoint(
+        self,
+        x: float,
+        y: float,
+        current_year: int,
+        building_player: Player = None,
+    ) -> float:
+        """Conservative annual revenue uplift when a planned endpoint connects to existing lines (transfer fares)."""
+        nearby = self.find_stations_near_point((float(x), float(y)), max_distance=5.0)
+        if not nearby:
+            return 0.0
+        from inflation_utils import get_nominal_fare_cap
+
+        sy = self.get_timeline_start_year()
+        ey = self.get_timeline_end_year()
+        _, fare_cap = get_nominal_fare_cap(int(current_year), start_year=sy, end_year=ey)
+        margin = max(0.25, min(10.0, getattr(self.game, "profit_margin", 1.0)))
+        bonus = 0.0
+        for _station, line, walk_dist in nearby:
+            if not line or not line.get_stations() or not line.get_vehicles():
+                continue
+            walk_factor = max(0.15, 1.0 - float(walk_dist) / 5.0)
+            other_fare = min(float(getattr(line, "fare", fare_cap) or fare_cap), float(fare_cap))
+            station_count = max(2, len(line.get_stations()))
+            demand_proxy = float(station_count) * 180.0 * walk_factor
+            # Transfer trips pay each line's fare; model extra ridership on the planned line.
+            leg_value = demand_proxy * other_fare * margin * 0.12
+            other_owner = getattr(line, "owner", None)
+            if building_player and other_owner and other_owner is not building_player:
+                leg_value *= 1.35
+            bonus = max(bonus, leg_value)
+        return float(bonus)
+
+    def _ai_collect_line_routes_for_competition(self) -> list:
+        """All completed and queued line polylines (any owner) for parallel-corridor scoring."""
+        routes = []
+        game_map = self.get_map()
+        if not game_map:
+            return routes
+        map_lines = game_map.get_lines_by_name() if hasattr(game_map, 'get_lines_by_name') else {}
+        if not isinstance(map_lines, dict):
+            map_lines = {}
+        for name, line in map_lines.items():
+            r = []
+            if hasattr(self, 'get_line_route_including_extensions'):
+                try:
+                    r = self.get_line_route_including_extensions(name) or []
+                except Exception:
+                    r = []
+            if len(r) < 2 and line and hasattr(line, 'get_route'):
+                r = line.get_route() or []
+            if len(r) >= 2:
+                routes.append(r)
+        bq = self.get_build_queue() if hasattr(self, 'get_build_queue') else []
+        if not isinstance(bq, list):
+            bq = []
+        chunks_by_key: dict = {}
+        for build in bq:
+            if build.get('type') not in ('line', 'line_extension'):
+                continue
+            data = build.get('data') or {}
+            pts = data.get('points') or []
+            if len(pts) < 2:
+                continue
+            player = build.get('player')
+            name = (data.get('name') or '').strip()
+            key = (id(player) if player is not None else 0, name)
+            seg_idx = int(data.get('segment_index', 0) or 0)
+            chunks_by_key.setdefault(key, []).append((seg_idx, list(pts)))
+        for _key, chunks in chunks_by_key.items():
+            chunks.sort(key=lambda t: t[0])
+            merged = []
+            for _si, pts in chunks:
+                if not merged:
+                    merged = list(pts)
+                else:
+                    merged.extend(pts[1:])
+            if len(merged) >= 2:
+                routes.append(merged)
+        return routes
+
+    def _ai_parallel_corridor_competition_factor(
+        self,
+        route_points: list,
+        existing_routes: list = None,
+        parallel_distance_grid: float = None,
+    ) -> float:
+        """1.0 = no nearby parallel line; lower when the route hugs existing corridors."""
+        import math
+        from game_presets import AI_PARALLEL_COMPETITION_DISTANCE_GRID
+
+        if not route_points or len(route_points) < 2:
+            return 1.0
+        max_d = float(
+            parallel_distance_grid
+            if parallel_distance_grid is not None
+            else AI_PARALLEL_COMPETITION_DISTANCE_GRID
+        )
+        if max_d <= 0:
+            return 1.0
+        if existing_routes is None:
+            existing_routes = self._ai_collect_line_routes_for_competition()
+        if not existing_routes:
+            return 1.0
+
+        def _pt_seg_dist(px, py, ax, ay, bx, by):
+            dx = bx - ax
+            dy = by - ay
+            dist_sq = dx * dx + dy * dy
+            if dist_sq < 1e-20:
+                return math.hypot(px - ax, py - ay)
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / dist_sq))
+            nx = ax + t * dx
+            ny = ay + t * dy
+            return math.hypot(px - nx, py - ny)
+
+        def _min_dist_to_routes(px, py):
+            best = float('inf')
+            for route in existing_routes:
+                for i in range(len(route) - 1):
+                    a, b = route[i], route[i + 1]
+                    ax = float(a[0]) if isinstance(a, (list, tuple)) else float(getattr(a, 'x', 0))
+                    ay = float(a[1]) if isinstance(a, (list, tuple)) else float(getattr(a, 'y', 0))
+                    bx = float(b[0]) if isinstance(b, (list, tuple)) else float(getattr(b, 'x', 0))
+                    by = float(b[1]) if isinstance(b, (list, tuple)) else float(getattr(b, 'y', 0))
+                    best = min(best, _pt_seg_dist(px, py, ax, ay, bx, by))
+            return best
+
+        sample_step = max(0.01, max_d * 0.5)
+        total_len = 0.0
+        parallel_len = 0.0
+        for i in range(len(route_points) - 1):
+            a, b = route_points[i], route_points[i + 1]
+            ax = float(a[0]) if isinstance(a, (list, tuple)) else float(getattr(a, 'x', 0))
+            ay = float(a[1]) if isinstance(a, (list, tuple)) else float(getattr(a, 'y', 0))
+            bx = float(b[0]) if isinstance(b, (list, tuple)) else float(getattr(b, 'x', 0))
+            by = float(b[1]) if isinstance(b, (list, tuple)) else float(getattr(b, 'y', 0))
+            seg_len = math.hypot(bx - ax, by - ay)
+            if seg_len <= 0:
+                continue
+            total_len += seg_len
+            n_samples = max(1, int(math.ceil(seg_len / sample_step)))
+            chunk = seg_len / n_samples
+            for j in range(n_samples):
+                t = (j + 0.5) / n_samples
+                px = ax + t * (bx - ax)
+                py = ay + t * (by - ay)
+                if _min_dist_to_routes(px, py) <= max_d:
+                    parallel_len += chunk
+        if total_len <= 0:
+            return 1.0
+        parallel_fraction = parallel_len / total_len
+        return max(0.12, 1.0 - 0.82 * parallel_fraction)
+
     def _ai_planned_line_gross_annual_revenue_floor(
         self,
         pop1: int,
@@ -4440,6 +6480,8 @@ class Operations:
         route_length: float,
         current_year: int,
         interior_max_pop: int = 0,
+        route_points: list = None,
+        player: Player = None,
     ) -> float:
         """Conservative annual revenue potential (no construction cost) for endpoint demand vs length."""
         if route_length <= 0:
@@ -4455,13 +6497,14 @@ class Operations:
         sy = self.get_timeline_start_year()
         ey = self.get_timeline_end_year()
         span = max(1, ey - sy)
-        from inflation_utils import get_inflation_factor
+        from inflation_utils import get_nominal_fare_cap
 
-        fare_cap = 2.0 + (float(current_year) - float(sy)) * 13.0 / float(span)
-        fare_cap = max(2.0, min(15.0, fare_cap))
-        real_fare = fare_cap / get_inflation_factor(int(current_year), max_factor=5.5)
-        # Below the AI's optimistic _estimate_line_profit factor (0.6 * 1.7) so margin failures are rare but real duds fail.
-        base = connection_value * real_fare * 0.35
+        sy = self.get_timeline_start_year()
+        ey = self.get_timeline_end_year()
+        _, fare_cap = get_nominal_fare_cap(
+            int(current_year), start_year=sy, end_year=ey,
+        )
+        base = connection_value * fare_cap * 0.35
         margin = max(0.25, min(10.0, getattr(self.game, "profit_margin", 1.0)))
         base *= margin
         try:
@@ -4469,63 +6512,17 @@ class Operations:
         except Exception:
             em = 1.0
         base *= min(1.0, em) * 0.9
+        if route_points and len(route_points) >= 2:
+            p0, p1 = route_points[0], route_points[-1]
+            base += self._ai_planned_transfer_revenue_at_endpoint(
+                float(p0[0]), float(p0[1]), int(current_year), player,
+            )
+            base += self._ai_planned_transfer_revenue_at_endpoint(
+                float(p1[0]), float(p1[1]), int(current_year), player,
+            )
+            comp = self._ai_parallel_corridor_competition_factor(route_points)
+            base *= comp
         return float(base)
-
-    def _ai_estimated_minimum_annual_maintenance_planned_route(
-        self, route_points: list, current_year: int, is_bus_line: bool, is_ferry_line: bool
-    ) -> int:
-        """Typical annual line maintenance (track + one minimal in-era vehicle + schedule) for a completed route."""
-        from line import Line, Ferry as FerryLine, Bus as BusLine
-        from vehicle import Trainset, Railcar
-        from vehicle_presets import get_vehicle_registry
-
-        pts = []
-        for p in route_points:
-            if not p:
-                continue
-            x, y = self._ai_guard_normalize_xy(p[0], p[1])
-            pts.append((x, y))
-        if len(pts) < 2:
-            return 0
-        reg = get_vehicle_registry()
-        cy = int(current_year)
-        if is_ferry_line:
-            line = FerryLine("__ai_margin__", None, pts, owner=None, vehicles=[])
-            ferries = reg.get_ferries_by_year(cy)
-            if not ferries:
-                return 0
-            line.vehicles = [ferries[0][0]]
-        elif is_bus_line:
-            line = BusLine("__ai_margin__", None, pts, owner=None, vehicles=[])
-            buses = reg.get_buses_by_year(cy)
-            if not buses:
-                return 0
-            line.vehicles = [buses[0][0]]
-        else:
-            line = Line("__ai_margin__", None, pts, owner=None, vehicles=[])
-            locos = [pair for pair in reg.get_locomotives_by_year(cy) if getattr(pair[0], "can_have_railcars", False)]
-            if not locos:
-                locos = reg.get_locomotives_by_year(cy)
-            if not locos:
-                return 0
-            loco = locos[0][0]
-            if getattr(loco, "can_have_railcars", False):
-                rc = reg.get_earliest_railcar()
-                if rc is None:
-                    line.vehicles = [Trainset(locomotive=loco, cars=[])]
-                else:
-                    line.vehicles = [
-                        Trainset(
-                            locomotive=loco,
-                            cars=[Railcar("Std", 0, rc.capacity, rc.maitnance_costs)],
-                        )
-                    ]
-            else:
-                line.vehicles = [Trainset(locomotive=loco, cars=[])]
-        try:
-            return int(line.calc_maitnance(cy))
-        except Exception:
-            return 0
 
     @staticmethod
     def _nimby_line_elevation_chance_multiplier(
@@ -4556,6 +6553,7 @@ class Operations:
         player: Player,
         elevation_levels: list,
         segment_lengths: list = None,
+        route_points: list = None,
     ) -> Optional[dict]:
         """Roll for NIMBY lawsuit when queuing line construction. Returns prosecution result or None."""
         from agency import get_agency_by_name
@@ -4575,7 +6573,13 @@ class Operations:
             return None
 
         elev_mult = self._nimby_line_elevation_chance_multiplier(elevation_levels, segment_lengths)
-        chance = LINE_NIMBY_LAWSUIT_BASE_CHANCE * elev_mult
+        off_street_mult = 1.0
+        if route_points and len(route_points) >= 2:
+            from game_presets import OFF_STREET_NIMBY_CHANCE_BONUS_PER_FRACTION
+            frac = _route_off_street_length_fraction(self.get_map(), route_points, current_year)
+            if frac > 0:
+                off_street_mult = 1.0 + float(OFF_STREET_NIMBY_CHANCE_BONUS_PER_FRACTION) * frac
+        chance = LINE_NIMBY_LAWSUIT_BASE_CHANCE * elev_mult * off_street_mult
         if random.random() >= chance:
             return None
 
@@ -4585,40 +6589,6 @@ class Operations:
         excuse = random.choice(nimby_excuses)
         player.add_lawsuit_excuse(excuse)
         return self.game.prosecute_excuse_with_agency(nimby, player, excuse, current_year)
-
-    def _ai_planned_line_passes_operating_margin(
-        self,
-        game_map,
-        route_points: list,
-        route_length: float,
-        is_bus_line: bool,
-        is_ferry_line: bool,
-        current_year: int,
-        player: Player,
-    ) -> bool:
-        """True if conservative annual revenue covers minimal operating maintenance once the line is in service."""
-        if not route_points or len(route_points) < 2:
-            return False
-        p0, p1 = route_points[0], route_points[-1]
-        pop1 = self._ai_guard_pop_at_endpoint(game_map, p0[0], p0[1])
-        pop2 = self._ai_guard_pop_at_endpoint(game_map, p1[0], p1[1])
-        interior_max = self._ai_guard_interior_max_pop(game_map, route_points)
-        gross = self._ai_planned_line_gross_annual_revenue_floor(
-            pop1, pop2, float(route_length), int(current_year), interior_max_pop=interior_max
-        )
-        diff = (getattr(player, "ai_difficulty", None) or "medium")
-        if not isinstance(diff, str):
-            diff = "medium"
-        gross *= float(AI_DIFFICULTY_MARGIN_GROSS_MULTIPLIER.get(diff.lower(), 1.0))
-        maint = self._ai_estimated_minimum_annual_maintenance_planned_route(
-            route_points, int(current_year), is_bus_line, is_ferry_line
-        )
-        from worker import ENGINEER
-
-        operating_floor = int(maint) + int(ENGINEER.get_yearly_cost(int(current_year)))
-        if operating_floor <= 0:
-            return True
-        return gross >= float(operating_floor)
 
     def create_line_complete(self, name: str, points: list, player: Player, elevation_levels: list = None, is_ferry_line: bool = False, is_bus_line: bool = False, cost_info: dict = None, use_fast_path: bool = False) -> dict:
         """Complete line creation operation. Returns dict with result info.
@@ -4645,73 +6615,81 @@ class Operations:
         self.assert_line_name_globally_available(name)
         
         # OPTIMIZATION: Calculate segment lengths once, then derive total_length
-        # This avoids redundant calculations later in segment combining
         segment_lengths = []
         total_length = 0.0
         if len(points) > 1:
-            for i in range(len(points) - 1):
-                x1, y1 = points[i]
-                x2, y2 = points[i+1]
-                # Handle different point formats efficiently
-                if isinstance(x1, (list, tuple)):
-                    x1, y1 = float(x1[0]), float(x1[1])
-                elif hasattr(x1, 'x'):
-                    x1, y1 = float(x1.x), float(x1.y)
-                if isinstance(x2, (list, tuple)):
-                    x2, y2 = float(x2[0]), float(x2[1])
-                elif hasattr(x2, 'x'):
-                    x2, y2 = float(x2.x), float(x2.y)
-                segment_length = math.hypot(x2 - x1, y2 - y1)
-                segment_lengths.append(segment_length)
-                total_length += segment_length
+            total_length, segment_lengths = _polyline_metrics(points)
         
         # OPTIMIZATION: Fast duplicate name checking with early exit
         game_map = self.game.get_map()
         
-        # Validate all points are in buildable area (e.g. NYC boroughs). Skip when use_fast_path (AI uses population points already in area).
-        if not use_fast_path and hasattr(game_map, 'is_point_in_buildable_area'):
-            for i, pt in enumerate(points):
-                x, y = pt[0], pt[1]
-                if isinstance(x, (list, tuple)):
-                    x, y = float(x[0]), float(x[1])
-                elif hasattr(x, 'x'):
-                    x, y = float(x.x), float(x.y)
-                if not game_map.is_point_in_buildable_area(x, y):
-                    raise ValueError(
-                        f"Point {i+1} at ({x:.1f}, {y:.1f}) is outside the buildable area. "
-                        "Lines can only be built within the play area."
-                    )
+        human_cost_previewed = (
+            cost_info is not None
+            and not getattr(player, 'is_ai', False)
+            and not use_fast_path
+        )
+        
+        if not use_fast_path:
+            _assert_points_in_buildable_area(game_map, points)
         
         build_queue = self.game.build_queue
         if getattr(player, 'is_ai', False) and _ai_line_geometry_exists_elsewhere(points, game_map, build_queue):
             raise ValueError(
                 "AI players cannot create a line with the same route as an existing or in-progress line."
             )
+        ai_fast = bool(use_fast_path and getattr(player, 'is_ai', False))
+        skip_osm_recheck = human_cost_previewed or ai_fast
         if not is_ferry_line:
-            _validate_route_geometry(
-                points, game_map, is_bus_line=is_bus_line, is_ferry_line=is_ferry_line
+            street_check = _validate_land_line_route_for_build(
+                game_map, points, current_year=self.get_year(),
+                is_bus_line=is_bus_line, is_ferry_line=False, player=player,
+                ai_fast=ai_fast, skip_osm=skip_osm_recheck, for_extension=False,
+                elevation_levels=elevation_levels, cost_info=cost_info,
+                use_fast_path=use_fast_path, human_cost_previewed=human_cost_previewed,
             )
+            if not street_check.get('success'):
+                return {
+                    'success': False,
+                    'error_message': street_check.get('error_message'),
+                    'line': None,
+                    'cost': 0,
+                    'build_time': 0,
+                    'points_count': len(points),
+                }
         
-        # Block routes that sit on top of any other line (completed or under construction).
-        overlap_tol = 0.5
-        if getattr(game_map, 'use_osm', False):
-            try:
-                from map_preset_utils import ai_grid_polyline_overlap_tolerance
-                overlap_tol = ai_grid_polyline_overlap_tolerance(game_map)
-            except Exception:
-                overlap_tol = 0.02
-        overlap_routes = _collect_routes_for_overlap_validation(
-            game_map, self.game.build_queue, name
-        )
-        for i in range(len(points) - 1):
-            p1, p2 = points[i], points[i + 1]
-            if _segment_overlaps_existing_routes(p1, p2, overlap_routes, overlap_tol):
-                raise ValueError(
-                    "This line overlaps an existing route too closely. Choose a different corridor."
-                )
+        # Lines may cross or share corridors with other routes.
 
-        if not use_fast_path:
-            self._validate_line_not_on_construction_segments(points, name)
+        if getattr(player, 'is_ai', False) and not is_ferry_line:
+            ep0, ep1 = points[0], points[-1]
+            line_cost_hint = None
+            if cost_info and isinstance(cost_info.get('cost'), (int, float)):
+                line_cost_hint = int(cost_info['cost'])
+            two_station_err = self._ai_line_supports_two_stations_error(
+                player, points, is_bus_line=is_bus_line, line_cost=line_cost_hint,
+            )
+            if two_station_err:
+                return {
+                    'success': False,
+                    'error_message': two_station_err,
+                    'line': None,
+                    'cost': 0,
+                    'build_time': 0,
+                    'points_count': len(points),
+                }
+            pop1 = self._ai_guard_pop_at_endpoint(game_map, ep0[0], ep0[1])
+            pop2 = self._ai_guard_pop_at_endpoint(game_map, ep1[0], ep1[1])
+            if pop1 <= 0 or pop2 <= 0:
+                if not self._ai_route_has_two_viable_station_sites(
+                    player, game_map, points, is_bus_line=is_bus_line,
+                ):
+                    return {
+                        'success': False,
+                        'error_message': 'AI lines must have two viable station sites along the route.',
+                    'line': None,
+                    'cost': 0,
+                    'build_time': 0,
+                    'points_count': len(points),
+                }
         
         # Get construction workers (can be 0 - jobs can start without workers, they just won't progress)
         construction_workers = self.get_player_construction_worker_count(player)
@@ -4719,13 +6697,9 @@ class Operations:
         if use_fast_path and is_ferry_line:
             raise ValueError("Ferry lines cannot use the fast build path; water proximity must be validated.")
 
-        # Ferry routes: always enforce 60m-of-water rule (never skip for AI fast path).
+        # Ferry routes: preset-first water validation (no redundant tile/OSM proximity loops).
         if is_ferry_line:
-            if game_map.tile_system and hasattr(game_map.tile_system, 'set_water_check_deadline'):
-                game_map.tile_system.set_water_check_deadline(5.0)
             try:
-                if game_map.tile_system:
-                    game_map.tile_system.pre_cache_route_tiles(points, proximity_buffer_m=60.0)
                 self._validate_ferry_route(points)
             except ValueError as e:
                 return {
@@ -4736,38 +6710,9 @@ class Operations:
                     'build_time': 0,
                     'points_count': len(points),
                 }
-            finally:
-                if game_map.tile_system and hasattr(game_map.tile_system, 'clear_water_check_deadline'):
-                    game_map.tile_system.clear_water_check_deadline()
         
-        # Fast path: skip water/terrain/tile work when AI provides cost_info (max 10s per line)
-        if use_fast_path:
-            if cost_info is None:
+        if use_fast_path and cost_info is None:
                 raise ValueError("use_fast_path requires cost_info")
-            pass
-        elif game_map.tile_system and (is_ferry_line or not is_bus_line):
-            if hasattr(game_map.tile_system, 'set_water_check_deadline'):
-                game_map.tile_system.set_water_check_deadline(5.0)
-        try:
-            if not use_fast_path and game_map.tile_system and (is_ferry_line or not is_bus_line):
-                max_proximity_buffer = 60.0 if is_ferry_line else 0.0
-                game_map.tile_system.pre_cache_route_tiles(points, proximity_buffer_m=max_proximity_buffer)
-
-            # For bus lines, validate that all segments are on streets (skip for fast path)
-            if not use_fast_path and is_bus_line:
-                validation_result = self._validate_bus_route(points)
-                if not validation_result['success']:
-                    return {
-                        'success': False,
-                        'error_message': validation_result['error_message'],
-                        'line': None,
-                        'cost': 0,
-                        'build_time': 0,
-                        'points_count': len(points)
-                    }
-        finally:
-            if game_map.tile_system and hasattr(game_map.tile_system, 'clear_water_check_deadline'):
-                game_map.tile_system.clear_water_check_deadline()
         
         # Cost calculation: reuse cost_info if provided (avoids redundant calculation from UI preview).
         if cost_info is None:
@@ -4789,28 +6734,6 @@ class Operations:
         else:
             elevation_levels = elev
         
-        if getattr(player, "is_ai", False):
-            if not self._ai_planned_line_passes_operating_margin(
-                game_map,
-                points,
-                float(total_length),
-                is_bus_line,
-                is_ferry_line,
-                int(self.get_year()),
-                player,
-            ):
-                return {
-                    "success": False,
-                    "error_message": (
-                        "AI operating-margin guard: conservative annual revenue does not cover "
-                        "minimum operating maintenance for this route."
-                    ),
-                    "line": None,
-                    "cost": 0,
-                    "build_time": 0,
-                    "points_count": len(points),
-                }
-        
         # Check if player can afford
         if self.get_player_money(player) < effective_cost:
             raise ValueError(f"Player {self.get_player_name(player)} cannot afford line creation (needs ${effective_cost}).")
@@ -4828,29 +6751,22 @@ class Operations:
         work_rate = max(0.2, 1.0 - min(construction_workers * 0.2, 0.8))
         estimated_turns = max(1, int(base_turns * work_rate + 0.999))  # Round up to integer
         
-        # One build-queue job per point-to-point segment (map clicks), in route order.
-        segments = []
-        for i in range(len(points) - 1):
-            segments.append([points[i], points[i + 1]])
-
-        total_segments = len(segments)
-        for segment_idx, segment_points in enumerate(segments):
-            seg_elev = None
-            if elevation_levels and segment_idx < len(elevation_levels):
-                seg_elev = [elevation_levels[segment_idx]]
+        # Batched build-queue jobs: many point-to-point segments per job (same cost, far fewer turns).
+        batches = _batch_polyline_segments_for_build(points, elevation_levels)
+        for batch in batches:
             segment_data = {
                 'name': name,
-                'points': segment_points,
-                'segment_index': segment_idx,
-                'total_segments': total_segments,
+                'points': batch['points'],
+                'segment_index': batch['segment_index'],
+                'total_segments': batch['total_segments'],
                 'is_ferry_line': is_ferry_line,
                 'is_bus_line': is_bus_line,
-                'elevation_levels': seg_elev,
+                'elevation_levels': batch.get('elevation_levels'),
             }
             self.add_to_build_queue('line', segment_data, player, construction_workers)
 
         nimby_lawsuit = self._maybe_nimby_lawsuit_for_line_build(
-            player, elevation_levels, segment_lengths
+            player, elevation_levels, segment_lengths, route_points=points,
         )
 
         return {
@@ -4864,7 +6780,7 @@ class Operations:
             'remaining_money': self.get_player_money(player),
             'osm_snapped': game_map.use_osm if game_map.use_osm else False,
             'nimby_lawsuit': nimby_lawsuit,
-            'segments_queued': total_segments,
+            'segments_queued': len(batches),
         }
     
     def calculate_upgrade_cost(self, line, upgrades: list[str]) -> dict:
@@ -5062,10 +6978,11 @@ class Operations:
 
     def create_station_complete(self, station_name: str, x: float, y: float, player: Player, line_names: list[str]) -> dict:
         """Complete station creation operation. Returns dict with result info"""
-        from worker import CONSTRUCTION_WORKER
-        
+
         station_name = (station_name or "").strip()
-        self.assert_station_name_unique_for_player(player, station_name)
+        self.assert_station_name_unique_for_player(
+            player, station_name, x=float(x), y=float(y), line_names=line_names,
+        )
         
         # Get construction workers (can be 0 - jobs can start without workers, they just won't progress)
         construction_workers = self.get_player_construction_worker_count(player)
@@ -5086,7 +7003,6 @@ class Operations:
             if line:
                 route = self.get_line_route(line)
             if not route:
-                # Merge all segments from build queue for this line
                 all_segments = []
                 for build in self.game.build_queue:
                     if build['type'] == 'line' and build['data'].get('name') == line_name:
@@ -5135,6 +7051,8 @@ class Operations:
         if _station_targets_ferry(line_names):
             self._require_ferry_terminal_near_coast(game_map, x, y)
 
+        self._require_station_not_in_deep_water(game_map, x, y)
+
         self.assert_ai_stop_minimum_direct_separation(player, x, y)
 
         # Deduct money
@@ -5166,7 +7084,9 @@ class Operations:
         from station import Station
         
         station_name = (station_name or "").strip()
-        self.assert_station_name_unique_for_player(player, station_name)
+        self.assert_station_name_unique_for_player(
+            player, station_name, x=float(x), y=float(y), line_names=line_names,
+        )
         
         x, y = float(x), float(y)
         cost = self.calculate_station_cost(len(line_names), x, y)
@@ -5189,6 +7109,8 @@ class Operations:
         game_map = self.game.get_map()
         if any(isinstance(all_lines.get(ln), Ferry) for ln in line_names):
             self._require_ferry_terminal_near_coast(game_map, x, y)
+
+        self._require_station_not_in_deep_water(game_map, x, y)
 
         self.assert_ai_stop_minimum_direct_separation(player, x, y)
 
@@ -5213,6 +7135,19 @@ class Operations:
             'coordinates': (x, y),
             'remaining_money': self.get_player_money(player)
         }
+
+    def get_line_build_type_flags(self, line_name: str) -> tuple:
+        """Return (is_ferry_line, is_bus_line) for a built or queued line."""
+        line = self.get_map_lines().get(line_name)
+        if line is not None:
+            return isinstance(line, Ferry), isinstance(line, BusLine)
+        for build in self.get_build_queue():
+            if build.get('type') != 'line':
+                continue
+            data = build.get('data') or {}
+            if data.get('name') == line_name:
+                return bool(data.get('is_ferry_line', False)), bool(data.get('is_bus_line', False))
+        return False, False
     
     def calculate_extend_cost(self, line_name: str, additional_points: list, extend_from_end: bool, elevation_levels: list = None) -> dict:
         """Calculate cost to extend a line. Uses same variable cost system as calculate_line_cost.
@@ -5303,6 +7238,26 @@ class Operations:
                 x1, y1 = additional_points[i]
                 x2, y2 = additional_points[i+1]
                 total_length += math.hypot(x2 - x1, y2 - y1)
+
+        LINE_COST_MULTIPLIER = 1.5
+        is_ferry_line, is_bus_line = self.get_line_build_type_flags(line_name)
+        if is_ferry_line:
+            # Fast cost preview — full ferry validation runs in extend_line_complete.
+            ferry_cost = max(15, int(total_length * 40 * 0.8 * LINE_COST_MULTIPLIER))
+            return {
+                'cost': ferry_cost,
+                'length': total_length,
+                'points_count': len(additional_points),
+                'elevation_levels': elevation_levels,
+            }
+        if is_bus_line:
+            bus_cost = max(15, int(total_length * road_cost_per_unit * 0.5 * LINE_COST_MULTIPLIER))
+            return {
+                'cost': bus_cost,
+                'length': total_length,
+                'points_count': len(additional_points),
+                'elevation_levels': elevation_levels,
+            }
         
         # OPTIMIZATION: Reuse shared water checking method instead of duplicating logic
         water_cache = {}
@@ -5345,11 +7300,14 @@ class Operations:
             conn_in_water = is_point_in_water(last_x, last_y) or is_point_in_water(first_x, first_y)
             conn_on_road = is_point_on_road(mid_x, mid_y)
             conn_on_bridge = is_point_on_bridge(mid_x, mid_y)
+            conn_on_bridge_or_tunnel = conn_on_bridge or _segment_on_bridge_or_tunnel(
+                game_map, last_x, last_y, first_x, first_y, current_year,
+            )
             conn_has_buildings = has_buildings(mid_x, mid_y)
             
             if conn_on_road:
                 base_cost_per_unit = road_cost_per_unit
-            elif conn_in_water and not conn_on_bridge:
+            elif conn_in_water and not conn_on_bridge_or_tunnel:
                 base_cost_per_unit = water_cost_per_unit
             elif conn_has_buildings:
                 base_cost_per_unit = land_with_buildings_cost_per_unit
@@ -5358,11 +7316,15 @@ class Operations:
             
             conn_cost = base_cost_per_unit * conn_length
             elevation = elevation_levels[0] if elevation_levels else 'street'
-            # CRITICAL: No ground level on water
-            if conn_in_water and not conn_on_bridge and elevation == 'street':
+            if conn_in_water and not conn_on_bridge_or_tunnel and elevation == 'street':
                 raise ValueError(f"Cannot build at street level on water. Connection segment from ({last_x:.1f}, {last_y:.1f}) to ({first_x:.1f}, {first_y:.1f}) is in water. Use 'above_ground' or 'underground' instead.")
             conn_cost *= elevation_multipliers.get(elevation, 1.0)
             conn_cost *= event_cost_multiplier
+            _, is_bus_ext = self.get_line_build_type_flags(line_name)
+            conn_cost *= _off_street_segment_cost_multiplier(
+                game_map, last_x, last_y, first_x, first_y, current_year,
+                is_bus_line=is_bus_ext,
+            )
             total_cost += int(conn_cost)
         elif not extend_from_end and len(existing_route) > 0 and len(additional_points) > 0:
             first_x, first_y = existing_route[0]
@@ -5372,11 +7334,14 @@ class Operations:
             conn_in_water = is_point_in_water(first_x, first_y) or is_point_in_water(last_new_x, last_new_y)
             conn_on_road = is_point_on_road(mid_x, mid_y)
             conn_on_bridge = is_point_on_bridge(mid_x, mid_y)
+            conn_on_bridge_or_tunnel = conn_on_bridge or _segment_on_bridge_or_tunnel(
+                game_map, last_new_x, last_new_y, first_x, first_y, current_year,
+            )
             conn_has_buildings = has_buildings(mid_x, mid_y)
             
             if conn_on_road:
                 base_cost_per_unit = road_cost_per_unit
-            elif conn_in_water and not conn_on_bridge:
+            elif conn_in_water and not conn_on_bridge_or_tunnel:
                 base_cost_per_unit = water_cost_per_unit
             elif conn_has_buildings:
                 base_cost_per_unit = land_with_buildings_cost_per_unit
@@ -5385,11 +7350,15 @@ class Operations:
             
             conn_cost = base_cost_per_unit * conn_length
             elevation = elevation_levels[-1] if elevation_levels else 'street'
-            # CRITICAL: No ground level on water
-            if conn_in_water and not conn_on_bridge and elevation == 'street':
+            if conn_in_water and not conn_on_bridge_or_tunnel and elevation == 'street':
                 raise ValueError(f"Cannot build at street level on water. Connection segment from ({last_new_x:.1f}, {last_new_y:.1f}) to ({first_x:.1f}, {first_y:.1f}) is in water. Use 'above_ground' or 'underground' instead.")
             conn_cost *= elevation_multipliers.get(elevation, 1.0)
             conn_cost *= event_cost_multiplier
+            _, is_bus_ext = self.get_line_build_type_flags(line_name)
+            conn_cost *= _off_street_segment_cost_multiplier(
+                game_map, last_new_x, last_new_y, first_x, first_y, current_year,
+                is_bus_line=is_bus_ext,
+            )
             total_cost += int(conn_cost)
         
         # Cost for extension segments
@@ -5402,11 +7371,14 @@ class Operations:
                 seg_in_water = is_point_in_water(x1, y1) or is_point_in_water(x2, y2)
                 seg_on_road = is_point_on_road(mid_x, mid_y)
                 seg_on_bridge = is_point_on_bridge(mid_x, mid_y)
+                seg_on_bridge_or_tunnel = seg_on_bridge or _segment_on_bridge_or_tunnel(
+                    game_map, x1, y1, x2, y2, current_year,
+                )
                 seg_has_buildings = has_buildings(mid_x, mid_y)
                 
                 if seg_on_road:
                     base_cost_per_unit = road_cost_per_unit
-                elif seg_in_water and not seg_on_bridge:
+                elif seg_in_water and not seg_on_bridge_or_tunnel:
                     base_cost_per_unit = water_cost_per_unit
                 elif seg_has_buildings:
                     base_cost_per_unit = land_with_buildings_cost_per_unit
@@ -5414,20 +7386,19 @@ class Operations:
                     base_cost_per_unit = land_without_buildings_cost_per_unit
                 
                 seg_cost = base_cost_per_unit * seg_length
-                # For extension segments: segment i connects point i to point i+1
-                # If extending from end: elevation_levels[0] is for connection, elevation_levels[1..n] are for segments 0..n-1
-                # If extending from start: elevation_levels[-1] is for connection, elevation_levels[0..n-2] are for segments 0..n-1
                 if extend_from_end:
-                    # Segment i uses elevation_levels[i+1] (skip index 0 which is for connection)
                     elevation = elevation_levels[i + 1] if (i + 1) < len(elevation_levels) else 'street'
                 else:
-                    # Segment i uses elevation_levels[i] (last one is for connection)
                     elevation = elevation_levels[i] if i < len(elevation_levels) else 'street'
-                # CRITICAL: No ground level on water
-                if seg_in_water and not seg_on_bridge and elevation == 'street':
+                if seg_in_water and not seg_on_bridge_or_tunnel and elevation == 'street':
                     raise ValueError(f"Cannot build at street level on water. Extension segment from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is in water. Use 'above_ground' or 'underground' instead.")
                 seg_cost *= elevation_multipliers.get(elevation, 1.0)
                 seg_cost *= event_cost_multiplier
+                _, is_bus_ext = self.get_line_build_type_flags(line_name)
+                seg_cost *= _off_street_segment_cost_multiplier(
+                    game_map, x1, y1, x2, y2, current_year,
+                    is_bus_line=is_bus_ext,
+                )
                 total_cost += int(seg_cost)
         
         if total_cost < 15:
@@ -5467,8 +7438,15 @@ class Operations:
                 raise ValueError(f"Line '{line_name}' not found or not owned by player")
         
         # Fast path: use pre-computed cost from AI (avoids expensive water/road checks, max 10s per extension)
+        human_cost_previewed = (
+            cost_info is not None
+            and not getattr(player, 'is_ai', False)
+            and not use_fast_path
+        )
         if use_fast_path and cost_info:
             pass  # use cost_info as-is
+        elif human_cost_previewed:
+            pass  # human already ran calculate_extend_cost in the UI
         else:
             cost_info = self.calculate_extend_cost(line_name, additional_points, extend_from_end, elevation_levels)
         elevation_levels = cost_info['elevation_levels']  # Use validated elevation levels
@@ -5480,14 +7458,44 @@ class Operations:
         game_map = self.game.get_map()
         is_bus_line = bool(line and line.__class__.__name__ == 'Bus')
         is_ferry_line = bool(line and line.__class__.__name__ == 'Ferry')
-        existing_route = []
-        if line and hasattr(line, 'get_route'):
-            existing_route = list(line.get_route() or [])
+        if line is None:
+            for build in self.get_build_queue():
+                if build.get('type') != 'line':
+                    continue
+                data = build.get('data', {})
+                if data.get('name') != line_name:
+                    continue
+                is_bus_line = bool(data.get('is_bus_line', False))
+                is_ferry_line = bool(data.get('is_ferry_line', False))
+                break
+        existing_route = list(self.get_line_route_including_extensions(line_name) or [])
         merged = _ai_merged_line_route(existing_route, additional_points, extend_from_end)
+        ai_fast = bool(use_fast_path and getattr(player, 'is_ai', False))
+        skip_osm_recheck = human_cost_previewed or ai_fast
+
+        if not use_fast_path:
+            _assert_points_in_buildable_area(game_map, additional_points)
+
+        merged_elevs = _merged_route_elevation_levels(
+            line,
+                merged,
+            additional_points,
+            extend_from_end,
+            elevation_levels,
+                is_bus_line=is_bus_line,
+        )
         if not is_ferry_line:
-            _validate_route_geometry(
-                merged, game_map, is_bus_line=is_bus_line, is_ferry_line=is_ferry_line
+            street_check = _validate_land_line_route_for_build(
+                game_map, merged, current_year=self.get_year(),
+                is_bus_line=is_bus_line, is_ferry_line=False, player=player,
+                ai_fast=ai_fast, skip_osm=skip_osm_recheck, for_extension=True,
+                elevation_levels=merged_elevs, cost_info=cost_info,
+                use_fast_path=use_fast_path, human_cost_previewed=human_cost_previewed,
             )
+            if not street_check.get('success'):
+                raise ValueError(
+                    street_check.get('error_message') or 'Route must follow streets on land.'
+                )
         
         construction_workers = self.get_player_construction_worker_count(player)
         
@@ -5503,45 +7511,43 @@ class Operations:
         work_rate = max(0.2, 1.0 - min(construction_workers * 0.2, 0.8))
         estimated_turns = max(1, int(base_turns * work_rate + 0.999))  # Round up to integer
         
-        # Split extension into segments for progressive building
-        # Each segment is between two consecutive points
-        segments = []
-        if len(additional_points) > 1:
-            for i in range(len(additional_points) - 1):
-                segment_points = [additional_points[i], additional_points[i+1]]
-                segments.append(segment_points)
-        else:
-            # Single point extension (rare case - connect to next point)
-            segments.append(additional_points)
-        
-        # Add each segment to build queue as extension job
-        for segment_idx, segment_points in enumerate(segments):
-            # Get elevation for this segment
-            segment_elevation = elevation_levels[segment_idx] if segment_idx < len(elevation_levels) else 'street'
+        # Split extension into batched segments for progressive building
+        batches = _batch_polyline_segments_for_build(additional_points, elevation_levels)
+        for batch in batches:
+            batch_elev = batch.get('elevation_levels')
+            segment_elevation = (
+                batch_elev[0] if batch_elev else (
+                    elevation_levels[batch['segment_index']]
+                    if elevation_levels and batch['segment_index'] < len(elevation_levels)
+                    else 'street'
+                )
+            )
             extension_data = {
                 'line_name': line_name,
-                'points': segment_points,
+                'points': batch['points'],
                 'extend_from_end': extend_from_end,
-                'segment_index': segment_idx,
-                'total_segments': len(segments),
-                'elevation_levels': [segment_elevation]  # Store elevation for this segment
+                'segment_index': batch['segment_index'],
+                'total_segments': batch['total_segments'],
+                'elevation_levels': batch_elev if batch_elev else [segment_elevation],
             }
             self.add_to_build_queue('line_extension', extension_data, player, construction_workers)
 
-        ext_segment_lengths = []
-        if len(additional_points) > 1:
-            for i in range(len(additional_points) - 1):
-                x1, y1 = additional_points[i]
-                x2, y2 = additional_points[i + 1]
-                ext_segment_lengths.append(math.hypot(x2 - x1, y2 - y1))
+        _, ext_segment_lengths = _polyline_metrics(additional_points)
         ext_elevations = []
         if elevation_levels and len(additional_points) > 1:
             if extend_from_end:
                 ext_elevations = list(elevation_levels[1:len(additional_points)])
             else:
                 ext_elevations = list(elevation_levels[: len(additional_points) - 1])
+        route = list(self.get_line_route(line)) if line else []
+        ext_route = list(additional_points)
+        if extend_from_end and route:
+            ext_route = [route[-1]] + ext_route if route else ext_route
+        elif route:
+            ext_route = ext_route + [route[0]]
         nimby_lawsuit = self._maybe_nimby_lawsuit_for_line_build(
-            player, ext_elevations or elevation_levels, ext_segment_lengths or None
+            player, ext_elevations or elevation_levels, ext_segment_lengths or None,
+            route_points=ext_route if len(ext_route) >= 2 else None,
         )
 
         return {
@@ -5554,12 +7560,11 @@ class Operations:
             'build_time': estimated_turns,
             'base_turns': base_turns,
             'nimby_lawsuit': nimby_lawsuit,
-            'segments_queued': len(segments),
+            'segments_queued': len(batches),
         }
     
     def get_line_route_including_extensions(self, line_name: str) -> list:
-        """Get full route for a line including any pending extension segments in the build queue.
-        Used by AI to place stations on extended segments before construction completes."""
+        """Full route including pending extension segments in the build queue."""
         def _pt(p):
             if isinstance(p, (list, tuple)) and len(p) >= 2:
                 return (float(p[0]), float(p[1]))
@@ -5570,6 +7575,30 @@ class Operations:
         route = [_pt(p) for p in route] if route else []
 
         build_queue = self.get_build_queue()
+        if not route:
+            line_segments = []
+            for build in build_queue:
+                if build.get('type') != 'line':
+                    continue
+                data = build.get('data', {})
+                if data.get('name') != line_name:
+                    continue
+                segment_points = data.get('points', [])
+                if segment_points and len(segment_points) >= 2:
+                    line_segments.append((data.get('segment_index', 0), segment_points))
+            if line_segments:
+                line_segments.sort(key=lambda x: x[0])
+                route_points = []
+                for _segment_idx, segment_points in line_segments:
+                    segment_points = [_pt(p) for p in segment_points]
+                    if not route_points:
+                        route_points.extend(segment_points)
+                    elif segment_points[0] == route_points[-1]:
+                        route_points.extend(segment_points[1:])
+                    else:
+                        route_points.extend(segment_points)
+                route = route_points
+
         ext_builds = []
         for build in build_queue:
             if build.get('type') != 'line_extension':
@@ -5601,6 +7630,89 @@ class Operations:
             else:
                 route = route + ext_pts
         return route
+
+    def extension_attach_from_closest_end(self, line_name: str, click_point: tuple) -> bool:
+        """Pick route end vs start by proximity to the first extension click."""
+        route = self.get_line_route_including_extensions(line_name)
+        return _extension_attach_from_closest_end(route, click_point)
+
+    def get_pending_line_extension_routes(self) -> list:
+        """Grid polylines for line extensions in the build queue (for map display)."""
+        def _pt(p):
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                return (float(p[0]), float(p[1]))
+            return (float(getattr(p, 'x', 0)), float(getattr(p, 'y', 0)))
+
+        def _dedupe_append(route: list, pt) -> None:
+            if not route or route[-1] != pt:
+                route.append(pt)
+
+        extensions_by_line = {}
+        for build in self.get_build_queue():
+            if build.get('type') != 'line_extension':
+                continue
+            data = build.get('data') or {}
+            line_name = data.get('line_name')
+            if not line_name:
+                continue
+            if line_name not in extensions_by_line:
+                extensions_by_line[line_name] = {
+                    'segments': [],
+                    'player': build.get('player'),
+                    'extend_from_end': data.get('extend_from_end', True),
+                }
+            extensions_by_line[line_name]['segments'].append(
+                (data.get('segment_index', 0), data.get('points', []))
+            )
+
+        results = []
+        for line_name, info in extensions_by_line.items():
+            segments = sorted(info['segments'], key=lambda x: x[0])
+            ext_route = []
+            for _seg_idx, seg_pts in segments:
+                for p in seg_pts or []:
+                    _dedupe_append(ext_route, _pt(p))
+            if len(ext_route) < 1:
+                continue
+
+            line = self.get_map_lines().get(line_name)
+            built_route = [_pt(p) for p in (self.get_line_route(line) if line else [])]
+            extend_from_end = info.get('extend_from_end', True)
+            display_route = []
+            if built_route:
+                if extend_from_end:
+                    display_route.append(built_route[-1])
+                    for p in ext_route:
+                        _dedupe_append(display_route, p)
+                else:
+                    for p in ext_route:
+                        _dedupe_append(display_route, p)
+                    _dedupe_append(display_route, built_route[0])
+            else:
+                display_route = ext_route
+
+            if len(display_route) < 2:
+                continue
+
+            line_type = 'train'
+            if line:
+                try:
+                    from line import Ferry, Bus
+                    if isinstance(line, Ferry):
+                        line_type = 'ferry'
+                    elif isinstance(line, Bus):
+                        line_type = 'bus'
+                except Exception:
+                    pass
+
+            results.append({
+                'line_name': line_name,
+                'points': display_route,
+                'player': info.get('player'),
+                'line_type': line_type,
+                'extend_from_end': extend_from_end,
+            })
+        return results
 
     def get_station_creation_available_points(self, line_name: str) -> list[tuple]:
         """Get all points on a line where stations can be built (anywhere on the line)"""
@@ -5730,6 +7842,32 @@ class Operations:
                         if entry not in lines_at_point:
                             lines_at_point.append(entry)
                         break  # Found this line in construction, move to next
+
+        for ext_info in self.get_pending_line_extension_routes():
+            line_name = ext_info.get('line_name', 'Unknown')
+            player = ext_info.get('player')
+            segment_points = ext_info.get('points', [])
+            for i in range(len(segment_points) - 1):
+                pt1 = segment_points[i]
+                pt2 = segment_points[i + 1]
+                x1, y1 = float(pt1[0]), float(pt1[1])
+                x2, y2 = float(pt2[0]), float(pt2[1])
+                dx = x2 - x1
+                dy = y2 - y1
+                seg_len_sq = dx * dx + dy * dy
+                if seg_len_sq == 0:
+                    dist = math.hypot(x - x1, y - y1)
+                else:
+                    t = max(0, min(1, ((x - x1) * dx + (y - y1) * dy) / seg_len_sq))
+                    proj_x = x1 + t * dx
+                    proj_y = y1 + t * dy
+                    dist = math.hypot(x - proj_x, y - proj_y)
+                if dist <= tolerance:
+                    line = all_lines.get(line_name)
+                    entry = (line, line_name, player)
+                    if entry not in lines_at_point:
+                        lines_at_point.append(entry)
+                    break
         
         return lines_at_point
     
@@ -5741,14 +7879,7 @@ class Operations:
         vehicles = self.get_line_vehicles(line)
         stations = self.get_line_stations(line)
         
-        # CRITICAL: Only use cached profit - NEVER calculate it here to avoid freezes
-        # Profit is calculated and cached during year advance
-        if hasattr(line, '_cached_profit') and hasattr(line, '_cached_profit_year') and line._cached_profit_year == current_year:
-            profit = line._cached_profit
-        else:
-            # No cache available - return 0 to avoid any expensive calculation
-            # This prevents freeze when clicking lines before year advance completes
-            profit = 0
+        profit = self.calc_line_profit(line, current_year)
         
         maintenance = self.calc_line_maintenance(line, current_year)
         fare = self.get_line_fare(line)
@@ -5770,8 +7901,8 @@ class Operations:
         """Calculate station creation cost. If (x,y) provided and an existing station
         is within 50m (station extension to another line), returns half price."""
         import math
-        base_cost = 500
-        additional_cost = 250
+        base_cost = self.inflate_economic_value(500, max_factor=10.0)
+        additional_cost = self.inflate_economic_value(250, max_factor=10.0)
         cost = base_cost + ((num_lines - 1) * additional_cost)
         if x is not None and y is not None:
             game_map = self.game.get_map()
@@ -5801,6 +7932,156 @@ class Operations:
             except Exception:
                 pass
         return float(math.hypot(x2 - x1, y2 - y1) * 1000.0)
+
+    def _shared_track_threshold_grid(self) -> float:
+        """Convert SHARED_TRACK_MAX_DISTANCE_M to grid units for the current map."""
+        meters_per_grid = self._direct_distance_between_stop_positions_m(0.0, 0.0, 1.0, 0.0)
+        if meters_per_grid <= 0:
+            return SHARED_TRACK_MAX_DISTANCE_M / 1000.0
+        return SHARED_TRACK_MAX_DISTANCE_M / meters_per_grid
+
+    def _existing_track_segments_for_sharing(self, exclude_line_name: str = None) -> list:
+        """Route polylines of built and under-construction lines (candidate shared tracks)."""
+        game_map = self.game.get_map()
+        build_queue = getattr(self.game, 'build_queue', None) or []
+        return _collect_routes_for_overlap_validation(game_map, build_queue, exclude_line_name or '')
+
+    def _segment_reuses_existing_track(
+        self, x1: float, y1: float, x2: float, y2: float, existing_routes: list, threshold_grid: float,
+    ) -> bool:
+        """True when segment (x1,y1)-(x2,y2) runs on top of an existing track (within threshold)."""
+        if not existing_routes:
+            return False
+
+        def pt_seg(px, py, sx, sy, tx, ty):
+            dx, dy = tx - sx, ty - sy
+            d2 = dx * dx + dy * dy
+            if d2 < 1e-20:
+                return math.hypot(px - sx, py - sy)
+            t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / d2))
+            return math.hypot(px - (sx + t * dx), py - (sy + t * dy))
+
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        for route in existing_routes:
+            for k in range(len(route) - 1):
+                cx, cy = float(route[k][0]), float(route[k][1])
+                dx, dy = float(route[k + 1][0]), float(route[k + 1][1])
+                # Shared track requires the whole new segment to lie on the existing one.
+                if (
+                    pt_seg(x1, y1, cx, cy, dx, dy) <= threshold_grid
+                    and pt_seg(x2, y2, cx, cy, dx, dy) <= threshold_grid
+                    and pt_seg(mx, my, cx, cy, dx, dy) <= threshold_grid
+                ):
+                    return True
+        return False
+
+    def _ai_min_two_station_route_length_grid(self, is_bus_line: bool) -> float:
+        from game_presets import (
+            AI_BUS_MIN_TWO_STATION_ROUTE_LENGTH_GRID,
+            AI_RAIL_MIN_TWO_STATION_ROUTE_LENGTH_GRID,
+        )
+        return (
+            float(AI_BUS_MIN_TWO_STATION_ROUTE_LENGTH_GRID)
+            if is_bus_line
+            else float(AI_RAIL_MIN_TWO_STATION_ROUTE_LENGTH_GRID)
+        )
+
+    def _ai_station_site_viable_on_route(
+        self, player: Player, game_map, x: float, y: float, *, is_bus_line: bool = False,
+    ) -> bool:
+        """True when (x, y) can host a queued/built station (not a bare route vertex)."""
+        if not game_map:
+            return False
+        try:
+            from map_preset_loader import get_preset_ai_station_population
+            pop_map = getattr(game_map, 'population', None) or {}
+            pop = get_preset_ai_station_population(game_map, float(x), float(y), pop_map)
+        except Exception:
+            pop = 0
+        if pop <= 0:
+            gx, gy = int(round(x)), int(round(y))
+            pop = int((getattr(game_map, 'population', None) or {}).get((gx, gy), 0) or 0)
+        if pop <= 0:
+            return False
+        if getattr(player, 'is_ai', False):
+            try:
+                self.assert_ai_stop_minimum_direct_separation(player, float(x), float(y))
+            except ValueError:
+                return False
+        return True
+
+    def _ai_find_route_station_site_from_end(
+        self, player: Player, game_map, route_points: list, *, from_start: bool, is_bus_line: bool = False,
+    ) -> Optional[tuple]:
+        if not route_points:
+            return None
+        seq = route_points if from_start else list(reversed(route_points))
+        for pt in seq:
+            if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                x, y = float(pt[0]), float(pt[1])
+            else:
+                x, y = float(getattr(pt, 'x', 0)), float(getattr(pt, 'y', 0))
+            if self._ai_station_site_viable_on_route(
+                player, game_map, x, y, is_bus_line=is_bus_line,
+            ):
+                return (x, y)
+        return None
+
+    def _ai_route_has_two_viable_station_sites(
+        self, player: Player, game_map, route_points: list, *, is_bus_line: bool = False,
+    ) -> bool:
+        """Route must support two station sites along it (endpoints may be in water)."""
+        if not route_points or len(route_points) < 2:
+            return False
+        s1 = self._ai_find_route_station_site_from_end(
+            player, game_map, route_points, from_start=True, is_bus_line=is_bus_line,
+        )
+        s2 = self._ai_find_route_station_site_from_end(
+            player, game_map, route_points, from_start=False, is_bus_line=is_bus_line,
+        )
+        if not s1 or not s2:
+            return False
+        min_sp = self._ai_min_two_station_route_length_grid(is_bus_line)
+        return math.hypot(s2[0] - s1[0], s2[1] - s1[1]) >= min_sp - 1e-9
+
+    def _ai_line_supports_two_stations_error(
+        self,
+        player: Player,
+        points: list,
+        *,
+        is_bus_line: bool = False,
+        line_cost: int = None,
+    ) -> Optional[str]:
+        """Return an error message when an AI line cannot support two endpoint stations."""
+        if not points or len(points) < 2:
+            return "AI lines must have at least two route points for two stations."
+        min_sp = self._ai_min_two_station_route_length_grid(is_bus_line)
+        total_len, _ = _polyline_metrics(points)
+        if total_len < min_sp - 1e-9:
+            return (
+                f"AI lines must be long enough for two stations "
+                f"(at least {min_sp:.2f} grid units, got {total_len:.2f})."
+            )
+        x0, y0 = _normalize_route_point(points[0])
+        x1, y1 = _normalize_route_point(points[-1])
+        if math.hypot(x1 - x0, y1 - y0) < min_sp - 1e-9:
+            return (
+                f"AI line endpoints are too close for two stations "
+                f"(need at least {min_sp:.2f} grid units apart)."
+            )
+        if line_cost is not None:
+            try:
+                money = int(self.get_player_money(player))
+                station_cost = int(self.calculate_station_cost(1))
+                need = int(line_cost) + station_cost * 2
+                if money < need:
+                    return (
+                        f"AI cannot afford this line and two endpoint stations "
+                        f"(need ${need:,}, have ${money:,})."
+                    )
+            except (TypeError, ValueError):
+                pass
+        return None
 
     def assert_ai_stop_minimum_direct_separation(
         self, player: Player, x: float, y: float, exclude_pending_station_build: dict = None
@@ -6071,7 +8352,9 @@ class Operations:
             self._require_ferry_terminal_near_coast(game_map, grid_x, grid_y)
 
         station_name = (station_name or "").strip()
-        self.assert_station_name_unique_for_player(player, station_name)
+        self.assert_station_name_unique_for_player(
+            player, station_name, x=float(grid_x), y=float(grid_y), line_names=[line_name],
+        )
         self.assert_ai_stop_minimum_direct_separation(player, grid_x, grid_y)
         station = Station(station_name, grid_x, grid_y)
         self.add_station_to_line(player, line_name, station)
@@ -6181,21 +8464,9 @@ class Operations:
                     segment_points = build['data']['points']
                     
                     if existing_line:
-                        # Add completed segment to existing partial line
-                        existing_route = list(existing_line.get_route())
-                        
-                        # Check if last point of existing route connects to first point of segment
-                        if existing_route and existing_route[-1] == segment_points[0]:
-                            # Append the second point of the segment
-                            if len(segment_points) > 1 and segment_points[1] not in existing_route:
-                                existing_route.append(segment_points[1])
-                        else:
-                            # Add both points if neither is in route
-                            for point in segment_points:
-                                if point not in existing_route:
-                                    existing_route.append(point)
-                        
-                        existing_line.route = existing_route
+                        existing_line.route = _merge_route_with_completed_build_points(
+                            existing_line.get_route(), segment_points,
+                        )
                     else:
                         # Create new partial line with this segment
                         is_ferry = build['data'].get('is_ferry_line', False)
@@ -6203,9 +8474,11 @@ class Operations:
                         if is_ferry:
                             from line import Ferry
                             line = Ferry(name=build['data']['name'], object_id=None, route=segment_points, owner=build['player'], vehicles=[])
+                            self.apply_timeline_fare_to_line(line)
                         elif is_bus:
                             from line import Bus
                             line = Bus(name=build['data']['name'], object_id=None, route=segment_points, owner=build['player'], vehicles=[])
+                            self.apply_timeline_fare_to_line(line)
                         else:
                             line = self.game.create_line(build['data']['name'], build['player'], segment_points)
                         build['player'].acquire_line(line)
@@ -6217,9 +8490,11 @@ class Operations:
                     if is_ferry:
                         from line import Ferry
                         line = Ferry(name=build['data']['name'], object_id=None, route=build['data']['points'], owner=build['player'], vehicles=[])
+                        self.apply_timeline_fare_to_line(line)
                     elif is_bus:
                         from line import Bus
                         line = Bus(name=build['data']['name'], object_id=None, route=build['data']['points'], owner=build['player'], vehicles=[])
+                        self.apply_timeline_fare_to_line(line)
                     else:
                         line = self.game.create_line(build['data']['name'], build['player'], build['data']['points'])
                     build['player'].acquire_line(line)
@@ -6256,7 +8531,12 @@ class Operations:
                 st_player = build['player']
                 st_nm = (build['data'].get('name') or '').strip()
                 self.assert_station_name_unique_for_player(
-                    st_player, st_nm, exclude_pending_station_build=build
+                    st_player,
+                    st_nm,
+                    exclude_pending_station_build=build,
+                    x=float(build['data']['x']),
+                    y=float(build['data']['y']),
+                    line_names=build['data'].get('line_names') or [],
                 )
                 self.assert_ai_stop_minimum_direct_separation(
                     st_player,
@@ -6270,8 +8550,6 @@ class Operations:
                     build['data']['y'],
                     line_names=build['data'].get('line_names', [])
                 )
-                # Add station to all specified lines using the proper method
-                # This works for both complete and incomplete lines
                 for line_name in build['data'].get('line_names', []):
                     all_lines = self.game.get_map().get_lines_by_name()
                     line = all_lines.get(line_name)
@@ -6284,13 +8562,9 @@ class Operations:
                         partial_points = []
                         for build_item in self.game.build_queue:
                             if build_item['type'] == 'line' and build_item['data'].get('name') == line_name:
-                                if 'segment_index' in build_item['data']:
-                                    partial_points.extend(build_item['data'].get('points', []))
-                                else:
                                     partial_points.extend(build_item['data'].get('points', []))
                         
                         if partial_points:
-                            # Create partial line to hold the station
                             partial_line = self.game.create_line(line_name, build['player'], partial_points)
                             build['player'].acquire_line(partial_line)
                             self.game.get_map().add_line(partial_line)
@@ -6298,7 +8572,6 @@ class Operations:
                             if hasattr(station, 'add_line'):
                                 station.add_line(line_name)
                 
-                # Add station to map if needed
                 game_map = self.game.get_map()
                 if not hasattr(game_map, 'stations'):
                     game_map.stations = []
@@ -6453,44 +8726,33 @@ class Operations:
     def _calculate_base_work(self, build: dict) -> float:
         """Calculate the base work needed for a build (work with 1 worker = turns with 1 worker)"""
         import math
-        from game_presets import LINE_BUILD_SPEED_MULTIPLIER
         if build['type'] == 'line':
             points = build['data']['points']
-            total_length = 0.0
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    x1, y1 = points[i]
-                    x2, y2 = points[i+1]
-                    total_length += math.hypot(x2 - x1, y2 - y1)
-            base_work = max(1.0, float(int(total_length) + 1)) / LINE_BUILD_SPEED_MULTIPLIER
+            total_length, _ = _polyline_metrics(points)
+            base_work = _line_build_work_units(total_length)
         elif build['type'] == 'line_extension':
             # Line extension work is based on the length of the extension points
             points = build['data']['points']
-            total_length = 0.0
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    x1, y1 = points[i]
-                    x2, y2 = points[i+1]
-                    total_length += math.hypot(x2 - x1, y2 - y1)
+            total_length, _ = _polyline_metrics(points)
             # Also add distance from existing line to first extension point
             if len(points) > 0:
-                # Get the line to calculate connection distance
                 line_name = build['data'].get('line_name')
                 if line_name:
                     line = self.game.get_map().get_lines_by_name().get(line_name)
                     if line:
                         existing_route = self.get_line_route(line)
                         if existing_route:
+                            import math
                             extend_from_end = build['data'].get('extend_from_end', True)
                             if extend_from_end:
-                                last_x, last_y = existing_route[-1]
-                                first_x, first_y = points[0]
+                                last_x, last_y = _normalize_route_point(existing_route[-1])
+                                first_x, first_y = _normalize_route_point(points[0])
                                 total_length += math.hypot(first_x - last_x, first_y - last_y)
                             else:
-                                first_x, first_y = existing_route[0]
-                                last_new_x, last_new_y = points[-1]
+                                first_x, first_y = _normalize_route_point(existing_route[0])
+                                last_new_x, last_new_y = _normalize_route_point(points[-1])
                                 total_length += math.hypot(first_x - last_new_x, first_y - last_new_y)
-            base_work = max(1.0, float(int(total_length) + 1)) / LINE_BUILD_SPEED_MULTIPLIER
+            base_work = _line_build_work_units(total_length)
         elif build['type'] == 'station':
             num_lines = len(build['data'].get('line_names', []))
             base_work = max(1.0, float(num_lines))
@@ -6502,27 +8764,14 @@ class Operations:
         """Add a build to the queue. All game logic in ui.py.
         Speed: N workers = 1/N time (1 worker = base_work turns, 2 workers = base_work/2 turns)"""
         import math
-        from game_presets import LINE_BUILD_SPEED_MULTIPLIER
         # Calculate base work needed (work with 1 worker). Must match _calculate_base_work.
         if build_type == 'line':
             points = build_data['points']
-            total_length = 0.0
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    x1, y1 = points[i]
-                    x2, y2 = points[i+1]
-                    total_length += math.hypot(x2 - x1, y2 - y1)
-            base_work = max(1.0, float(int(total_length) + 1)) / LINE_BUILD_SPEED_MULTIPLIER
+            total_length, _ = _polyline_metrics(points)
+            base_work = _line_build_work_units(total_length)
         elif build_type == 'line_extension':
-            # Line extension work is based on the length of the extension points
             points = build_data['points']
-            total_length = 0.0
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    x1, y1 = points[i]
-                    x2, y2 = points[i+1]
-                    total_length += math.hypot(x2 - x1, y2 - y1)
-            # Also add distance from existing line to first extension point
+            total_length, _ = _polyline_metrics(points)
             if len(points) > 0:
                 line_name = build_data.get('line_name')
                 if line_name:
@@ -6532,14 +8781,14 @@ class Operations:
                         if existing_route:
                             extend_from_end = build_data.get('extend_from_end', True)
                             if extend_from_end:
-                                last_x, last_y = existing_route[-1]
-                                first_x, first_y = points[0]
+                                last_x, last_y = _normalize_route_point(existing_route[-1])
+                                first_x, first_y = _normalize_route_point(points[0])
                                 total_length += math.hypot(first_x - last_x, first_y - last_y)
                             else:
-                                first_x, first_y = existing_route[0]
-                                last_new_x, last_new_y = points[-1]
+                                first_x, first_y = _normalize_route_point(existing_route[0])
+                                last_new_x, last_new_y = _normalize_route_point(points[-1])
                                 total_length += math.hypot(first_x - last_new_x, first_y - last_new_y)
-            base_work = max(1.0, float(int(total_length) + 1)) / LINE_BUILD_SPEED_MULTIPLIER
+            base_work = _line_build_work_units(total_length)
         elif build_type == 'station':
             # Stations always take 1 turn with 1 worker
             base_work = 1.0
@@ -7022,15 +9271,15 @@ class Operations:
                 destination_weights_cache[origin] = (destinations, weights, total_weight)
             return destination_weights_cache[origin]
         
-        # Optimize sample size and enforce time budget to keep End Year under 5 seconds
-        RIDERSHIP_TIME_BUDGET_SEC = 1.5
+        # Optimize sample size and enforce time budget to keep End Year responsive
+        RIDERSHIP_TIME_BUDGET_SEC = 18.0
         map_size = game_map.width * game_map.height
         if map_size < 2500:  # < 50x50
-            sample_size = min(total_population, 150)
+            sample_size = min(total_population, 1800)
         elif map_size < 10000:  # < 100x100
-            sample_size = min(total_population, 80)
+            sample_size = min(total_population, 960)
         else:  # Large maps (e.g. NYC)
-            sample_size = min(total_population, 40)
+            sample_size = min(total_population, 480)
         
         start_time = time.time()
         self._route_stations_cache = {}
@@ -7054,7 +9303,7 @@ class Operations:
             if time.time() - start_time > RIDERSHIP_TIME_BUDGET_SEC:
                 sample_size = trip_idx or 1
                 break
-            if trip_idx > 0 and trip_idx % 30 == 0:
+            if trip_idx > 0 and trip_idx % 360 == 0:
                 time.sleep(0.01)  # Yield GIL occasionally so main thread can update timer
             # Randomly select an origin weighted by population (binary search for large n)
             rand_origin = random.random() * total_origin_weight
@@ -7143,19 +9392,20 @@ class Operations:
             # No trainset assigned yet: give a small profit floor so players/AIs get income the first year after building
             stations_list = line.get_stations() if hasattr(line, 'get_stations') else (getattr(line, 'stations', None) or [])
             if len(stations_list) >= 2 and not has_incomplete_segments:
-                from inflation_utils import get_inflation_factor
-                floor = 400
-                floor = int(floor / get_inflation_factor(current_year, max_factor=5.5))
+                floor = self.inflate_economic_value(400, max_factor=5.5)
                 line.profit = max(0, floor)
                 return line.profit
             line.profit = 0
             return 0
         
-        from inflation_utils import get_inflation_factor
-        max_acceptable_fare = 2 + (current_year - 1830) * (15 - 2) / (2050 - 1830)
-        max_acceptable_fare = max(2, min(15, max_acceptable_fare))
+        from inflation_utils import get_nominal_fare_cap
+
+        sy = self.get_timeline_start_year()
+        ey = self.get_timeline_end_year()
+        _, max_acceptable_fare = get_nominal_fare_cap(
+            int(current_year), start_year=sy, end_year=ey,
+        )
         effective_fare = min(line.fare, max_acceptable_fare)
-        real_fare = effective_fare / get_inflation_factor(current_year, max_factor=5.5)
         
         # Calculate total capacity across all trainsets
         total_capacity_per_trip = 0
@@ -7170,7 +9420,10 @@ class Operations:
         if passengers_per_year == 0:
             stations_list = line.get_stations() if hasattr(line, 'get_stations') else (getattr(line, 'stations', None) or [])
             if len(stations_list) >= 2:
-                passengers_per_year = max(200, int(total_capacity_per_trip * 0.25))
+                passengers_per_year = max(
+                    self.inflate_economic_value(200, max_factor=5.5),
+                    int(total_capacity_per_trip * 0.25),
+                )
         
         # Calculate how many trips can be made per year
         # Use the fastest trainset to determine service frequency
@@ -7198,7 +9451,7 @@ class Operations:
         line.update_quality()
         quality_multiplier = 1.0 + ((line.quality - 1.0) * 0.2)
         profit_multiplier = max(0.25, min(10.0, getattr(self.game, 'profit_margin', 1.0)))
-        total_profit = actual_passengers * real_fare * profit_multiplier * quality_multiplier
+        total_profit = actual_passengers * effective_fare * profit_multiplier * quality_multiplier
         
         # Apply event effects
         event_profit_multiplier = 1.0
@@ -7509,43 +9762,166 @@ class Operations:
         
         marketplace = self.game.get_marketplace()
         available_lines = self.marketplace_get_available_lines()
-        
-        for sale_item in available_lines:
-            if not isinstance(sale_item, SaleItem):
-                continue
-            
+        current_year = self.get_year()
+
+        def _seller_priority(sale_item) -> int:
+            seller = sale_item.get_seller() if hasattr(sale_item, 'get_seller') else ''
+            if seller and seller not in ('Unowned', 'Manufacturer'):
+                return 0
+            return 1
+
+        sorted_lines = sorted(
+            (si for si in available_lines if isinstance(si, SaleItem)),
+            key=lambda si: (_seller_priority(si), si.get_price(current_year=current_year)),
+        )
+
+        for sale_item in sorted_lines:
             line = sale_item.get_item()
             if not isinstance(line, Line):
                 continue
             
-            price = sale_item.get_price(current_year=self.get_year())
-            if price <= self.public_ta.get_money():
+            price = sale_item.get_price(current_year=current_year)
+            if price > self.public_ta.get_money():
+                continue
                 self.public_ta.deduct_money(price)
                 line.owner = self.public_ta
                 self.public_ta.acquire_line(line)
-                game_map = self.get_map()
-                if line.name not in game_map.get_lines_by_name():
-                    game_map.add_line(line)
+            self.add_line_to_map(line)
+            self.invalidate_ridership_cache()
                 
-                is_unowned = sale_item.get_seller() == "Unowned"
-                if not is_unowned:
-                    seller = sale_item.get_salesman()
-                    if seller:
-                        self.add_player_money(seller, price, reason='Public TA line sale')
-                    marketplace.remove_line(line)
-                break
+            is_unowned = sale_item.get_seller() == "Unowned"
+            if not is_unowned:
+                seller = sale_item.get_salesman()
+                if seller:
+                    self.add_player_money(seller, price, reason='Public TA line sale')
+                marketplace.remove_line(line)
     
-    def get_population_points_for_display(self, game_map, edit_mode_enabled: bool = False) -> list[dict]:
+    def get_stations_for_map_display(self, game_map, current_player=None) -> list[dict]:
+        """Stations for OSM map overlay: completed map stations, line-attached stops, and queue jobs."""
+        import math
+        from map_preset_loader import get_map_bounds, get_default_center_lat, get_default_center_lon
+
+        map_width_val = game_map.width if getattr(game_map, 'width', None) else 50
+        map_height_val = game_map.height if getattr(game_map, 'height', None) else 50
+        grid_size = max(map_width_val, map_height_val)
+        if grid_size <= 0:
+            return []
+
+        preset_name = getattr(game_map, 'map_preset_name', None)
+        preset_bounds = get_map_bounds(preset_name) if preset_name else None
+        center_lat = (
+            game_map.map_center_lat
+            if hasattr(game_map, 'map_center_lat') and game_map.map_center_lat is not None
+            else get_default_center_lat(preset_name)
+        )
+        center_lon = (
+            game_map.map_center_lon
+            if hasattr(game_map, 'map_center_lon') and game_map.map_center_lon is not None
+            else get_default_center_lon(preset_name)
+        )
+        use_preset_bounds = preset_bounds and all(
+            k in preset_bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon')
+        )
+        if use_preset_bounds:
+            min_lat, max_lat = preset_bounds['min_lat'], preset_bounds['max_lat']
+            min_lon, max_lon = preset_bounds['min_lon'], preset_bounds['max_lon']
+            preset_lat_scale = (max_lat - min_lat) / map_height_val if map_height_val > 0 else 0
+            preset_lon_scale = (max_lon - min_lon) / map_width_val if map_width_val > 0 else 0
+        else:
+            lon_deg_per_km = 111.0 * math.cos(math.radians(center_lat)) or 111.0
+            min_lat, max_lat = center_lat - 0.5, center_lat + 0.5
+            min_lon, max_lon = center_lon - 0.5, center_lon + 0.5
+
+        def grid_to_lat_lon(x: float, y: float):
+            if use_preset_bounds:
+                lat = preset_bounds['min_lat'] + y * preset_lat_scale
+                lon = preset_bounds['min_lon'] + x * preset_lon_scale
+            else:
+                lat_km = y - grid_size // 2
+                lon_km = x - grid_size // 2
+                lat = center_lat + (lat_km / 111.0)
+                lon = center_lon + (lon_km / lon_deg_per_km)
+            return lat, lon
+
+        def can_close_station(line_names: list) -> bool:
+            if not line_names or current_player is None:
+                return True
+            for ln in line_names:
+                line = self.get_map_lines().get(ln)
+                if line and self.get_line_owner(line) != current_player:
+                    return False
+            return True
+
+        seen_keys = set()
+        stations_data = []
+
+        def append_station(x, y, name, under_construction, line_names):
+            key = (round(float(x), 3), round(float(y), 3))
+            if key in seen_keys:
+                return
+            lat, lon = grid_to_lat_lon(float(x), float(y))
+            if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
+                return
+            seen_keys.add(key)
+            line_names = list(line_names or [])
+            stations_data.append({
+                'lat': lat,
+                'lon': lon,
+                'name': name or 'Station',
+                'under_construction': bool(under_construction),
+                'can_close': can_close_station(line_names),
+                'line_names': line_names,
+            })
+
+        for build in self.game.build_queue or []:
+            if build.get('type') != 'station':
+                continue
+            build_data = build.get('data') or {}
+            x, y = build_data.get('x'), build_data.get('y')
+            if x is None or y is None:
+                continue
+            append_station(
+                x, y,
+                build_data.get('name', 'Station'),
+                True,
+                build_data.get('line_names', []),
+            )
+
+        for station in getattr(game_map, 'stations', []) or []:
+            x = station.get_x() if hasattr(station, 'get_x') else getattr(station, 'x', None)
+            y = station.get_y() if hasattr(station, 'get_y') else getattr(station, 'y', None)
+            if x is None or y is None:
+                continue
+            line_names = (
+                station.get_line_names()
+                if hasattr(station, 'get_line_names')
+                else getattr(station, 'line_names', [])
+            )
+            name = station.get_name() if hasattr(station, 'get_name') else getattr(station, 'name', 'Station')
+            append_station(x, y, name, False, line_names)
+
+        lines = game_map.lines if hasattr(game_map, 'lines') and game_map.lines else {}
+        for line in lines.values():
+            line_stations = line.get_stations() if hasattr(line, 'get_stations') else getattr(line, 'stations', [])
+            for station in line_stations or []:
+                x = station.get_x() if hasattr(station, 'get_x') else getattr(station, 'x', None)
+                y = station.get_y() if hasattr(station, 'get_y') else getattr(station, 'y', None)
+                if x is None or y is None:
+                    continue
+                line_names = (
+                    station.get_line_names()
+                    if hasattr(station, 'get_line_names')
+                    else getattr(station, 'line_names', [])
+                )
+                name = station.get_name() if hasattr(station, 'get_name') else getattr(station, 'name', 'Station')
+                append_station(x, y, name, False, line_names)
+
+        return stations_data
+
+    def get_population_points_for_display(self, game_map) -> list[dict]:
         """Get all population points that should be displayed on the map.
         Returns a list of dicts with keys: 'grid_x', 'grid_y', 'pop', 'lat', 'lon', and optionally 'included'
         All game logic for determining which points to display is here.
-        
-        Args:
-            game_map: Map object
-            edit_mode_enabled: If True, also returns non-included valid points with included=False (teal)
-            
-        Returns:
-            List of population point dicts ready for display
         """
         population_data = []
         
@@ -7577,7 +9953,7 @@ class Operations:
         map_width = game_map.width if hasattr(game_map, 'width') and game_map.width and game_map.width > 0 else 50
         map_height = game_map.height if hasattr(game_map, 'height') and game_map.height and game_map.height > 0 else 50
         
-        # Get included points for any preset with INCLUDED_POINTS - FILE IS SOURCE OF TRUTH
+        # Preset land cells come from INITIAL_POPULATION in the preset file (source of truth).
         # Uses preset_info (from map_preset_name) so Bay Area, NYC, NY Metro all work without core changes
         preset_info = None
         if hasattr(game_map, 'map_preset_name') and game_map.map_preset_name:
@@ -7585,10 +9961,19 @@ class Operations:
             preset_info = get_preset_file_info(game_map)
         
         included_points = None
-        if preset_info:
+        deleted_points = (
+            (getattr(game_map, '_deleted_population_points', set()) or set())
+            | (getattr(self, '_session_deleted_population_points', set()) or set())
+        )
+        # Fast path: use in-memory population from Map init (avoids re-parsing huge preset files).
+        if game_map.population:
+            included_points = {
+                pt for pt, pop in game_map.population.items()
+                if pop and int(pop) > 0
+            } - deleted_points
+        elif preset_info:
             from map_preset_utils import read_included_points_from_file
             file_path, variable_name = preset_info
-            deleted_points = (getattr(game_map, '_deleted_population_points', set()) or set()) | (getattr(self, '_session_deleted_population_points', set()) or set())
             for attempt in range(5):
                 points_set = read_included_points_from_file(file_path, variable_name)
                 if points_set is not None and len(points_set) > 0:
@@ -7599,10 +9984,6 @@ class Operations:
                     break
                 import time
                 time.sleep(0.02 * (attempt + 1))
-            
-            if included_points is None and game_map.population:
-                deleted = (getattr(game_map, '_deleted_population_points', set()) or set()) | (getattr(self, '_session_deleted_population_points', set()) or set())
-                included_points = set(game_map.population.keys()) - deleted
         
         # Get bounds for coordinate conversion (preset-agnostic via map_preset_loader)
         bounds = None
@@ -7636,15 +10017,26 @@ class Operations:
         # Points explicitly removed in edit mode - never show these (map + session-level for persistence)
         deleted_points = (getattr(game_map, '_deleted_population_points', set()) or set()) | (getattr(self, '_session_deleted_population_points', set()) or set())
         
-        # Preset with included_points from file: FILE IS SOLE SOURCE OF TRUTH
-        # Works for NYC, NY Metro, Bay Area, or any preset with INCLUDED_POINTS
+        preset_name = getattr(game_map, 'map_preset_name', None)
+        if preset_name and bounds_has_minmax:
+            from map_preset_loader import convert_preset_grid_to_latlon
+            _grid_latlon = lambda gx, gy: convert_preset_grid_to_latlon(
+                preset_name, gx, gy,
+                {'min_lat': min_lat, 'max_lat': max_lat, 'min_lon': min_lon, 'max_lon': max_lon},
+                map_width, map_height,
+            )
+        else:
+            _grid_latlon = lambda gx, gy: (min_lat + gy * lat_scale, min_lon + gx * lon_scale)
+        
+        # Preset maps: land cells = INITIAL_POPULATION keys (population > 0).
         if preset_info and included_points is not None:
             for (grid_x, grid_y) in included_points:
                 if (grid_x, grid_y) in deleted_points:
                     continue
                 pop = game_map.population.get((grid_x, grid_y), 0)
-                lat = min_lat + grid_y * lat_scale
-                lon = min_lon + grid_x * lon_scale
+                if pop <= 0:
+                    continue
+                lat, lon = _grid_latlon(grid_x, grid_y)
                 population_data.append({
                     'grid_x': grid_x,
                     'grid_y': grid_y,
@@ -7680,45 +10072,9 @@ class Operations:
         deleted_points = (getattr(game_map, '_deleted_population_points', set()) or set()) | (getattr(self, '_session_deleted_population_points', set()) or set())
         population_data = [p for p in population_data if (p['grid_x'], p['grid_y']) not in deleted_points]
         
-        # In edit mode: add non-included valid (land) points in teal - user can click to add
-        # Uses preset's is_water_location when available (Bay Area, NYC, etc. - no core changes needed)
-        if edit_mode_enabled and preset_info and included_points is not None:
-            preset_name = game_map.map_preset_name
-            preset = None
-            is_water_fn = None
-            if preset_name:
-                from map_preset_loader import load_map_preset, preset_has_water_areas
-                if preset_has_water_areas(preset_name):
-                    preset = load_map_preset(preset_name)
-                    if preset and hasattr(preset, 'is_water_location'):
-                        is_water_fn = preset.is_water_location
-            osm_int = getattr(game_map, 'osm_integration', None)
-            for grid_x in range(map_width + 1):
-                for grid_y in range(map_height + 1):
-                    pt = (grid_x, grid_y)
-                    if pt in included_points or pt in deleted_points:
-                        continue
-                    lat = min_lat + grid_y * lat_scale
-                    lon = min_lon + grid_x * lon_scale
-                    if is_water_fn:
-                        try:
-                            if is_water_fn(lat, lon, osm_int):
-                                continue
-                        except TypeError:
-                            if is_water_fn(lat, lon):
-                                continue
-                    population_data.append({
-                        'grid_x': grid_x,
-                        'grid_y': grid_y,
-                        'pop': 0,
-                        'lat': lat,
-                        'lon': lon,
-                        'included': False
-                    })
-        
         # Mark included points for JS (default True when not specified)
         for p in population_data:
             if 'included' not in p:
                 p['included'] = True
-        
-        return population_data
+
+        return cap_population_points_for_map_display(population_data)

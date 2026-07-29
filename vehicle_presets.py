@@ -186,20 +186,24 @@ electric_bus = Bus(name="Electric Bus", object_id=27, fuel=Electricity(), miles_
 brt_bus = Bus(name="BRT Bus", object_id=28, fuel=Gasoline(), miles_per_unit=0.4, top_speed=55, average_speed=30, capacity=150, maitnance_costs=70, year_introduced=2010, quality=5.0, base_price=450)
 
 class VehicleRegistry:
-    """Dynamic registry that automatically discovers all vehicles from this module"""
+    """Dynamic registry that automatically discovers all vehicles from a module"""
     
-    def __init__(self):
+    def __init__(self, source_module=None):
         self._locomotives = []
         self._railcars = []
         self._ferries = []
         self._buses = []
-        self._discover_vehicles()
+        if source_module is None:
+            import sys
+            source_module = sys.modules[__name__]
+        self._discover_vehicles(source_module)
+
+    @classmethod
+    def from_module(cls, module) -> "VehicleRegistry":
+        return cls(source_module=module)
     
-    def _discover_vehicles(self):
-        """Automatically discover all vehicles defined in this module"""
-        import sys
-        current_module = sys.modules[__name__]
-        
+    def _discover_vehicles(self, current_module):
+        """Discover all vehicles defined in the given module."""
         for attr_name in dir(current_module):
             if attr_name.startswith('_'):
                 continue
@@ -287,11 +291,33 @@ class VehicleRegistry:
 
 _registry = None
 
+
+def reset_vehicle_registry() -> None:
+    """Clear cached registry (e.g. when switching rulesets)."""
+    global _registry
+    _registry = None
+
+
+def set_vehicle_registry_from_module(module) -> VehicleRegistry:
+    """Build registry from a Python module that defines Locomotive/Railcar/Ferry/Bus objects."""
+    global _registry
+    _registry = VehicleRegistry.from_module(module)
+    return _registry
+
+
+def set_vehicle_registry(registry: VehicleRegistry) -> VehicleRegistry:
+    """Use a pre-built registry (e.g. from ruleset vehicles.json)."""
+    global _registry
+    _registry = registry
+    return _registry
+
+
 def get_vehicle_registry() -> VehicleRegistry:
     """Get the global vehicle registry instance"""
     global _registry
     if _registry is None:
-        _registry = VehicleRegistry()
+        import vehicle_presets as vp
+        _registry = VehicleRegistry.from_module(vp)
     return _registry
 
 

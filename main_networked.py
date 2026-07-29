@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Main entry point for networked Transit Game (alias for main.py)"""
+"""Main entry point for networked Railroad Baron (alias for main.py)"""
 import sys
 from PyQt6.QtWidgets import QApplication, QDialog
 from qt_networked import NetworkedMainWindow, GameModeDialog, MainWindow
+from qt_networked import _install_osm_tile_interceptor, application_window_icon
 
 def main():
     app = QApplication(sys.argv)
+    app_icon = application_window_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+    _install_osm_tile_interceptor()
     
     # Show game mode selection dialog
     dialog = GameModeDialog()

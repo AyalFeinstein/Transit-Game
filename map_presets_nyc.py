@@ -1,10 +1,30 @@
 """NYC Map Presets
 All configuration for the NYC proper map should be defined here.
-Follows standardized preset format for easy customization."""
+Follows standardized preset format for easy customization.
+
+Precomputed included points / population: run generate_nyc_*.py scripts (not at game startup).
+"""
 
 # Map identification
 MAP_NAME = "New York City"
 MAP_ID = "nyc"
+
+# OSM relation for Governors Island landmass (included in buildable area with population).
+GOVERNORS_ISLAND_OSM_RELATION_ID = 2389631
+GOVERNORS_ISLAND_BOUNDS = {
+    'min_lat': 40.684,
+    'max_lat': 40.696,
+    'min_lon': -74.028,
+    'max_lon': -74.012,
+}
+
+
+def is_in_governors_island(lat: float, lon: float) -> bool:
+    """True when a lat/lon lies on Governors Island (approximate bounds)."""
+    return (
+        GOVERNORS_ISLAND_BOUNDS['min_lat'] <= lat <= GOVERNORS_ISLAND_BOUNDS['max_lat']
+        and GOVERNORS_ISLAND_BOUNDS['min_lon'] <= lon <= GOVERNORS_ISLAND_BOUNDS['max_lon']
+    )
 
 # NYC Proper bounds - covers all five boroughs including Staten Island
 # NOTE: Keep this as the *default* bounds used by scripts unless they explicitly opt into
@@ -61,6 +81,32 @@ NYC_ZOOM = {
     'min_zoom': 10,  # Can't zoom out too far
     'max_zoom': 19,
 }
+
+# Default line names for companies on this map (first line A, second B, etc.)
+DEFAULT_LINE_NAMES = [
+    "Hudson Line",
+    "Harlem Service",
+    "Lexington Line",
+    "Queens Boulevard Line",
+    "Brooklyn Crosstown",
+    "Seventh Avenue Line",
+    "Fulton Street Line",
+    "East Side Line",
+    "West Side Line",
+    "Rockaway Branch",
+    "Crosstown Link",
+    "Waterfront Line",
+    "Midtown Connector",
+    "Downtown Link",
+    "River Line",
+    "Park Avenue Line",
+    "Bridge Line",
+    "East River Line",
+    "Harbor Shuttle",
+    "Metro Local",
+]
+# Default schedule scheme for new lines
+DEFAULT_SCHEDULE_SCHEME = {"peak": 1.0, "off_peak": 0.8, "night": 0.3}
 
 # Water/land detection (for NYC - approximate boundaries)
 # These are approximate rectangular areas for water bodies
@@ -133,6 +179,9 @@ def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
         'min_lat': 40.49, 'max_lat': 40.65,
         'min_lon': -74.30, 'max_lon': -74.02
     }
+
+    # Governors Island (included in buildable area; harbor water bbox must not swallow it)
+    GOVERNORS_ISLAND = GOVERNORS_ISLAND_BOUNDS
     
     active_bounds = _get_active_nyc_bounds()
 
@@ -144,7 +193,11 @@ def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
     for excluded_area in NYC_EXCLUDED_AREAS:
         if (excluded_area['min_lat'] <= lat <= excluded_area['max_lat'] and
             excluded_area['min_lon'] <= lon <= excluded_area['max_lon']):
-            return True 
+            return True
+
+    if is_in_governors_island(lat, lon):
+        return False
+
     if osm_integration and hasattr(osm_integration, 'is_water_at_latlon'):
         try:
             if osm_integration.is_water_at_latlon(lat, lon):
@@ -191,6 +244,10 @@ def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
                             water_area['min_lon'] <= lon <= water_area['max_lon']):
                             return True  # In water
                     return False  # In Staten Island, not water
+
+                if (GOVERNORS_ISLAND['min_lat'] <= lat <= GOVERNORS_ISLAND['max_lat'] and
+                    GOVERNORS_ISLAND['min_lon'] <= lon <= GOVERNORS_ISLAND['max_lon']):
+                    return False  # Governors Island is land (buildable)
                 
                 # Outside Manhattan/Bronx/Brooklyn/Queens/Staten Island, trust OSM
                 return True
@@ -247,6 +304,11 @@ def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
                 water_area['min_lon'] <= lon <= water_area['max_lon']):
                 return True  # In water
         return False  # In Staten Island, not water
+
+    # Governors Island — land in the harbor (not harbor water)
+    if (GOVERNORS_ISLAND['min_lat'] <= lat <= GOVERNORS_ISLAND['max_lat'] and
+        GOVERNORS_ISLAND['min_lon'] <= lon <= GOVERNORS_ISLAND['max_lon']):
+        return False
     
     # Check water areas for other locations
     for water_area in NYC_WATER_AREAS:
@@ -256,16 +318,33 @@ def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
     
     return False
 
-# Population settings for NYC
+# Population settings for NYC - historical milestones for realistic growth
+# Sources: NYC Planning, US Census. Growth was rapid 1830-1900, moderate 1900-1950, flat 1950-2000.
 NYC_POPULATION = {
     'base_year': 1830,
-    'total_population_1830': 100798,  # NYC population in 1830
+    'total_population_1830': 100226,  # NYC population 1830 (historical)
     'min_population_per_location': 0,
     'max_population_per_location_1830': 5000,
-    'population_growth_rate': 0.023615,  # ~2.36% per year to reach ~8.5M by 2020 (from 100,798 in 1830)
+    'population_growth_rate': 0.02,  # Fallback when targets not used
     'population_variation': (-0.01, 0.03),
     'location_growth_variation': (0.9, 1.1),
-    'max_population_per_location': 50000,  # Allow population to grow much higher (no practical cap)
+    'max_population_per_location': 50000,
+    # Realistic historical targets (interpolated between years)
+    'population_targets_by_year': {
+        1830: 202589,
+        1850: 515547,
+        1870: 942292,
+        1890: 1515301,
+        1900: 3437202,
+        1920: 5620048,
+        1940: 7454995,
+        1950: 7891957,
+        1970: 7894863,
+        1990: 7322564,
+        2000: 8008278,
+        2020: 8336817,
+        2050: 9000000,  # Modest projected growth
+    },
 }
 
 def get_nyc_population_at_location(lat: float, lon: float, is_water: bool) -> int:
@@ -326,6 +405,10 @@ def get_nyc_population_at_location(lat: float, lon: float, is_water: bool) -> in
     # Roosevelt Island is approximately 40.75-40.77 lat, -73.95 to -73.94 lon
     elif 40.75 <= lat <= 40.77 and -73.95 <= lon <= -73.94:
         return random.randint(20, 80)  # Sparse population in 1830
+
+    # Governors Island — military garrison and sparse civilian settlement in 1830
+    elif is_in_governors_island(lat, lon):
+        return random.randint(50, 200)
     
     # Staten Island (Richmond County) - sparse population in 1830, mostly rural
     # Staten Island is approximately 40.49-40.65 lat, -74.30 to -74.02 lon
@@ -414,80 +497,330 @@ def get_nyc_population_settings() -> dict:
     return NYC_POPULATION.copy()
 
 
-def initialize_nyc_population(width: int, height: int, map_center_lat: float = None, map_center_lon: float = None) -> dict:
-    """Initialize population dictionary for NYC map.
-    All NYC-specific population logic should be in this function.
-    
-    Args:
-        width: Map width in grid squares
-        height: Map height in grid squares
-        map_center_lat: Map center latitude (uses default if None)
-        map_center_lon: Map center longitude (uses default if None)
-        
-    Returns:
-        Dictionary mapping (x, y) tuples to population counts
-    """
+def get_point_area_map() -> dict:
+    """Get point-to-area mapping for area-specific population changes (borough, etc). Used by map_preset_loader."""
+    try:
+        from nyc_population_map import NYC_POPULATION_MAP
+        return NYC_POPULATION_MAP
+    except ImportError:
+        return {}
+
+
+def get_excluded_water_points() -> set:
+    """Get grid points that are always water. Used by map_preset_loader."""
+    try:
+        return set(NYC_EXCLUDED_POINTS)
+    except NameError:
+        return set()
+
+
+def is_point_on_road_at_year(x: float, y: float, current_year: int, game_map) -> bool:
+    """Check if grid point is on a road at current_year. Used by map_preset_loader."""
+    from map_presets_nyc_road_utils import is_point_on_road_at_year as _impl
+    return _impl(x, y, current_year, game_map, bounds=get_nyc_bounds())
+
+
+def is_point_on_bridge_at_year(x: float, y: float, current_year: int, game_map) -> bool:
+    """Check if grid point is on a bridge at current_year. Used by map_preset_loader."""
+    from map_presets_nyc_road_utils import is_point_on_bridge_at_year as _impl
+    return _impl(x, y, current_year, game_map, bounds=get_nyc_bounds())
+
+
+def polyline_follows_streets_for_ai(game_map, points: list, current_year: int) -> bool:
+    """True when every land segment of an AI opener polyline lies on buildable streets."""
+    from map_presets_nyc_road_utils import _polyline_land_segments_on_street
+    return _polyline_land_segments_on_street(game_map, list(points or []), current_year)
+
+
+def preload_road_data(game_map) -> None:
+    """Preload road spatial index at game start. Avoids 2-5s load on first AI turn."""
+    from map_presets_nyc_road_utils import _build_road_spatial_index
+    _build_road_spatial_index(game_map)
+
+
+def ai_station_population_at_grid(px: float, py: float, game_map, pop_map: dict) -> int:
+    """AI station population: geodesic-capped so Hudson/NJ grid sites do not borrow Manhattan pop."""
+    from map_presets_nyc_road_utils import population_at_station_site_geographic
+    return population_at_station_site_geographic(game_map, px, py, pop_map, get_nyc_bounds())
+
+
+def get_road_segment_points_for_ai(game_map, current_year: int, max_points: int = 12,
+                                   existing_line_routes=None, min_length_grid=None, max_length_grid=None,
+                                   min_endpoint_population=None, rng=None) -> list:
+    """Return grid points along street polylines for AI line building. Used by map_preset_loader.
+    Uses min_endpoint_population=50 to prioritize high-population areas (Manhattan, Brooklyn Heights)."""
+    from map_presets_nyc_road_utils import get_road_segment_points_for_ai as _impl
+    min_pop = 1000 if min_endpoint_population is None else min_endpoint_population  # Require 1000+ to avoid low-pop areas (e.g. NJ waterfront)
+    return _impl(game_map, current_year, max_points, existing_line_routes=existing_line_routes,
+                 min_length_grid=min_length_grid, max_length_grid=max_length_grid,
+                 min_endpoint_population=min_pop, rng=rng)
+
+
+def count_available_line_corridors(game_map, current_year: int, bounds=None) -> dict:
+    from map_presets_nyc_road_utils import count_available_line_corridors as _impl
+    return _impl(game_map, current_year, bounds=bounds)
+
+
+def get_geo_feature_name_for_line_naming(
+    game_map, x: float, y: float, current_year: int = None, max_distance_m: float = 150.0,
+) -> str:
+    """Geographic label within max_distance_m of (x,y) for AI line names (OSM roads)."""
+    from map_presets_nyc_road_utils import get_geo_feature_name_for_line_naming as _impl
+    year = int(current_year) if current_year is not None else (getattr(game_map, "start_year", 1830) or 1830)
+    return _impl(game_map, float(x), float(y), year, bounds=get_nyc_bounds(), max_distance_m=max_distance_m)
+
+
+def get_streets_route_runs_along(
+    game_map,
+    route_points: list,
+    current_year: int = None,
+    max_distance_m: float = 40.0,
+    min_route_fraction: float = 0.5,
+) -> list:
+    """Street names whose OSM polylines the route follows within max_distance_m."""
+    from map_presets_nyc_road_utils import get_streets_route_runs_along as _impl
+    year = int(current_year) if current_year is not None else (getattr(game_map, "start_year", 1830) or 1830)
+    return _impl(
+        game_map, list(route_points or []), year, bounds=get_nyc_bounds(),
+        max_distance_m=max_distance_m, min_route_fraction=min_route_fraction,
+    )
+
+
+def get_bridge_polyline_between_shores(
+    game_map, shore_a: tuple, shore_b: tuple, current_year: int, max_points: int = 12,
+) -> list:
+    from map_presets_nyc_road_utils import get_bridge_polyline_between_shores as _impl
+    return _impl(game_map, shore_a, shore_b, current_year, bounds=None, max_points=max_points)
+
+
+def get_road_extension_points_from_end(game_map, base_pt: tuple, other_end_pt: tuple, current_year: int,
+                                       extend_from_end: bool, max_points: int = 6, prefer_bridges: bool = False,
+                                       exclude_road_names=None, _chain_depth: int = 0,
+                                       max_neighbor_street_gap_grid: float = None) -> list:
+    """Return grid points along street polylines for AI line extension. Used by map_preset_loader."""
+    from map_presets_nyc_road_utils import get_road_extension_points_from_end as _impl
+    return _impl(
+        game_map, base_pt, other_end_pt, current_year, extend_from_end, max_points,
+        bounds=None, prefer_bridges=prefer_bridges, exclude_road_names=exclude_road_names, _chain_depth=_chain_depth,
+        max_neighbor_street_gap_grid=max_neighbor_street_gap_grid,
+    )
+
+
+def get_ferry_segment_points_for_ai(game_map, current_year: int, max_points: int = 12, existing_line_routes=None, rng=None) -> list:
+    """Return NYC ferry route candidates as grid polylines over water.
+    Preset-scoped so core AI can stay map-agnostic."""
     import math
-    
-    population = {}
-    
-    # Read NYC_INCLUDED_POINTS directly from file to ensure we get the latest version
-    # (avoids cached module imports that might be stale after edit-mode changes)
-    from map_preset_utils import get_preset_file_info, read_included_points_from_file
-    
-    class TempMap:
-        map_preset_name = "nyc"
-    
-    preset_info = get_preset_file_info(TempMap())
-    use_included_points = False
-    included_set = set()
-    
-    if preset_info:
-        file_path, variable_name = preset_info
-        included_set = read_included_points_from_file(file_path, variable_name)
-        use_included_points = len(included_set) > 0
-    
-    if not use_included_points:
-        # Fallback to excluded points check if file read fails
+
+    b = get_nyc_bounds()
+    w = max(1, getattr(game_map, "width", 1))
+    h = max(1, getattr(game_map, "height", 1))
+    pop_map = getattr(game_map, "population", None) or {}
+
+    def _latlon_to_grid(lat: float, lon: float) -> tuple[float, float]:
+        x = (lon - b["min_lon"]) / max(1e-9, (b["max_lon"] - b["min_lon"])) * w
+        y = (lat - b["min_lat"]) / max(1e-9, (b["max_lat"] - b["min_lat"])) * h
+        return (float(x), float(y))
+
+    def _in_map(pt: tuple[float, float]) -> bool:
+        return 0 <= pt[0] <= w and 0 <= pt[1] <= h
+
+    def _pop_near(px: float, py: float, radius: int = 10) -> int:
+        """Match AI road-building population lookup (sparse OSM grid vs population keys)."""
+        ix, iy = int(round(px)), int(round(py))
+        p = int(pop_map.get((ix, iy), 0))
+        if p > 0:
+            return p
+        for r in range(1, radius + 1):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if dx * dx + dy * dy <= r * r:
+                        q = int(pop_map.get((ix + dx, iy + dy), 0))
+                        if q > 0:
+                            return q
+        return 0
+
+    def _is_water_grid(x: float, y: float) -> bool:
         try:
-            excluded_set = set(NYC_EXCLUDED_POINTS)
-        except NameError:
-            excluded_set = set()
+            from map_preset_loader import preset_is_point_in_water
+            return bool(preset_is_point_in_water("nyc", x, y, game_map, skip_osm=True))
+        except Exception:
+            lat = b["min_lat"] + (float(y) / h) * (b["max_lat"] - b["min_lat"])
+            lon = b["min_lon"] + (float(x) / w) * (b["max_lon"] - b["min_lon"])
+            return bool(is_water_location(lat, lon, None))
+
+    # Build candidates from water cells that have nearby population.
+    # Endpoints are on water (passes ferry endpoint validation) but close to population centers.
+    water_points = []
+    for x in range(int(w) + 1):
+        for y in range(int(h) + 1):
+            if not _is_water_grid(x, y):
+                continue
+            near_pop = _pop_near(x, y, radius=3)
+            if near_pop >= 120:
+                water_points.append((float(x), float(y), int(near_pop)))
+    water_points.sort(key=lambda t: t[2], reverse=True)
+    if rng:
+        top = water_points[:180]
+        rng.shuffle(top)
+        water_points = top + water_points[180:]
     else:
-        excluded_set = set()  # Not used when use_included_points is True
-    
-    if map_center_lat is None:
-        map_center_lat = get_nyc_default_center_lat()
-    if map_center_lon is None:
-        map_center_lon = get_nyc_default_center_lon()
-    
-    for x in range(width + 1):
-        for y in range(height + 1):
-            if use_included_points:
-                # Only assign population to included points
-                if (x, y) not in included_set:
-                    population[(x, y)] = 0
+        water_points = water_points[:220]
+
+    out = []
+    seen = set()
+    for i in range(len(water_points)):
+        x1, y1, p1 = water_points[i]
+        for j in range(i + 1, len(water_points)):
+            x2, y2, p2 = water_points[j]
+            d = math.hypot(x2 - x1, y2 - y1)
+            if d < 0.8 or d > 4.8:
+                continue
+            # Ensure route remains mostly over water.
+            water_hits = 0
+            total = 0
+            for t in (0.15, 0.3, 0.45, 0.6, 0.75, 0.9):
+                sx = x1 + t * (x2 - x1)
+                sy = y1 + t * (y2 - y1)
+                total += 1
+                if _is_water_grid(sx, sy):
+                    water_hits += 1
+            if total > 0 and (water_hits / total) < 0.70:
+                continue
+            ts = getattr(game_map, "tile_system", None)
+            if ts and hasattr(ts, "ferry_corridor_interior_mostly_water"):
+                try:
+                    if not ts.ferry_corridor_interior_mostly_water(
+                        x1, y1, x2, y2, skip_osm=False, min_fraction=0.88
+                    ):
+                        continue
+                except Exception:
                     continue
-            else:
-                # Fallback: check excluded points
-                if (x, y) in excluded_set:
-                    population[(x, y)] = 0
+            key = tuple(sorted(((int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))))))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append([(x1, y1), (x2, y2)])
+            if len(out) >= max(1, min(10, max_points)):
+                return out
+    return out
+
+
+def get_station_name_for_point(x: float, y: float, game_map, current_year: int = None, line_name: str = None, existing_names: set = None) -> str:
+    """Return a human-friendly station name for (x,y) on the NYC map.
+    Prefers nearby road names; falls back to borough/area label. Intended for AI station naming."""
+    try:
+        year = int(current_year) if current_year is not None else getattr(game_map, "start_year", 1830) or 1830
+    except Exception:
+        year = 1830
+    existing_names = existing_names or set()
+
+    try:
+        from game_presets import pick_major_terminal_station_name
+        year_i = int(year)
+        mix = (
+            int(getattr(game_map, "start_year", 1830) or 1830)
+            ^ year_i * 997
+            ^ int(round(x * 1000))
+            ^ (int(round(y * 1000)) << 7)
+            ^ len(existing_names) * 31
+        )
+        major = pick_major_terminal_station_name(mix, existing_names)
+        if major:
+            return major
+    except Exception:
+        pass
+
+    area_label = ""
+    try:
+        import math
+        from game_presets import AI_STATION_STREET_NAME_MAX_DISTANCE_GRID
+        area_map = get_point_area_map() or {}
+        ix, iy = int(round(x)), int(round(y))
+        best_d = float("inf")
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                key = (ix + dx, iy + dy)
+                a = area_map.get(key)
+                if not isinstance(a, str) or not a.strip():
                     continue
-            
-            nyc_bounds = get_nyc_bounds()
-            min_lat = nyc_bounds['min_lat']
-            max_lat = nyc_bounds['max_lat']
-            min_lon = nyc_bounds['min_lon']
-            max_lon = nyc_bounds['max_lon']
-            
-            # Linear interpolation: x/width maps to lon, y/height maps to lat
-            lat = min_lat + (y / height) * (max_lat - min_lat)
-            lon = min_lon + (x / width) * (max_lon - min_lon)
-            
-            # Point is included - assign population
-            pop = get_nyc_population_at_location(lat, lon, False)
-            population[(x, y)] = pop
-    
+                d = math.hypot(x - key[0], y - key[1])
+                if d <= AI_STATION_STREET_NAME_MAX_DISTANCE_GRID and d < best_d:
+                    best_d = d
+                    area_label = a.strip()
+    except Exception:
+        area_label = ""
+
+    # 1) Nearest road name (best signal) — wider search catches dense street grid
+    road_name = ""
+    try:
+        from map_presets_nyc_road_utils import get_nearest_road_name_for_point, format_osm_road_name_for_display
+        from game_presets import AI_STATION_STREET_NAME_MAX_DISTANCE_GRID
+        road_name = get_nearest_road_name_for_point(
+            game_map, x, y, year, bounds=get_nyc_bounds(), tolerance_grid=2.0, max_segments=220,
+            max_distance_grid=AI_STATION_STREET_NAME_MAX_DISTANCE_GRID,
+        )
+    except Exception:
+        road_name = ""
+
+    def _clean(s: str) -> str:
+        s = (s or "").replace("_", " ").strip()
+        # Drop common internal suffixes while keeping meaningful phrases
+        for suf in (" Manhattan", " Brooklyn", " Queens", " Bronx", " Staten Island"):
+            if s.endswith(suf) and len(s) > len(suf) + 3:
+                s = s[: -len(suf)].strip()
+        return s
+
+    def _title_road_phrase(s: str) -> str:
+        """Make OSM key fragments readable (preserve ordinals like 42nd)."""
+        return format_osm_road_name_for_display(s)
+
+    street_display = _title_road_phrase(road_name)
+    name = street_display
+
+    # Combine neighborhood + street when both are informative (e.g. "Harlem / Lexington Av")
+    if area_label and street_display:
+        al, sl = area_label.lower(), street_display.lower()
+        if al not in sl and sl not in al:
+            name = f"{area_label} — {street_display}"
+    elif area_label and not street_display:
+        name = area_label
+
+    # 3) Last resort
+    if not name:
+        name = "Station"
+
+    # Ensure uniqueness — prefer neighborhood or grid position over "Jackson Street (2)" for every stop.
+    if name not in existing_names:
+        return name
+    if area_label and area_label.lower() not in name.lower():
+        area_cand = f"{area_label} — {name}"
+        if area_cand not in existing_names:
+            return area_cand
+    k = 2
+    while f"{name} ({k})" in existing_names and k < 999:
+        k += 1
+    return f"{name} ({k})"
+
+
+def initialize_nyc_population(width: int, height: int, map_center_lat: float = None, map_center_lon: float = None) -> dict:
+    """Initialize population dictionary for NYC map from NYC_INITIAL_POPULATION."""
+    from map_preset_utils import get_preset_file_info, read_initial_population_from_file
+
+    class _TempMap:
+        map_preset_name = "nyc"
+
+    source = dict(NYC_INITIAL_POPULATION)
+    preset_info = get_preset_file_info(_TempMap())
+    if preset_info:
+        file_pop = read_initial_population_from_file(*preset_info)
+        if file_pop:
+            source = file_pop
+
+    population: dict[tuple[int, int], int] = {}
+    for (x, y), pop in source.items():
+        if 0 <= x <= width and 0 <= y <= height and pop > 0:
+            population[(x, y)] = int(pop)
+
     return population
 
 
@@ -495,711 +828,713 @@ def initialize_nyc_population(width: int, height: int, map_center_lat: float = N
 # Pre-computed excluded points - cleared, will be regenerated from OSM
 NYC_EXCLUDED_POINTS = []
 
-# Pre-computed included points - cleared, will be regenerated from OSM Manhattan Island relation (ID: 3954665)
-NYC_INCLUDED_POINTS = [
-    (10, 5),
-    (10, 6),
-    (10, 7),
-    (10, 10),
-    (11, 6),
-    (11, 7),
-    (11, 8),
-    (11, 9),
-    (11, 10),
-    (11, 11),
-    (12, 6),
-    (12, 7),
-    (12, 8),
-    (12, 9),
-    (12, 10),
-    (12, 11),
-    (13, 7),
-    (13, 8),
-    (13, 9),
-    (13, 10),
-    (13, 11),
-    (13, 12),
-    (13, 13),
-    (13, 14),
-    (14, 7),
-    (14, 8),
-    (14, 9),
-    (14, 10),
-    (14, 11),
-    (14, 12),
-    (14, 13),
-    (14, 14),
-    (14, 16),
-    (14, 17),
-    (14, 18),
-    (14, 19),
-    (14, 20),
-    (15, 8),
-    (15, 9),
-    (15, 10),
-    (15, 11),
-    (15, 12),
-    (15, 13),
-    (15, 14),
-    (15, 15),
-    (15, 16),
-    (15, 17),
-    (15, 18),
-    (15, 19),
-    (15, 20),
-    (16, 9),
-    (16, 10),
-    (16, 11),
-    (16, 12),
-    (16, 13),
-    (16, 14),
-    (16, 15),
-    (16, 16),
-    (16, 17),
-    (16, 18),
-    (16, 19),
-    (16, 20),
-    (17, 9),
-    (17, 10),
-    (17, 11),
-    (17, 12),
-    (17, 14),
-    (17, 16),
-    (17, 17),
-    (17, 18),
-    (17, 20),
-    (18, 11),
-    (18, 12),
-    (18, 13),
-    (18, 14),
-    (18, 15),
-    (18, 16),
-    (18, 17),
-    (18, 18),
-    (18, 19),
-    (18, 20),
-    (19, 10),
-    (19, 11),
-    (19, 12),
-    (19, 13),
-    (19, 14),
-    (19, 15),
-    (19, 16),
-    (19, 17),
-    (19, 18),
-    (19, 19),
-    (19, 20),
-    (20, 11),
-    (20, 12),
-    (20, 13),
-    (20, 14),
-    (20, 15),
-    (20, 16),
-    (20, 17),
-    (20, 18),
-    (20, 19),
-    (20, 20),
-    (21, 12),
-    (21, 13),
-    (21, 15),
-    (21, 19),
-    (21, 20),
-    (22, 14),
-    (22, 15),
-    (22, 16),
-    (22, 17),
-    (22, 18),
-    (22, 19),
-    (22, 20),
-    (22, 21),
-    (23, 15),
-    (23, 16),
-    (23, 17),
-    (23, 18),
-    (24, 15),
-    (24, 16),
-    (25, 18),
-    (25, 19),
-    (25, 20),
-    (26, 17),
-    (26, 18),
-    (26, 19),
-    (26, 20),
-    (26, 21),
-    (26, 29),
-    (27, 13),
-    (27, 14),
-    (27, 17),
-    (27, 18),
-    (27, 19),
-    (27, 20),
-    (27, 21),
-    (27, 22),
-    (27, 23),
-    (27, 24),
-    (27, 25),
-    (27, 27),
-    (27, 28),
-    (27, 29),
-    (27, 30),
-    (27, 31),
-    (27, 32),
-    (27, 33),
-    (28, 13),
-    (28, 14),
-    (28, 15),
-    (28, 16),
-    (28, 17),
-    (28, 18),
-    (28, 19),
-    (28, 20),
-    (28, 21),
-    (28, 22),
-    (28, 23),
-    (28, 24),
-    (28, 25),
-    (28, 26),
-    (28, 27),
-    (28, 28),
-    (28, 29),
-    (28, 30),
-    (28, 31),
-    (28, 32),
-    (28, 33),
-    (28, 34),
-    (28, 35),
-    (29, 13),
-    (29, 14),
-    (29, 15),
-    (29, 16),
-    (29, 17),
-    (29, 18),
-    (29, 19),
-    (29, 20),
-    (29, 21),
-    (29, 22),
-    (29, 23),
-    (29, 24),
-    (29, 25),
-    (29, 26),
-    (29, 27),
-    (29, 28),
-    (29, 29),
-    (29, 30),
-    (29, 31),
-    (29, 32),
-    (29, 33),
-    (29, 34),
-    (29, 35),
-    (29, 36),
-    (29, 37),
-    (30, 13),
-    (30, 14),
-    (30, 15),
-    (30, 16),
-    (30, 17),
-    (30, 18),
-    (30, 19),
-    (30, 20),
-    (30, 21),
-    (30, 22),
-    (30, 23),
-    (30, 24),
-    (30, 25),
-    (30, 26),
-    (30, 27),
-    (30, 28),
-    (30, 29),
-    (30, 30),
-    (30, 31),
-    (30, 32),
-    (30, 33),
-    (30, 34),
-    (30, 35),
-    (30, 36),
-    (30, 37),
-    (30, 38),
-    (30, 39),
-    (31, 13),
-    (31, 14),
-    (31, 15),
-    (31, 16),
-    (31, 17),
-    (31, 18),
-    (31, 19),
-    (31, 20),
-    (31, 21),
-    (31, 22),
-    (31, 23),
-    (31, 24),
-    (31, 25),
-    (31, 26),
-    (31, 27),
-    (31, 28),
-    (31, 29),
-    (31, 30),
-    (31, 31),
-    (31, 32),
-    (31, 33),
-    (31, 34),
-    (31, 35),
-    (31, 36),
-    (31, 37),
-    (31, 38),
-    (31, 39),
-    (31, 40),
-    (31, 41),
-    (32, 10),
-    (32, 11),
-    (32, 13),
-    (32, 14),
-    (32, 15),
-    (32, 16),
-    (32, 17),
-    (32, 18),
-    (32, 19),
-    (32, 20),
-    (32, 21),
-    (32, 22),
-    (32, 23),
-    (32, 24),
-    (32, 25),
-    (32, 26),
-    (32, 27),
-    (32, 28),
-    (32, 29),
-    (32, 30),
-    (32, 31),
-    (32, 32),
-    (32, 33),
-    (32, 34),
-    (32, 35),
-    (32, 36),
-    (32, 37),
-    (32, 38),
-    (32, 39),
-    (32, 40),
-    (32, 41),
-    (32, 42),
-    (33, 10),
-    (33, 11),
-    (33, 12),
-    (33, 14),
-    (33, 15),
-    (33, 16),
-    (33, 17),
-    (33, 18),
-    (33, 19),
-    (33, 20),
-    (33, 21),
-    (33, 22),
-    (33, 23),
-    (33, 24),
-    (33, 25),
-    (33, 26),
-    (33, 27),
-    (33, 28),
-    (33, 29),
-    (33, 30),
-    (33, 31),
-    (33, 32),
-    (33, 33),
-    (33, 34),
-    (33, 35),
-    (33, 37),
-    (33, 43),
-    (33, 46),
-    (33, 47),
-    (33, 48),
-    (34, 10),
-    (34, 11),
-    (34, 12),
-    (34, 14),
-    (34, 15),
-    (34, 16),
-    (34, 17),
-    (34, 18),
-    (34, 19),
-    (34, 20),
-    (34, 21),
-    (34, 22),
-    (34, 23),
-    (34, 24),
-    (34, 25),
-    (34, 26),
-    (34, 27),
-    (34, 28),
-    (34, 29),
-    (34, 30),
-    (34, 31),
-    (34, 32),
-    (34, 33),
-    (34, 34),
-    (34, 35),
-    (34, 36),
-    (34, 37),
-    (34, 38),
-    (34, 39),
-    (34, 40),
-    (34, 41),
-    (34, 42),
-    (34, 43),
-    (34, 44),
-    (34, 45),
-    (34, 46),
-    (34, 47),
-    (34, 48),
-    (34, 49),
-    (35, 11),
-    (35, 12),
-    (35, 14),
-    (35, 15),
-    (35, 16),
-    (35, 17),
-    (35, 18),
-    (35, 19),
-    (35, 20),
-    (35, 21),
-    (35, 22),
-    (35, 23),
-    (35, 24),
-    (35, 25),
-    (35, 26),
-    (35, 27),
-    (35, 28),
-    (35, 29),
-    (35, 30),
-    (35, 31),
-    (35, 32),
-    (35, 33),
-    (35, 34),
-    (35, 35),
-    (35, 36),
-    (35, 37),
-    (35, 38),
-    (35, 39),
-    (35, 40),
-    (35, 41),
-    (35, 42),
-    (35, 43),
-    (35, 44),
-    (35, 45),
-    (35, 46),
-    (35, 47),
-    (35, 48),
-    (35, 49),
-    (36, 11),
-    (36, 12),
-    (36, 14),
-    (36, 15),
-    (36, 16),
-    (36, 17),
-    (36, 18),
-    (36, 19),
-    (36, 20),
-    (36, 21),
-    (36, 22),
-    (36, 23),
-    (36, 24),
-    (36, 25),
-    (36, 26),
-    (36, 27),
-    (36, 28),
-    (36, 29),
-    (36, 30),
-    (36, 31),
-    (36, 32),
-    (36, 33),
-    (36, 34),
-    (36, 35),
-    (36, 37),
-    (36, 38),
-    (36, 39),
-    (36, 40),
-    (36, 41),
-    (36, 42),
-    (36, 43),
-    (36, 44),
-    (36, 45),
-    (36, 46),
-    (37, 12),
-    (37, 13),
-    (37, 14),
-    (37, 15),
-    (37, 16),
-    (37, 17),
-    (37, 19),
-    (37, 20),
-    (37, 21),
-    (37, 22),
-    (37, 23),
-    (37, 24),
-    (37, 25),
-    (37, 26),
-    (37, 27),
-    (37, 28),
-    (37, 29),
-    (37, 30),
-    (37, 31),
-    (37, 32),
-    (37, 33),
-    (37, 34),
-    (37, 35),
-    (37, 37),
-    (37, 38),
-    (37, 39),
-    (37, 40),
-    (37, 41),
-    (37, 42),
-    (37, 43),
-    (37, 44),
-    (37, 45),
-    (37, 46),
-    (38, 12),
-    (38, 13),
-    (38, 14),
-    (38, 20),
-    (38, 21),
-    (38, 22),
-    (38, 23),
-    (38, 24),
-    (38, 25),
-    (38, 26),
-    (38, 27),
-    (38, 28),
-    (38, 29),
-    (38, 30),
-    (38, 31),
-    (38, 32),
-    (38, 33),
-    (38, 34),
-    (38, 35),
-    (38, 38),
-    (38, 39),
-    (38, 40),
-    (38, 41),
-    (38, 42),
-    (38, 43),
-    (38, 44),
-    (38, 45),
-    (38, 46),
-    (39, 13),
-    (39, 21),
-    (39, 22),
-    (39, 23),
-    (39, 24),
-    (39, 25),
-    (39, 26),
-    (39, 27),
-    (39, 28),
-    (39, 29),
-    (39, 30),
-    (39, 31),
-    (39, 32),
-    (39, 33),
-    (39, 34),
-    (39, 35),
-    (39, 37),
-    (39, 38),
-    (39, 39),
-    (39, 40),
-    (39, 41),
-    (39, 42),
-    (39, 43),
-    (39, 44),
-    (39, 45),
-    (39, 46),
-    (39, 47),
-    (39, 48),
-    (39, 49),
-    (40, 13),
-    (40, 21),
-    (40, 22),
-    (40, 23),
-    (40, 24),
-    (40, 25),
-    (40, 26),
-    (40, 27),
-    (40, 28),
-    (40, 29),
-    (40, 30),
-    (40, 31),
-    (40, 32),
-    (40, 33),
-    (40, 34),
-    (40, 35),
-    (40, 37),
-    (40, 38),
-    (40, 39),
-    (40, 40),
-    (40, 41),
-    (40, 42),
-    (40, 43),
-    (40, 44),
-    (40, 45),
-    (40, 46),
-    (40, 47),
-    (40, 48),
-    (41, 21),
-    (41, 22),
-    (41, 23),
-    (41, 24),
-    (41, 25),
-    (41, 26),
-    (41, 27),
-    (41, 28),
-    (41, 29),
-    (41, 30),
-    (41, 31),
-    (41, 32),
-    (41, 33),
-    (41, 34),
-    (41, 35),
-    (41, 38),
-    (41, 39),
-    (41, 40),
-    (41, 41),
-    (41, 42),
-    (41, 43),
-    (41, 44),
-    (41, 45),
-    (41, 46),
-    (41, 47),
-    (42, 21),
-    (42, 22),
-    (42, 23),
-    (42, 24),
-    (42, 25),
-    (42, 26),
-    (42, 27),
-    (42, 28),
-    (42, 29),
-    (42, 30),
-    (42, 31),
-    (42, 32),
-    (42, 33),
-    (42, 34),
-    (42, 35),
-    (42, 37),
-    (42, 38),
-    (42, 39),
-    (42, 40),
-    (42, 41),
-    (42, 42),
-    (42, 43),
-    (42, 44),
-    (42, 45),
-    (42, 46),
-    (42, 47),
-    (43, 21),
-    (43, 22),
-    (43, 23),
-    (43, 24),
-    (43, 25),
-    (43, 26),
-    (43, 27),
-    (43, 28),
-    (43, 29),
-    (43, 30),
-    (43, 31),
-    (43, 32),
-    (43, 33),
-    (43, 34),
-    (43, 35),
-    (43, 37),
-    (43, 38),
-    (43, 39),
-    (43, 40),
-    (43, 41),
-    (43, 42),
-    (43, 43),
-    (43, 44),
-    (43, 45),
-    (43, 46),
-    (44, 21),
-    (44, 22),
-    (44, 23),
-    (44, 24),
-    (44, 25),
-    (44, 26),
-    (44, 27),
-    (44, 28),
-    (44, 29),
-    (44, 30),
-    (44, 31),
-    (44, 32),
-    (44, 33),
-    (44, 34),
-    (44, 35),
-    (44, 37),
-    (44, 38),
-    (44, 39),
-    (44, 40),
-    (44, 41),
-    (44, 42),
-    (44, 43),
-    (44, 44),
-    (44, 45),
-    (44, 46),
-    (45, 21),
-    (45, 22),
-    (45, 23),
-    (45, 24),
-    (45, 25),
-    (45, 26),
-    (45, 27),
-    (45, 28),
-    (45, 29),
-    (45, 30),
-    (45, 31),
-    (45, 32),
-    (45, 33),
-    (45, 34),
-    (45, 35),
-    (45, 41),
-    (45, 42),
-    (45, 43),
-    (45, 44),
-    (45, 45),
-    (45, 46),
-    (46, 21),
-    (46, 22),
-    (46, 23),
-    (46, 24),
-    (46, 25),
-    (46, 26),
-    (46, 27),
-    (46, 28),
-    (46, 29),
-    (46, 30),
-    (46, 31),
-    (46, 32),
-    (46, 33),
-    (46, 34),
-    (46, 42),
-    (46, 43),
-    (46, 44),
-    (46, 45),
-    (47, 22),
-    (47, 23),
-    (47, 24),
-    (47, 25),
-    (47, 26),
-    (47, 27),
-    (47, 28),
-    (47, 29),
-    (47, 30),
-    (47, 31),
-    (47, 32),
-    (47, 33),
-    (48, 30),
-    (48, 31),
-    (48, 32),
-    (49, 31),
-    (49, 32)
-]
 
-NYC_POPULATION_POINTS = NYC_INCLUDED_POINTS
+
+NYC_INITIAL_POPULATION: dict[tuple[int, int], int] = {
+    (10, 5): 26,
+    (10, 6): 24,
+    (10, 7): 6,
+    (10, 10): 32,
+    (11, 6): 29,
+    (11, 7): 39,
+    (11, 8): 50,
+    (11, 9): 30,
+    (11, 10): 20,
+    (11, 11): 8,
+    (12, 6): 48,
+    (12, 7): 50,
+    (12, 8): 26,
+    (12, 9): 38,
+    (12, 10): 26,
+    (12, 11): 11,
+    (13, 7): 47,
+    (13, 8): 50,
+    (13, 9): 48,
+    (13, 10): 22,
+    (13, 11): 9,
+    (13, 12): 5,
+    (13, 13): 15,
+    (13, 14): 32,
+    (14, 7): 46,
+    (14, 8): 44,
+    (14, 9): 50,
+    (14, 10): 39,
+    (14, 11): 29,
+    (14, 12): 22,
+    (14, 13): 19,
+    (14, 14): 50,
+    (14, 16): 29,
+    (14, 17): 45,
+    (14, 18): 25,
+    (14, 19): 49,
+    (14, 20): 30,
+    (15, 8): 49,
+    (15, 9): 35,
+    (15, 10): 13,
+    (15, 11): 45,
+    (15, 12): 21,
+    (15, 13): 28,
+    (15, 14): 26,
+    (15, 15): 35,
+    (15, 16): 47,
+    (15, 17): 11,
+    (15, 18): 15,
+    (15, 19): 26,
+    (15, 20): 25,
+    (16, 9): 10,
+    (16, 10): 6,
+    (16, 11): 5,
+    (16, 12): 12,
+    (16, 13): 34,
+    (16, 14): 15,
+    (16, 15): 24,
+    (16, 16): 43,
+    (16, 17): 35,
+    (16, 18): 37,
+    (16, 19): 7,
+    (16, 20): 31,
+    (17, 9): 42,
+    (17, 10): 5,
+    (17, 11): 45,
+    (17, 12): 35,
+    (17, 14): 47,
+    (17, 16): 31,
+    (17, 17): 45,
+    (17, 18): 11,
+    (17, 20): 44,
+    (18, 11): 11,
+    (18, 12): 5,
+    (18, 13): 38,
+    (18, 14): 9,
+    (18, 15): 45,
+    (18, 16): 30,
+    (18, 17): 25,
+    (18, 18): 43,
+    (18, 19): 35,
+    (18, 20): 40,
+    (19, 10): 6,
+    (19, 11): 28,
+    (19, 12): 46,
+    (19, 13): 34,
+    (19, 14): 23,
+    (19, 15): 15,
+    (19, 16): 44,
+    (19, 17): 30,
+    (19, 18): 7,
+    (19, 19): 39,
+    (19, 20): 23,
+    (20, 11): 9,
+    (20, 12): 22,
+    (20, 13): 32,
+    (20, 14): 16,
+    (20, 15): 17,
+    (20, 16): 48,
+    (20, 17): 31,
+    (20, 18): 14,
+    (20, 19): 11,
+    (20, 20): 14,
+    (21, 12): 38,
+    (21, 13): 15,
+    (21, 15): 28,
+    (21, 19): 10,
+    (21, 20): 24,
+    (22, 14): 50,
+    (22, 15): 25,
+    (22, 16): 37,
+    (22, 17): 17,
+    (22, 18): 48,
+    (22, 19): 40,
+    (22, 20): 28,
+    (22, 21): 12,
+    (23, 15): 31,
+    (23, 16): 38,
+    (23, 17): 50,
+    (23, 18): 7,
+    (24, 15): 17,
+    (24, 16): 29,
+    (25, 18): 37,
+    (25, 19): 8,
+    (25, 20): 25,
+    (26, 17): 9,
+    (26, 18): 17,
+    (26, 19): 49,
+    (26, 20): 16,
+    (26, 21): 16,
+    (26, 29): 50,
+    (27, 13): 88,
+    (27, 14): 71,
+    (27, 17): 56,
+    (27, 18): 48,
+    (27, 19): 70,
+    (27, 20): 24,
+    (27, 21): 97,
+    (27, 22): 95,
+    (27, 23): 66,
+    (27, 24): 125,
+    (27, 25): 255,
+    (27, 27): 1327,
+    (27, 28): 1200,
+    (27, 29): 1119,
+    (27, 30): 1089,
+    (27, 31): 1358,
+    (27, 32): 621,
+    (27, 33): 594,
+    (28, 13): 58,
+    (28, 14): 71,
+    (28, 15): 46,
+    (28, 16): 94,
+    (28, 17): 75,
+    (28, 18): 96,
+    (28, 19): 99,
+    (28, 20): 63,
+    (28, 21): 86,
+    (28, 22): 161,
+    (28, 23): 50,
+    (28, 24): 152,
+    (28, 25): 296,
+    (28, 26): 293,
+    (28, 27): 1043,
+    (28, 28): 982,
+    (28, 29): 1420,
+    (28, 30): 1419,
+    (28, 31): 895,
+    (28, 32): 402,
+    (28, 33): 637,
+    (28, 34): 546,
+    (28, 35): 626,
+    (29, 13): 47,
+    (29, 14): 81,
+    (29, 15): 63,
+    (29, 16): 42,
+    (29, 17): 37,
+    (29, 18): 78,
+    (29, 19): 65,
+    (29, 20): 20,
+    (29, 21): 66,
+    (29, 22): 113,
+    (29, 23): 78,
+    (29, 24): 133,
+    (29, 25): 259,
+    (29, 26): 311,
+    (29, 27): 1396,
+    (29, 28): 1011,
+    (29, 29): 955,
+    (29, 30): 982,
+    (29, 31): 1278,
+    (29, 32): 740,
+    (29, 33): 741,
+    (29, 34): 727,
+    (29, 35): 417,
+    (29, 36): 648,
+    (29, 37): 592,
+    (30, 13): 38,
+    (30, 14): 40,
+    (30, 15): 79,
+    (30, 16): 92,
+    (30, 17): 44,
+    (30, 18): 31,
+    (30, 19): 45,
+    (30, 20): 90,
+    (30, 21): 31,
+    (30, 22): 156,
+    (30, 23): 78,
+    (30, 24): 145,
+    (30, 25): 439,
+    (30, 26): 495,
+    (30, 27): 934,
+    (30, 28): 822,
+    (30, 29): 1384,
+    (30, 30): 1338,
+    (30, 31): 1482,
+    (30, 32): 493,
+    (30, 33): 657,
+    (30, 34): 683,
+    (30, 35): 405,
+    (30, 36): 463,
+    (30, 37): 450,
+    (30, 38): 120,
+    (30, 39): 109,
+    (31, 13): 45,
+    (31, 14): 81,
+    (31, 15): 57,
+    (31, 16): 70,
+    (31, 17): 44,
+    (31, 18): 45,
+    (31, 19): 42,
+    (31, 20): 99,
+    (31, 21): 93,
+    (31, 22): 78,
+    (31, 23): 150,
+    (31, 24): 177,
+    (31, 25): 240,
+    (31, 26): 397,
+    (31, 27): 1061,
+    (31, 28): 939,
+    (31, 29): 1490,
+    (31, 30): 1194,
+    (31, 31): 990,
+    (31, 32): 464,
+    (31, 33): 616,
+    (31, 34): 788,
+    (31, 35): 717,
+    (31, 36): 475,
+    (31, 37): 780,
+    (31, 38): 140,
+    (31, 39): 117,
+    (31, 40): 75,
+    (31, 41): 49,
+    (32, 10): 26,
+    (32, 11): 95,
+    (32, 13): 95,
+    (32, 14): 21,
+    (32, 15): 81,
+    (32, 16): 97,
+    (32, 17): 98,
+    (32, 18): 23,
+    (32, 19): 81,
+    (32, 20): 60,
+    (32, 21): 38,
+    (32, 22): 87,
+    (32, 23): 76,
+    (32, 24): 42,
+    (32, 25): 59,
+    (32, 26): 78,
+    (32, 27): 833,
+    (32, 28): 845,
+    (32, 29): 998,
+    (32, 30): 1467,
+    (32, 31): 1387,
+    (32, 32): 664,
+    (32, 33): 644,
+    (32, 34): 483,
+    (32, 35): 474,
+    (32, 36): 800,
+    (32, 37): 677,
+    (32, 38): 70,
+    (32, 39): 76,
+    (32, 40): 31,
+    (32, 41): 27,
+    (32, 42): 35,
+    (33, 10): 24,
+    (33, 11): 32,
+    (33, 12): 98,
+    (33, 14): 57,
+    (33, 15): 20,
+    (33, 16): 36,
+    (33, 17): 96,
+    (33, 18): 55,
+    (33, 19): 81,
+    (33, 20): 53,
+    (33, 21): 48,
+    (33, 22): 136,
+    (33, 23): 117,
+    (33, 24): 38,
+    (33, 25): 54,
+    (33, 26): 97,
+    (33, 27): 821,
+    (33, 28): 875,
+    (33, 29): 894,
+    (33, 30): 1472,
+    (33, 31): 1136,
+    (33, 32): 771,
+    (33, 33): 652,
+    (33, 34): 472,
+    (33, 35): 707,
+    (33, 37): 643,
+    (33, 43): 28,
+    (33, 46): 46,
+    (33, 47): 45,
+    (33, 48): 37,
+    (34, 10): 61,
+    (34, 11): 67,
+    (34, 12): 91,
+    (34, 14): 91,
+    (34, 15): 71,
+    (34, 16): 30,
+    (34, 17): 60,
+    (34, 18): 47,
+    (34, 19): 84,
+    (34, 20): 76,
+    (34, 21): 81,
+    (34, 22): 72,
+    (34, 23): 60,
+    (34, 24): 134,
+    (34, 25): 11,
+    (34, 26): 96,
+    (34, 27): 16,
+    (34, 28): 55,
+    (34, 29): 62,
+    (34, 30): 51,
+    (34, 31): 96,
+    (34, 32): 37,
+    (34, 33): 17,
+    (34, 34): 79,
+    (34, 35): 91,
+    (34, 36): 84,
+    (34, 37): 22,
+    (34, 38): 20,
+    (34, 39): 49,
+    (34, 40): 25,
+    (34, 41): 68,
+    (34, 42): 42,
+    (34, 43): 80,
+    (34, 44): 51,
+    (34, 45): 34,
+    (34, 46): 12,
+    (34, 47): 78,
+    (34, 48): 24,
+    (34, 49): 80,
+    (35, 11): 100,
+    (35, 12): 96,
+    (35, 14): 92,
+    (35, 15): 78,
+    (35, 16): 35,
+    (35, 17): 47,
+    (35, 18): 76,
+    (35, 19): 100,
+    (35, 20): 97,
+    (35, 21): 27,
+    (35, 22): 143,
+    (35, 23): 132,
+    (35, 24): 106,
+    (35, 25): 57,
+    (35, 26): 47,
+    (35, 27): 30,
+    (35, 28): 36,
+    (35, 29): 40,
+    (35, 30): 15,
+    (35, 31): 97,
+    (35, 32): 35,
+    (35, 33): 42,
+    (35, 34): 53,
+    (35, 35): 79,
+    (35, 36): 89,
+    (35, 37): 50,
+    (35, 38): 37,
+    (35, 39): 29,
+    (35, 40): 89,
+    (35, 41): 70,
+    (35, 42): 52,
+    (35, 43): 50,
+    (35, 44): 86,
+    (35, 45): 77,
+    (35, 46): 11,
+    (35, 47): 86,
+    (35, 48): 91,
+    (35, 49): 16,
+    (36, 11): 97,
+    (36, 12): 27,
+    (36, 14): 47,
+    (36, 15): 37,
+    (36, 16): 43,
+    (36, 17): 25,
+    (36, 18): 87,
+    (36, 19): 83,
+    (36, 20): 23,
+    (36, 21): 55,
+    (36, 22): 68,
+    (36, 23): 13,
+    (36, 24): 66,
+    (36, 25): 36,
+    (36, 26): 13,
+    (36, 27): 92,
+    (36, 28): 81,
+    (36, 29): 25,
+    (36, 30): 76,
+    (36, 31): 31,
+    (36, 32): 90,
+    (36, 33): 36,
+    (36, 34): 99,
+    (36, 35): 95,
+    (36, 37): 77,
+    (36, 38): 13,
+    (36, 39): 16,
+    (36, 40): 72,
+    (36, 41): 28,
+    (36, 42): 48,
+    (36, 43): 97,
+    (36, 44): 41,
+    (36, 45): 80,
+    (36, 46): 81,
+    (37, 12): 67,
+    (37, 13): 60,
+    (37, 14): 91,
+    (37, 15): 79,
+    (37, 16): 79,
+    (37, 17): 17,
+    (37, 19): 71,
+    (37, 20): 95,
+    (37, 21): 48,
+    (37, 22): 51,
+    (37, 23): 14,
+    (37, 24): 15,
+    (37, 25): 61,
+    (37, 26): 10,
+    (37, 27): 90,
+    (37, 28): 37,
+    (37, 29): 21,
+    (37, 30): 81,
+    (37, 31): 73,
+    (37, 32): 52,
+    (37, 33): 12,
+    (37, 34): 97,
+    (37, 35): 25,
+    (37, 37): 81,
+    (37, 38): 88,
+    (37, 39): 47,
+    (37, 40): 39,
+    (37, 41): 90,
+    (37, 42): 86,
+    (37, 43): 31,
+    (37, 44): 88,
+    (37, 45): 90,
+    (37, 46): 93,
+    (38, 12): 92,
+    (38, 13): 12,
+    (38, 14): 61,
+    (38, 20): 51,
+    (38, 21): 40,
+    (38, 22): 61,
+    (38, 23): 31,
+    (38, 24): 33,
+    (38, 25): 75,
+    (38, 26): 24,
+    (38, 27): 50,
+    (38, 28): 95,
+    (38, 29): 26,
+    (38, 30): 13,
+    (38, 31): 73,
+    (38, 32): 22,
+    (38, 33): 55,
+    (38, 34): 88,
+    (38, 35): 18,
+    (38, 38): 96,
+    (38, 39): 19,
+    (38, 40): 83,
+    (38, 41): 64,
+    (38, 42): 53,
+    (38, 43): 54,
+    (38, 44): 16,
+    (38, 45): 74,
+    (38, 46): 70,
+    (39, 13): 120,
+    (39, 21): 45,
+    (39, 22): 38,
+    (39, 23): 147,
+    (39, 24): 125,
+    (39, 25): 20,
+    (39, 26): 77,
+    (39, 27): 24,
+    (39, 28): 112,
+    (39, 29): 48,
+    (39, 30): 140,
+    (39, 31): 131,
+    (39, 32): 101,
+    (39, 33): 131,
+    (39, 34): 146,
+    (39, 35): 116,
+    (39, 37): 103,
+    (39, 38): 94,
+    (39, 39): 98,
+    (39, 40): 99,
+    (39, 41): 35,
+    (39, 42): 51,
+    (39, 43): 41,
+    (39, 44): 45,
+    (39, 45): 60,
+    (39, 46): 31,
+    (39, 47): 28,
+    (39, 48): 30,
+    (39, 49): 24,
+    (40, 13): 15,
+    (40, 21): 93,
+    (40, 22): 108,
+    (40, 23): 30,
+    (40, 24): 124,
+    (40, 25): 105,
+    (40, 26): 69,
+    (40, 27): 42,
+    (40, 28): 33,
+    (40, 29): 36,
+    (40, 30): 19,
+    (40, 31): 30,
+    (40, 32): 65,
+    (40, 33): 92,
+    (40, 34): 89,
+    (40, 35): 116,
+    (40, 37): 11,
+    (40, 38): 72,
+    (40, 39): 64,
+    (40, 40): 45,
+    (40, 41): 88,
+    (40, 42): 100,
+    (40, 43): 51,
+    (40, 44): 57,
+    (40, 45): 26,
+    (40, 46): 38,
+    (40, 47): 32,
+    (40, 48): 34,
+    (41, 21): 118,
+    (41, 22): 83,
+    (41, 23): 83,
+    (41, 24): 93,
+    (41, 25): 111,
+    (41, 26): 108,
+    (41, 27): 20,
+    (41, 28): 67,
+    (41, 29): 115,
+    (41, 30): 114,
+    (41, 31): 135,
+    (41, 32): 23,
+    (41, 33): 140,
+    (41, 34): 17,
+    (41, 35): 125,
+    (41, 38): 31,
+    (41, 39): 56,
+    (41, 40): 62,
+    (41, 41): 91,
+    (41, 42): 68,
+    (41, 43): 44,
+    (41, 44): 10,
+    (41, 45): 35,
+    (41, 46): 34,
+    (41, 47): 10,
+    (42, 21): 23,
+    (42, 22): 67,
+    (42, 23): 101,
+    (42, 24): 107,
+    (42, 25): 22,
+    (42, 26): 28,
+    (42, 27): 38,
+    (42, 28): 51,
+    (42, 29): 124,
+    (42, 30): 60,
+    (42, 31): 73,
+    (42, 32): 45,
+    (42, 33): 75,
+    (42, 34): 98,
+    (42, 35): 57,
+    (42, 37): 133,
+    (42, 38): 34,
+    (42, 39): 86,
+    (42, 40): 41,
+    (42, 41): 72,
+    (42, 42): 63,
+    (42, 43): 19,
+    (42, 44): 17,
+    (42, 45): 20,
+    (42, 46): 17,
+    (42, 47): 14,
+    (43, 21): 43,
+    (43, 22): 132,
+    (43, 23): 128,
+    (43, 24): 76,
+    (43, 25): 91,
+    (43, 26): 31,
+    (43, 27): 101,
+    (43, 28): 113,
+    (43, 29): 94,
+    (43, 30): 47,
+    (43, 31): 103,
+    (43, 32): 93,
+    (43, 33): 63,
+    (43, 34): 130,
+    (43, 35): 65,
+    (43, 37): 109,
+    (43, 38): 88,
+    (43, 39): 66,
+    (43, 40): 53,
+    (43, 41): 41,
+    (43, 42): 52,
+    (43, 43): 46,
+    (43, 44): 55,
+    (43, 45): 17,
+    (43, 46): 33,
+    (44, 21): 97,
+    (44, 22): 94,
+    (44, 23): 70,
+    (44, 24): 20,
+    (44, 25): 46,
+    (44, 26): 125,
+    (44, 27): 26,
+    (44, 28): 96,
+    (44, 29): 81,
+    (44, 30): 70,
+    (44, 31): 42,
+    (44, 32): 54,
+    (44, 33): 84,
+    (44, 34): 90,
+    (44, 35): 134,
+    (44, 37): 81,
+    (44, 38): 57,
+    (44, 39): 88,
+    (44, 40): 82,
+    (44, 41): 73,
+    (44, 42): 58,
+    (44, 43): 44,
+    (44, 44): 19,
+    (44, 45): 53,
+    (44, 46): 10,
+    (45, 21): 126,
+    (45, 22): 43,
+    (45, 23): 67,
+    (45, 24): 135,
+    (45, 25): 35,
+    (45, 26): 130,
+    (45, 27): 49,
+    (45, 28): 150,
+    (45, 29): 147,
+    (45, 30): 119,
+    (45, 31): 62,
+    (45, 32): 32,
+    (45, 33): 118,
+    (45, 34): 28,
+    (45, 35): 15,
+    (45, 41): 53,
+    (45, 42): 73,
+    (45, 43): 20,
+    (45, 44): 16,
+    (45, 45): 19,
+    (45, 46): 5,
+    (46, 21): 85,
+    (46, 22): 96,
+    (46, 23): 129,
+    (46, 24): 42,
+    (46, 25): 39,
+    (46, 26): 85,
+    (46, 27): 49,
+    (46, 28): 21,
+    (46, 29): 92,
+    (46, 30): 95,
+    (46, 31): 123,
+    (46, 32): 67,
+    (46, 33): 102,
+    (46, 34): 91,
+    (46, 42): 54,
+    (46, 43): 53,
+    (46, 44): 40,
+    (46, 45): 36,
+    (47, 22): 139,
+    (47, 23): 141,
+    (47, 24): 18,
+    (47, 25): 112,
+    (47, 26): 74,
+    (47, 27): 72,
+    (47, 28): 79,
+    (47, 29): 42,
+    (47, 30): 12,
+    (47, 31): 145,
+    (47, 32): 32,
+    (47, 33): 15,
+    (48, 30): 107,
+    (48, 31): 17,
+    (48, 32): 29,
+    (49, 31): 108,
+    (49, 32): 106
+}
+
+
+
 
 NYC_HISTORICAL_ROADS = {
     # Major NYC streets and their construction/removal years
@@ -1337,130 +1672,15 @@ NYC_HISTORICAL_BRIDGES = {
     # etc.
 }
 
-def is_point_on_road_at_year(x: float, y: float, year: int, game_map) -> bool:
-    """Check if a point is on a road that exists at the given year.
-    For NYC maps, checks historical roads. For other maps, checks OSM rights of way."""
-    if not game_map.is_nyc_proper:
-        # For non-NYC maps, check OSM rights of way
-        if game_map.use_osm and game_map.osm_integration:
-            if hasattr(game_map, '_osm_rights_of_way') and game_map._osm_rights_of_way:
-                nearest = game_map.find_nearest_right_of_way(x, y)
-                return nearest is not None
-        return False
-    
-    # For NYC maps, check historical roads first
-    from map_presets_nyc import get_nyc_bounds
-    nyc_bounds = get_nyc_bounds()
-    min_lat = nyc_bounds['min_lat']
-    max_lat = nyc_bounds['max_lat']
-    min_lon = nyc_bounds['min_lon']
-    max_lon = nyc_bounds['max_lon']
-    
-    # Convert grid coordinates to lat/lon
-    grid_width = game_map.width
-    grid_height = game_map.height
-    lat = min_lat + (y / grid_height) * (max_lat - min_lat)
-    lon = min_lon + (x / grid_width) * (max_lon - min_lon)
-    
-    # Check historical roads
-    for road_name, road_info in NYC_HISTORICAL_ROADS.items():
-        # Check if road exists at this year (must be built and not removed)
-        road_year = road_info.get('year', 0)
-        removed_year = road_info.get('removed_year', None)
-        
-        if road_year > year:
-            continue  # Road doesn't exist yet (not built)
-        
-        if removed_year is not None and year >= removed_year:
-            continue  # Road was removed (historical road removal)
-        
-        bounds = road_info.get('bounds', {})
-        if (bounds.get('min_lat', -90) <= lat <= bounds.get('max_lat', 90) and
-            bounds.get('min_lon', -180) <= lon <= bounds.get('max_lon', 180)):
-            # Point is within road bounds - consider it on the road
-            return True
-    
-    # Also check roads in the map that were built before or during the given year
-    roads = game_map.get_roads()
-    if not roads:
-        return False
-    
-    # Check if point is near any road route
-    import math
-    tolerance = 0.5  # Distance tolerance for "on road"
-    
-    for road_name, road in roads.items():
-        if not hasattr(road, 'route'):
-            continue
-        route = road.get_route()
-        if not route:
-            continue
-        
-        # Check if point is near any segment of the road
-        for i in range(len(route) - 1):
-            p1 = route[i]
-            p2 = route[i + 1]
-            
-            # Get coordinates
-            if hasattr(p1, 'x') and hasattr(p1, 'y'):
-                x1, y1 = float(p1.x), float(p1.y)
-            elif isinstance(p1, (list, tuple)) and len(p1) >= 2:
-                x1, y1 = float(p1[0]), float(p1[1])
-            else:
-                continue
-                
-            if hasattr(p2, 'x') and hasattr(p2, 'y'):
-                x2, y2 = float(p2.x), float(p2.y)
-            elif isinstance(p2, (list, tuple)) and len(p2) >= 2:
-                x2, y2 = float(p2[0]), float(p2[1])
-            else:
-                continue
-            
-            # Calculate distance from point to line segment
-            dx = x2 - x1
-            dy = y2 - y1
-            seg_len_sq = dx * dx + dy * dy
-            
-            if seg_len_sq == 0:
-                # Point segment - check distance to point
-                dist = math.hypot(x - x1, y - y1)
-            else:
-                # Project point onto line segment
-                t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / seg_len_sq))
-                proj_x = x1 + t * dx
-                proj_y = y1 + t * dy
-                dist = math.hypot(x - proj_x, y - proj_y)
-            
-            if dist <= tolerance:
-                return True
-    
-    return False
 
-def is_point_on_bridge_at_year(x: float, y: float, year: int, game_map) -> bool:
-    """Check if a point is on a bridge that exists at the given year.
-    For NYC maps, checks historical bridges."""
-    if not game_map.is_nyc_proper:
+def ai_relax_polyline_self_overlap_for_osm_candidate(
+    current_year: int, min_pop_road: int, existing_line_routes,
+) -> bool:
+    """If True, ai.py may build despite polyline_has_self_overlap on preset OSM routes.
+
+    Dense Manhattan corridors often false-positive after grid sampling; the same relaxation exists in
+    map_presets_nyc_road_utils when collecting candidates (relax_self_overlap).
+    """
+    if existing_line_routes:
         return False
-    
-    # For NYC maps, check if point is near any bridge that exists at the given year
-    # This is a simplified check - in a full implementation, we'd check actual bridge locations
-    # For now, if a point is in water and near a known bridge location, consider it on a bridge
-    
-    # Check if point is in water first
-    from map_presets_nyc import is_water_location, get_nyc_default_center_lat, get_nyc_default_center_lon
-    import math
-    
-    grid_size = max(game_map.width, game_map.height)
-    lat_km = (y - grid_size // 2)
-    lon_km = (x - grid_size // 2)
-    center_lat = game_map.map_center_lat if game_map.map_center_lat is not None else get_nyc_default_center_lat()
-    center_lon = game_map.map_center_lon if game_map.map_center_lon is not None else get_nyc_default_center_lon()
-    lat = center_lat + (lat_km / 111.0)
-    lon_deg_per_km = 111.0 * math.cos(math.radians(center_lat))
-    if lon_deg_per_km == 0:
-        lon_deg_per_km = 111.0
-    lon = center_lon + (lon_km / lon_deg_per_km)
-    
-    if not is_water_location(lat, lon, game_map.osm_integration):
-        return False
-    return False
+    return current_year == 1830 and int(min_pop_road or 0) >= 1000

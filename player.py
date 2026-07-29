@@ -5,11 +5,17 @@ class Player:
                  trainsets: list = None,
                  name: str = "",
                  line_names: list[str] = None,
-                 maitnance_costs: int = 0):
+                 maitnance_costs: int = 0,
+                 is_ai: bool = False,
+                 ai_focus: str = None,
+                 ai_difficulty: str = None):
         """The Player stores all information pertaining to the player's stats:
         Money, equipment, lines, ect.
         Money = int
-        lines is a list of dictionary keys to be used to read lines from the map."""
+        lines is a list of dictionary keys to be used to read lines from the map.
+        is_ai: If True, this player is computer-controlled.
+        ai_focus: For AI players, one of 'lobbying', 'marketplace', 'line_expansion', 'balanced'.
+        ai_difficulty: For AI players, one of 'easy', 'medium', 'hard'. Harder AIs get in-game bonuses."""
         self.money = money
         self.line_names = line_names
         self.player_id = player_id
@@ -17,14 +23,41 @@ class Player:
         self.name = name
         self.maitnance_costs = maitnance_costs
         self.is_eliminated = False
+        self.is_ai = is_ai
+        self.ai_focus = (ai_focus or 'balanced') if is_ai else None
+        self.ai_difficulty = (ai_difficulty or 'hard') if is_ai else None
         if self.trainsets is None:
             self.trainsets = []
         if self.line_names is None:
             self.line_names = []
-        # Worker rentals: dict mapping worker type name to WorkerRental
-        self.worker_rentals = {}  # worker_type_name -> WorkerRental
-        # Lawsuit excuses: list of LawsuitExcuse objects
-        self.lawsuit_excuses = []  # List of excuses to sue other players
+        self.buses = []
+        self.ferries = []
+        self.worker_rentals = {}
+        self.lawsuit_excuses = []
+        # When a human is merged into another human, they control the acquirer's company (same tab content).
+        self.merged_into_player_id = None
+        self.color_index = None
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        if not hasattr(self, 'is_ai'):
+            self.is_ai = False
+        if not hasattr(self, 'ai_focus'):
+            self.ai_focus = 'balanced' if getattr(self, 'is_ai', False) else None
+        if not hasattr(self, 'ai_difficulty'):
+            self.ai_difficulty = 'hard' if getattr(self, 'is_ai', False) else None
+        if not hasattr(self, 'worker_rentals'):
+            self.worker_rentals = {}
+        if not hasattr(self, 'lawsuit_excuses'):
+            self.lawsuit_excuses = []
+        if not hasattr(self, 'merged_into_player_id'):
+            self.merged_into_player_id = None
+        if not hasattr(self, 'color_index'):
+            self.color_index = None
+        if not hasattr(self, 'buses'):
+            self.buses = []
+        if not hasattr(self, 'ferries'):
+            self.ferries = []
 
     def get_money(self):
         return self.money

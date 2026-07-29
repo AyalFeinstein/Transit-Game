@@ -206,6 +206,14 @@ class Map:
                     for x in range(self.width + 1):
                         for y in range(self.height + 1):
                             self.population[(x, y)] = get_standard_population_at_location(x, y, self.width, self.height)
+            else:
+                # Preset module failed to load (load_map_preset returned None) - fall back to standard
+                import warnings
+                warnings.warn(f"Preset {self.map_preset_name} could not be loaded; using standard population")
+                self.population = {}
+                for x in range(self.width + 1):
+                    for y in range(self.height + 1):
+                        self.population[(x, y)] = get_standard_population_at_location(x, y, self.width, self.height)
         else:
             # Standard map: Use similar population density (per grid square)
             self.population = {}
@@ -220,11 +228,42 @@ class Map:
         # Cache for OSM rights of way
         self._osm_rights_of_way = None
         self._osm_bbox = None
+        # Lazy cache for preset INITIAL_POPULATION land cells (avoids re-parsing preset file per point check)
+        self._buildable_included_points: frozenset[tuple[int, int]] | None = None
+        self._buildable_included_points_loaded = False
+
+    def invalidate_buildable_area_cache(self) -> None:
+        """Clear cached buildable points after edit-mode preset file changes."""
+        self._buildable_included_points = None
+        self._buildable_included_points_loaded = False
+
+    def _get_buildable_included_points(self) -> frozenset[tuple[int, int]] | None:
+        """Included grid points for preset maps, or None when all in-bounds cells are buildable."""
+        if self._buildable_included_points_loaded:
+            return self._buildable_included_points
+        self._buildable_included_points_loaded = True
+        if self.population:
+            self._buildable_included_points = frozenset(
+                pt for pt, pop in self.population.items() if pop and int(pop) > 0
+            )
+            return self._buildable_included_points
+        if not self.map_preset_name:
+            self._buildable_included_points = None
+            return None
+        from map_preset_utils import get_preset_file_info, read_included_points_from_file
+        preset_info = get_preset_file_info(self)
+        if not preset_info:
+            self._buildable_included_points = None
+            return None
+        file_path, variable_name = preset_info
+        included = read_included_points_from_file(file_path, variable_name)
+        self._buildable_included_points = frozenset(included) if included else None
+        return self._buildable_included_points
         
     def is_point_in_buildable_area(self, x: float, y: float) -> bool:
         """Check if a grid point is in the buildable play area (where lines can be built).
         
-        For NYC map: buildable = NYC boroughs (NYC_INCLUDED_POINTS).
+        For preset maps: buildable = cells with population in INITIAL_POPULATION.
         For standard maps: all points within bounds are buildable.
         
         Returns:
@@ -233,14 +272,10 @@ class Map:
         gx, gy = int(round(x)), int(round(y))
         if gx < 0 or gx > self.width or gy < 0 or gy > self.height:
             return False
-        if self.map_preset_name == 'nyc':
-            from map_preset_utils import get_preset_file_info, read_included_points_from_file
-            preset_info = get_preset_file_info(self)
-            if preset_info:
-                file_path, variable_name = preset_info
-                included = read_included_points_from_file(file_path, variable_name)
-                if included:
-                    return (gx, gy) in included
+        included = self._get_buildable_included_points()
+        if included is not None:
+            return (gx, gy) in included
+        if self.map_preset_name:
             return True  # Fallback: allow if file read fails
         return True
     
@@ -296,10 +331,10 @@ class Map:
         base_year = pop_settings['base_year']
         years_passed = current_year - base_year
         
-        # Growth factor: use milestone targets for fluid rate when available
+        # Growth factor: use milestone targets for fluid rate when available (realistic growth)
         if years_passed <= 0:
             growth_factor = 1.0
-        elif self.map_preset_name == "nyc" and pop_settings.get('population_targets_by_year'):
+        elif pop_settings.get('population_targets_by_year'):
             # Derive growth from targets so population hits milestones at a fluid rate
             targets = pop_settings['population_targets_by_year']
             years = sorted(targets.keys())
@@ -373,13 +408,19 @@ class Map:
             max_lat = bounds['max_lat']
             min_lon = bounds['min_lon']
             max_lon = bounds['max_lon']
-            try:
-                from nyc_population_map import NYC_POPULATION_MAP
-            except ImportError:
-                NYC_POPULATION_MAP = {}
+            point_area_map = getattr(self, '_preset_point_area_map_cache', None)
+            if point_area_map is None and self.map_preset_name:
+                from map_preset_loader import get_preset_point_area_map
+                point_area_map = get_preset_point_area_map(self.map_preset_name)
+                try:
+                    self._preset_point_area_map_cache = point_area_map
+                except Exception:
+                    pass
+            elif point_area_map is None:
+                point_area_map = {}
         else:
             min_lat = max_lat = min_lon = max_lon = None
-            NYC_POPULATION_MAP = {}
+            point_area_map = {}
 
         # Points removed in edit mode - never update these (they must stay removed)
         deleted = getattr(self, '_deleted_population_points', set()) or set()
@@ -403,7 +444,7 @@ class Map:
                 for event_name, area_change in area_population_changes.items():
                     if 'boroughs' in area_change:
                         # Check if point is in affected borough
-                        point_borough = NYC_POPULATION_MAP.get((x, y), {}).get('borough', 'Unknown')
+                        point_borough = point_area_map.get((x, y), {}).get('borough', 'Unknown')
                         if point_borough in area_change['boroughs']:
                             area_multiplier *= (1.0 + area_change['change_percent'])
                     elif 'bounds' in area_change:
@@ -413,7 +454,10 @@ class Map:
                             bounds['min_lon'] <= lon <= bounds['max_lon']):
                             area_multiplier *= (1.0 + area_change['change_percent'])
             
-            location_growth = growth_factor * random.uniform(min_var, max_var) * event_multiplier * area_multiplier
+            if years_passed <= 0:
+                location_growth = growth_factor * event_multiplier * area_multiplier
+            else:
+                location_growth = growth_factor * random.uniform(min_var, max_var) * event_multiplier * area_multiplier
 
             # Prevent pathological growth from blowing up simulation (and runtime)
             if not math.isfinite(location_growth) or location_growth < 0:
@@ -421,7 +465,7 @@ class Map:
             
             has_station = (x, y) in station_set
             if has_station:
-                station_bonus = 1.0 + (station_locations[(x, y)] * 0.15)
+                station_bonus = 1.0 + (station_locations[(x, y)] * 0.05)
                 location_growth *= station_bonus
                 total_new_population += int(current_pop * 0.10)
             
@@ -433,20 +477,18 @@ class Map:
             self.population[(x, y)] = new_pop
         
         if total_new_population > 0:
-            station_points = list(station_locations.keys())
+            station_points = [p for p in station_locations.keys() if p not in deleted and self.population.get(p, 0) > 0]
             if station_points:
-                for _ in range(min(total_new_population, len(station_points) * 50)):
-                    sx, sy = random.choice(station_points)
-                    if (sx, sy) in deleted:
-                        continue  # Never add to deleted points
-                    if (sx, sy) in self.population and self.population[(sx, sy)] > 0:
-                        self.population[(sx, sy)] += 1
+                n = min(total_new_population, len(station_points) * 50)
+                from collections import Counter
+                for pt, cnt in Counter(random.choices(station_points, k=n)).items():
+                    self.population[pt] = self.population.get(pt, 0) + cnt
         
         # Scale total population to match NYC historical targets (fluid interpolation)
         current_total = sum(self.population.values())
         if current_total > 0:
             scale_factor = 1.0
-            if self.map_preset_name == "nyc" and pop_settings.get('population_targets_by_year'):
+            if pop_settings.get('population_targets_by_year'):
                 targets = pop_settings['population_targets_by_year']
                 years = sorted(targets.keys())
                 if current_year <= years[0]:
@@ -545,6 +587,20 @@ class Map:
 
     def delete_line(self,
                     the_line: Line):
+        # Remove stations that only served this line from the map (e.g. when player eliminated)
+        line_name = the_line.name
+        stations = list(the_line.get_stations() if hasattr(the_line, 'get_stations') else getattr(the_line, 'stations', []))
+        if hasattr(self, 'stations') and self.stations:
+            for station in stations:
+                line_names = list(station.get_line_names() if hasattr(station, 'get_line_names') else getattr(station, 'line_names', []))
+                if line_name in line_names:
+                    line_names_after = [ln for ln in line_names if ln != line_name]
+                    if hasattr(station, 'line_names'):
+                        station.line_names = line_names_after
+                    if not line_names_after and station in self.stations:
+                        self.stations.remove(station)
+                if hasattr(the_line, 'remove_station'):
+                    the_line.remove_station(station)
         del self.lines[the_line.name]
     
     def get_osm_rights_of_way(self) -> list:

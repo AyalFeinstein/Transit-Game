@@ -7,6 +7,9 @@ To use a custom map preset:
 2. Fill in all the required variables below
 3. The map will be automatically discovered and can be used without modifying main code!
 
+4. Put offline generation scripts in generate_<map_id>_*.py (e.g. generate_nyc_population_points.py).
+   Preset files (map_presets_*.py) hold bounds, runtime helpers, and precomputed data only.
+
 The preset will be automatically loaded when you specify the map name in the game.
 """
 
@@ -38,6 +41,21 @@ MAP_ZOOM = {
     'min_zoom': 8,  # Minimum zoom (can't zoom out further)
     'max_zoom': 19,  # Maximum zoom
 }
+
+# Optional: Default line names for companies (players) on this map. First line gets first name, etc.
+DEFAULT_LINE_NAMES = [
+    "Main Line",
+    "Central Link",
+    "Harbor Line",
+    "Crosstown Line",
+    "Uptown Line",
+    "Downtown Line",
+    "Riverside Line",
+    "Metro Link",
+]
+
+# Optional: Default schedule scheme for new lines. peak/off_peak/night multipliers (e.g. 1.0 = full service).
+DEFAULT_SCHEDULE_SCHEME = {"peak": 1.0, "off_peak": 0.8, "night": 0.3}
 
 # Water areas (list of rectangular areas that are water)
 # Format: {'min_lat': float, 'max_lat': float, 'min_lon': float, 'max_lon': float}

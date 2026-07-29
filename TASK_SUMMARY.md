@@ -65,3 +65,38 @@
 2. Fix population points script completion
 3. Unit tests
 4. Code review for separation of concerns
+
+---
+
+## End-year timing findings (for AI speed / profiling)
+
+**Source:** `profile_end_year_first_turn.py` (cProfile), `profile_end_year_sequence.py` (multi-year timings).
+
+### Summary
+- **AI turn dominates** end-year time (~90s on first turn for NYC with 1 AI). `advance_year_complete` is fast on the first turn (~0.1s when there are no stations; no ridership calculation).
+- In later years, `advance_year_complete` does ridership and per-line profit caching; expect it to grow with number of lines/stations but still secondary to AI turn on NYC.
+
+### Where time goes in `run_ai_turn` (NYC, first turn)
+| Phase | Cumulative time | Notes |
+|-------|-----------------|--------|
+| `run_ai_turn` | ~89s | Total for one AI |
+| `_try_build_line` | ~30s × 3 calls | Build attempts/retries |
+| `get_preset_road_segment_points` → `map_presets_nyc.get_road_segment_points_for_ai` → `map_presets_nyc_road_utils.get_road_segment_points_for_ai` | ~88s (24 calls) | **Main bottleneck** |
+| Inside NYC road utils: `sorted` | ~70.5s | Sorting many segments |
+| `_road_priority_by_population_grid` (lambda + grid lookup) | ~68s | Called 463k times |
+| `_latlon_to_grid` | ~27.7s | 2.2M calls |
+| `_get_bounds` / `get_nyc_bounds` | ~11s / ~8.5s | Bounds lookups |
+| `_get_roads_in_map_bounds` | ~5.2s | Road filtering |
+
+### Optimizations already applied
+- **Preset loaded once per AI turn:** `run_ai_turn` loads the map preset once and passes it into `_try_build_line`, `_try_build_ferry_line`, and `_try_extend_line`. `get_preset_road_segment_points`, `get_preset_ferry_segment_points`, and `get_preset_road_extension_points` accept an optional `preset=` to avoid repeated `load_map_preset` (was 600+ calls per turn, now 1).
+- **Existing routes and population points** are computed once per turn and passed through to avoid redundant work.
+
+### Further speedups (without changing behavior)
+- **Core (ai.py / operations.py):** No additional low-hanging fruit; hot path is inside the NYC preset’s `get_road_segment_points_for_ai`.
+- **Map preset (nyc_road_utils):** The largest gains would come from:
+  - Caching or narrowing the set of segments before the expensive sort (e.g. by bounds or length first).
+  - Caching `_road_priority_by_population_grid` or the 4×4 population grid for the turn.
+  - Reducing `_latlon_to_grid` calls (e.g. batch or cache by segment).
+  - Limiting the number of segments passed to `sorted` (e.g. top-N by a cheap metric before full sort).
+- **Profiling:** Run `python profile_end_year_first_turn.py` for cProfile breakdown; run `PROFILE_NUM_GAMES=2 PROFILE_YEARS_PER_GAME=8 python profile_end_year_sequence.py` for multi-year totals (and optionally `PROFILE_CPROFILE=1` for a cProfile dump to `profile_end_year_cprofile.txt`).

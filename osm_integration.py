@@ -4,6 +4,16 @@ from typing import List, Tuple, Optional, Dict
 
 import requests
 
+# Overpass usage policy: identify the application; avoid generic library UA (often blocked / 403).
+_OVERPASS_HEADERS = {
+    'User-Agent': (
+        'TransitGame/1.0 (OpenStreetMap data consumer; '
+        '+https://wiki.openstreetmap.org/wiki/Overpass_API ; '
+        'respects Overpass usage policy)'
+    ),
+    'Accept': 'application/json',
+}
+
 
 class OSMIntegration:
     """Handles OpenStreetMap API integration for map data and rights of way"""
@@ -13,7 +23,27 @@ class OSMIntegration:
         from map_presets import OSM_SETTINGS
         self.timeout = timeout if timeout is not None else OSM_SETTINGS['timeout']
         self.base_url = OSM_SETTINGS['base_url']
+        self._overpass_urls = [self.base_url]
+        for u in (OSM_SETTINGS.get('mirror_urls') or ()):
+            if u and u not in self._overpass_urls:
+                self._overpass_urls.append(u)
         self._cache = {}  # Cache for API responses
+
+    def _post_overpass(self, query: str, timeout: float):
+        """POST to Overpass, rotating mirrors on 403/429/5xx. Returns Response or None."""
+        data = query.encode('utf-8') if isinstance(query, str) else query
+        for url in self._overpass_urls:
+            try:
+                response = requests.post(
+                    url, data=data, timeout=timeout, headers=dict(_OVERPASS_HEADERS)
+                )
+                if response.status_code in (403, 429, 502, 503, 504):
+                    continue
+                response.raise_for_status()
+                return response
+            except requests.exceptions.RequestException:
+                continue
+        return None
     
     def get_railway_ways_in_bbox(self, min_lat: float, min_lon: float, 
                                   max_lat: float, max_lon: float) -> List[Dict]:
@@ -33,10 +63,11 @@ class OSMIntegration:
         """
         
         try:
-            response = requests.post(self.base_url, data=query, timeout=self.timeout)
-            response.raise_for_status()
+            response = self._post_overpass(query, self.timeout)
+            if not response:
+                return []
             data = response.json()
-            
+
             ways = []
             for element in data.get('elements', []):
                 if element.get('type') == 'way':
@@ -50,12 +81,12 @@ class OSMIntegration:
                             'coordinates': coords,
                             'railway_type': element.get('tags', {}).get('railway', 'rail')
                         })
-            
+
             self._cache[cache_key] = ways
             return ways
         except requests.exceptions.Timeout:
             return []
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.RequestException:
             return []
     
     def get_highway_ways_in_bbox(self, min_lat: float, min_lon: float,
@@ -74,8 +105,9 @@ class OSMIntegration:
         """
         
         try:
-            response = requests.post(self.base_url, data=query, timeout=self.timeout)
-            response.raise_for_status()
+            response = self._post_overpass(query, self.timeout)
+            if not response:
+                return []
             data = response.json()
             
             ways = []
@@ -272,8 +304,9 @@ class OSMIntegration:
         """
         
         try:
-            response = requests.post(self.base_url, data=query, timeout=5)
-            response.raise_for_status()
+            response = self._post_overpass(query, 5)
+            if not response:
+                return False
             data = response.json()
             # If we found any water elements, the point is in water
             is_water = len(data.get('elements', [])) > 0
@@ -311,8 +344,9 @@ class OSMIntegration:
         """
         
         try:
-            response = requests.post(self.base_url, data=query, timeout=10)
-            response.raise_for_status()
+            response = self._post_overpass(query, 10)
+            if not response:
+                return self._is_in_nyc_approximate_bounds(lat, lon)
             data = response.json()
             
             # Check if point is within any of the borough boundaries

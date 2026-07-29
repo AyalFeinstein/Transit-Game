@@ -37,19 +37,25 @@ STANDARD_ZOOM = {
     'max_zoom': 19,
 }
 
-# Population settings for standard map
-# Calculate population density similar to NYC (per grid square)
-# NYC 1830: ~202,589 people in ~50x50 grid = ~81 people per grid square average (excluding water)
-# For standard map, use similar density (no water, so all squares have population)
+# Population settings for standard map - realistic urban growth curve
+# Growth rapid in 19th century, moderate in early 20th, slower late 20th/21st
 STANDARD_POPULATION = {
     'base_year': 1830,
     'total_population_1830': 750000,  # For 100x75 reference map; scales with area
-    'population_per_grid_square_min': 50,  # Similar to NYC sparse areas
-    'population_per_grid_square_max': 300,  # Similar to NYC average (adjusted for no water)
-    'population_growth_rate': 0.02,  # 2% per year average
+    'population_per_grid_square_min': 50,
+    'population_per_grid_square_max': 300,
+    'population_growth_rate': 0.02,
     'population_variation': (-0.01, 0.03),
     'location_growth_variation': (0.9, 1.1),
     'max_population_per_location': 500000,
+    'population_targets_by_year': {
+        1830: 750000,
+        1850: 1100000,
+        1900: 2200000,
+        1950: 3500000,
+        2000: 4200000,
+        2050: 4800000,
+    },
 }
 
 def is_standard_map(map_center_lat: float, map_center_lon: float, width: int, height: int) -> bool:

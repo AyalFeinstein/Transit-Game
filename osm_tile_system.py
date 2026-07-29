@@ -61,6 +61,8 @@ class OSMTileSystem:
         self._grid_to_latlon_cache: Dict[Tuple[float, float], Tuple[float, float]] = {}
         # Water check deadline: when set, get_tile_type skips OSM if time.time() > _deadline (enforces 5s cap)
         self._deadline: Optional[float] = None
+        # Preset-only mode: when True, use preset water detection only (no OSM) for fast cost preview
+        self._preset_only_water: bool = False
 
         # Calculate bounds
         self._calculate_bounds()
@@ -201,6 +203,10 @@ class OSMTileSystem:
                 if is_water:
                     self._tile_cache[(tile_x, tile_y)] = 'water'
                     return 'water'
+                # Preset said land - skip OSM when preset_only (fast cost preview)
+                if self._preset_only_water:
+                    self._tile_cache[(tile_x, tile_y)] = 'land'
+                    return 'land'
                 # Preset said land - still check OSM for accuracy (harbor edges, etc.)
                 is_water = is_water_location(lat, lon, self.osm_integration)
             except Exception:
@@ -220,6 +226,10 @@ class OSMTileSystem:
                         except Exception:
                             is_water = False
         elif self.osm_integration:
+            if self._preset_only_water:
+                # No preset for this map - assume land for fast cost preview
+                self._tile_cache[(tile_x, tile_y)] = 'land'
+                return 'land'
             try:
                 is_water = self.osm_integration.is_water_at_latlon(lat, lon)
             except Exception:
@@ -282,10 +292,14 @@ class OSMTileSystem:
                     tile_y = max(0, min(self.tiles_y - 1, tile_y))
                     self._tile_cache[(tile_x, tile_y)] = 'water'
                     return True
+                # Preset-only mode: skip OSM, use tile cache from pre_cache
+                if self._preset_only_water:
+                    tile_type = self.get_point_tile_type(x, y, skip_osm=False)
+                    return tile_type == 'water'
             except Exception:
                 pass
         # Check exact point via OSM (or preset with OSM) when not already water
-        if not skip_osm:
+        if not skip_osm and not self._preset_only_water:
             try:
                 is_water_direct = False
                 if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
@@ -303,7 +317,7 @@ class OSMTileSystem:
                 pass
         tile_type = self.get_point_tile_type(x, y, skip_osm=skip_osm)
         
-        if (tile_type is None or tile_type == 'land') and not skip_osm:
+        if (tile_type is None or tile_type == 'land') and not skip_osm and not self._preset_only_water:
             try:
                 lat, lon = self._grid_to_latlon(x, y)
                 is_water_direct = False
@@ -548,7 +562,9 @@ class OSMTileSystem:
         
         # Double-check the point's own tile. We only "force" a re-query for this one tile,
         # because doing so for every surrounding tile explodes runtime (and can exceed 20s).
-        point_tile_type = self.get_tile_type(tile_x, tile_y, skip_osm=False, force_osm=True)
+        point_tile_type = self.get_tile_type(
+            tile_x, tile_y, skip_osm=False, force_osm=not self._preset_only_water,
+        )
         if point_tile_type == 'water':
             # Point's own tile is water - definitely near water (distance = 0)
             return True
@@ -575,7 +591,7 @@ class OSMTileSystem:
                 
                 # CRITICAL FIX: If tile_type is None (uncertain), query OSM directly as fallback
                 # This handles edge cases where get_tile_type fails to query OSM
-                if tile_type is None:
+                if tile_type is None and not self._preset_only_water:
                     try:
                         tile_lat, tile_lon = self._tile_to_latlon_center(check_tile_x, check_tile_y)
                         if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
@@ -604,6 +620,62 @@ class OSMTileSystem:
         # However, if skip_osm=True and tiles aren't cached, we can't be confident
         # For ferry validation (skip_osm=False), return False if no water found
         # For other cases (skip_osm=True), return False to be conservative
+        return False
+
+    def is_point_near_land(self, x: float, y: float, max_distance_m: float = 30.0, skip_osm: bool = False) -> bool:
+        """True if the point is on land or within max_distance_m of a non-water tile."""
+        in_water = False
+        try:
+            in_water = bool(self.is_point_in_water(x, y, skip_osm=skip_osm))
+        except TypeError:
+            in_water = bool(self.is_point_in_water(x, y))
+        if not in_water:
+            return True
+
+        is_default_impl = False
+        try:
+            is_default_impl = getattr(self.is_point_in_water, "__func__", None) is OSMTileSystem.is_point_in_water
+        except Exception:
+            is_default_impl = False
+        if not is_default_impl:
+            return False
+
+        point_lat, point_lon = self._grid_to_latlon(x, y)
+        tile_x, tile_y = self._latlon_to_tile(point_lat, point_lon)
+        tile_x = max(0, min(self.tiles_x - 1, tile_x))
+        tile_y = max(0, min(self.tiles_y - 1, tile_y))
+
+        tiles_to_check = int(math.ceil(max_distance_m / TILE_SIZE_METERS)) + 3
+        tile_radius_m = TILE_SIZE_METERS / 2
+
+        min_tile_x = max(0, tile_x - tiles_to_check)
+        max_tile_x = min(self.tiles_x - 1, tile_x + tiles_to_check)
+        min_tile_y = max(0, tile_y - tiles_to_check)
+        max_tile_y = min(self.tiles_y - 1, tile_y + tiles_to_check)
+        for check_tile_x in range(min_tile_x, max_tile_x + 1):
+            for check_tile_y in range(min_tile_y, max_tile_y + 1):
+                tile_type = self.get_tile_type(check_tile_x, check_tile_y, skip_osm=False, force_osm=False)
+                if tile_type is None:
+                    try:
+                        tile_lat, tile_lon = self._tile_to_latlon_center(check_tile_x, check_tile_y)
+                        if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
+                            from map_presets_nyc import is_water_location
+                            if is_water_location(tile_lat, tile_lon, self.osm_integration):
+                                tile_type = 'water'
+                            else:
+                                tile_type = 'land'
+                        elif self.osm_integration:
+                            if self.osm_integration.is_water_at_latlon(tile_lat, tile_lon):
+                                tile_type = 'water'
+                            else:
+                                tile_type = 'land'
+                    except Exception:
+                        pass
+                if tile_type and tile_type != 'water':
+                    tile_lat, tile_lon = self._tile_to_latlon_center(check_tile_x, check_tile_y)
+                    distance = self._distance_meters_fast(point_lat, point_lon, tile_lat, tile_lon)
+                    if distance <= max_distance_m + tile_radius_m:
+                        return True
         return False
     
     def is_segment_near_water(self, x1: float, y1: float, x2: float, y2: float, max_distance_m: float = 60.0, skip_osm: bool = False) -> bool:
@@ -659,8 +731,34 @@ class OSMTileSystem:
                 return False
         
         return True
+
+    def ferry_corridor_interior_mostly_water(
+        self, x1: float, y1: float, x2: float, y2: float, skip_osm: bool = False, min_fraction: float = 0.72
+    ) -> bool:
+        """True if the interior of the segment (excluding ~12% at each end) is mostly *in* water.
+
+        ``is_segment_near_water`` allows routes that stay on land but within 60m of the shoreline.
+        Real ferries must spend most of the crossing in actual water tiles.
+        """
+        end_trim = 0.12
+        hits = 0
+        total = 0
+        for k in range(1, 10):
+            t = end_trim + (1.0 - 2.0 * end_trim) * (k / 10.0)
+            sx = x1 + t * (x2 - x1)
+            sy = y1 + t * (y2 - y1)
+            total += 1
+            try:
+                in_w = bool(self.is_point_in_water(sx, sy, skip_osm=skip_osm))
+            except TypeError:
+                in_w = bool(self.is_point_in_water(sx, sy))
+            if in_w:
+                hits += 1
+        if total == 0:
+            return True
+        return (hits / total) >= min_fraction
     
-    def pre_cache_route_tiles(self, points: list, proximity_buffer_m: float = 60.0) -> None:
+    def pre_cache_route_tiles(self, points: list, proximity_buffer_m: float = 60.0, max_osm_queries: int = None) -> None:
         """Pre-cache tiles for all points and segments in a route, including nearby tiles for proximity checking.
         This speeds up validation by batching tile lookups.
         
@@ -669,6 +767,7 @@ class OSMTileSystem:
         Args:
             points: List of (x, y) coordinate tuples
             proximity_buffer_m: Distance in meters to cache around route for proximity checking (default 60m)
+            max_osm_queries: If set, cap total OSM queries (for cost preview; default None = use internal limits)
         """
         if not points:
             return
@@ -779,6 +878,7 @@ class OSMTileSystem:
         
         # OPTIMIZATION: Increase limits for better accuracy while maintaining performance
         MAX_POINT_TILE_QUERIES = 50  # Point tiles are critical - cache all of them
+        MAX_OSM_QUERIES = 30  # Proximity tiles
         
         try:
             from PyQt6.QtWidgets import QApplication
@@ -786,13 +886,16 @@ class OSMTileSystem:
         except:
             use_ui_updates = False
         
+        osm_queries_done = 0
+        
         # OPTIMIZATION: Process point tiles first (most critical for validation)
         # Batch process with UI updates to prevent freeze
         for i, (tile_x, tile_y) in enumerate(point_tiles_uncached):
-            if i >= MAX_POINT_TILE_QUERIES:
+            if i >= MAX_POINT_TILE_QUERIES or (max_osm_queries is not None and osm_queries_done >= max_osm_queries):
                 break
             try:
                 self.get_tile_type(tile_x, tile_y, skip_osm=False)  # Always query OSM for point tiles
+                osm_queries_done += 1
                 # OPTIMIZATION: Update UI less frequently for point tiles (they're fast)
                 if use_ui_updates and i > 0 and i % 20 == 0:
                     QApplication.processEvents()
@@ -801,12 +904,12 @@ class OSMTileSystem:
                 pass
         
         # OPTIMIZATION: Process other tiles (proximity tiles) with reasonable limit
-        MAX_OSM_QUERIES = 30  # Increased limit for proximity tiles (was 20)
         for i, (tile_x, tile_y) in enumerate(other_tiles_uncached):
-            if i >= MAX_OSM_QUERIES:
+            if i >= MAX_OSM_QUERIES or (max_osm_queries is not None and osm_queries_done >= max_osm_queries):
                 break
             try:
                 self.get_tile_type(tile_x, tile_y, skip_osm=False)  # Query OSM
+                osm_queries_done += 1
                 # OPTIMIZATION: Update UI less frequently (every 10 queries instead of 5)
                 if use_ui_updates and i > 0 and i % 10 == 0:
                     QApplication.processEvents()

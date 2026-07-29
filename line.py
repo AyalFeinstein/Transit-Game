@@ -1,6 +1,7 @@
 from grid import GridPoint
 from player import Player
 from vehicle import Trainset
+from typing import Optional
 import math
 
 
@@ -31,10 +32,29 @@ class RightOfWay:
 
     def extend_route_from_beginning(self,
                               additional_points: list[GridPoint]):
-        self.route = list(additional_points) + self.route
+        # Skip last point if it duplicates route start (avoids duplicate connection point)
+        pts = list(additional_points)
+        if pts and self.route:
+            last_pt = pts[-1]
+            first_route = self.route[0]
+            if (hasattr(last_pt, '__len__') and hasattr(first_route, '__len__') and
+                len(last_pt) >= 2 and len(first_route) >= 2 and
+                abs(float(last_pt[0]) - float(first_route[0])) < 0.01 and
+                abs(float(last_pt[1]) - float(first_route[1])) < 0.01):
+                pts = pts[:-1]
+        self.route = pts + self.route
 
     def extend_route_from_end(self,
                               additional_points: list[GridPoint]):
+        # Skip first point if it duplicates route end (avoids duplicate connection point)
+        if additional_points and self.route:
+            first = additional_points[0]
+            last = self.route[-1]
+            if (hasattr(first, '__len__') and hasattr(last, '__len__') and
+                len(first) >= 2 and len(last) >= 2 and
+                abs(float(first[0]) - float(last[0])) < 0.01 and
+                abs(float(first[1]) - float(last[1])) < 0.01):
+                additional_points = list(additional_points)[1:]
         self.route.extend(additional_points)
 
 class Line(RightOfWay):
@@ -42,8 +62,8 @@ class Line(RightOfWay):
                  name,
                  object_id,
                  route,
-                 owner: Player,
-                 vehicles: list[Trainset],
+                 owner: Optional[Player] = None,
+                 vehicles: list[Trainset] = None,
                  fare: int = 10,
                  profit: int = 0,
                  has_third_rail: bool = False,
@@ -56,7 +76,7 @@ class Line(RightOfWay):
         self.owner = owner
         self.has_third_rail = has_third_rail
         self.has_overhead_wire = has_overhead_wire
-        self.vehicles = vehicles
+        self.vehicles = vehicles if vehicles is not None else []
         self.profit = profit
         self.fare = fare
         self.stations = stations if stations is not None else []
@@ -140,9 +160,9 @@ class Line(RightOfWay):
         """Return list of stations on this line"""
         return self.stations
     
-    def calc_traversal_time(self, avg_speed_mph=30):
+    def calc_traversal_time(self, avg_speed_mph=30, include_station_dwell=True):
         """Calculate time (hours) to traverse the full line at average speed.
-        Default average speed is 30 mph, adjustable per trainset type."""
+        Includes dwell time at each station when include_station_dwell is True."""
         try:
             route = self.get_route()
             if not route or len(route) < 2:
@@ -150,59 +170,79 @@ class Line(RightOfWay):
             total_distance = 0.0
             for i in range(len(route) - 1):
                 x1, y1 = route[i]
-                x2, y2 = route[i+1]
+                x2, y2 = route[i + 1]
                 total_distance += math.hypot(x2 - x1, y2 - y1)
-            # Assume each unit is 1 mile; time = distance / speed
-            self.traversal_time_hours = total_distance / avg_speed_mph
-            return self.traversal_time_hours
+            speed = self._effective_train_speed_mph(avg_speed_mph)
+            if speed <= 0:
+                return 0.0
+            travel_hours = total_distance / speed
+            if include_station_dwell:
+                from game_presets import STATION_DWELL_MINUTES_PER_STOP
+                num_stations = len(self.get_stations()) if hasattr(self, 'get_stations') else 0
+                travel_hours += num_stations * (STATION_DWELL_MINUTES_PER_STOP / 60.0)
+            self.traversal_time_hours = travel_hours
+            return travel_hours
         except Exception:
             return 0
+
+    def _effective_train_speed_mph(self, fallback: float = 30.0) -> float:
+        """Average speed from assigned trainsets (mph)."""
+        speeds = []
+        for vehicle in self.vehicles or []:
+            loco = getattr(vehicle, 'locomotive', None)
+            if loco is not None:
+                for attr in ('average_speed', 'top_speed'):
+                    s = getattr(loco, attr, None)
+                    if isinstance(s, (int, float)) and not isinstance(s, bool):
+                        speeds.append(float(s))
+                        break
+            else:
+                s = getattr(vehicle, 'average_speed', None)
+                if isinstance(s, (int, float)) and not isinstance(s, bool):
+                    speeds.append(float(s))
+        if not speeds:
+            return float(fallback) if fallback else 30.0
+        return sum(speeds) / len(speeds)
     
     def get_max_frequency_per_hour(self, time_period: str = 'peak') -> float:
-        """Get maximum frequency per hour for a time period based on trains and track capacity.
-        
-        Args:
-            time_period: 'peak', 'off_peak', or 'night'
-            
-        Returns:
-            Maximum trains per hour (limited by number of trains and track capacity)
+        """Maximum physically feasible trains per hour (one direction).
+
+        Limited by assigned trainsets, line length, train speed, station dwell,
+        terminal turnaround, and track count.
         """
-        # Base capacity: each track can handle ~30 trains per hour (2 min headway)
-        # More tracks = more capacity
-        track_capacity = self.num_tracks * 30.0
-        
-        # Number of trains available
+        from game_presets import (
+            TERMINAL_TURNAROUND_MINUTES,
+            TRACK_CAPACITY_TRAINS_PER_HOUR_BASE,
+        )
+
         num_trains = len(self.vehicles) if self.vehicles else 0
-        
-        # Calculate max frequency based on trains and line length
-        trav_time = self.calc_traversal_time()
-        if trav_time == 0:
+        if num_trains <= 0:
             return 0.0
-        
-        # Maximum frequency is limited by:
-        # 1. Track capacity (trains per hour per track)
-        # 2. Number of trains available
-        # 3. Line traversal time (can't run more trains than line can handle)
-        max_by_tracks = track_capacity
-        max_by_trains = num_trains * (60.0 / (trav_time * 2)) if num_trains > 0 else 0  # Trains per hour
-        max_by_line = 60.0 / (trav_time * 2)  # One train per round trip time
-        
-        # Take minimum of all constraints
-        max_frequency = min(max_by_tracks, max_by_trains, max_by_line) if num_trains > 0 else 0.0
-        
-        # Apply schedule multiplier for time period
-        schedule_multiplier = self.schedule.get(time_period, 1.0)
-        return min(max_frequency, schedule_multiplier * max_frequency)
+
+        speed = self._effective_train_speed_mph()
+        one_way_hours = self.calc_traversal_time(avg_speed_mph=speed, include_station_dwell=True)
+        if one_way_hours <= 0:
+            return 0.0
+
+        round_trip_hours = (2.0 * one_way_hours) + (TERMINAL_TURNAROUND_MINUTES / 60.0)
+        max_by_trains = num_trains / round_trip_hours
+
+        # Faster trains allow slightly higher track throughput (shorter headways).
+        speed_factor = min(1.5, max(0.75, speed / 30.0))
+        track_capacity = self.num_tracks * TRACK_CAPACITY_TRAINS_PER_HOUR_BASE * speed_factor
+
+        return min(track_capacity, max_by_trains)
     
     def set_schedule_frequency(self, time_period: str, frequency: float):
         """Set schedule frequency for a time period.
-        Frequency is stored as desired; actual service is limited by max capacity at runtime.
-        
-        Args:
-            time_period: 'peak', 'off_peak', or 'night'
-            frequency: Desired frequency (trains per hour)
-        """
-        self.schedule[time_period] = max(0.0, frequency)
+        Frequency is capped at the physical limit from assigned trainsets and track capacity.
+        Clearing profit cache ensures next profit calculation uses the new schedule."""
+        max_frequency = self.get_max_frequency_per_hour(time_period)
+        self.schedule[time_period] = max(0.0, min(float(frequency), max_frequency))
+        if hasattr(self, '_cached_profit'):
+            delattr(self, '_cached_profit')
+        if hasattr(self, '_cached_profit_year'):
+            delattr(self, '_cached_profit_year')
     
     def upgrade_tracks(self, additional_tracks: int = 1):
         """Upgrade line by adding more tracks (increases capacity).
@@ -236,11 +276,9 @@ class Line(RightOfWay):
         desired_frequency = (self.schedule['peak'] * 0.4 + 
                             self.schedule['off_peak'] * 0.4 + 
                             self.schedule['night'] * 0.2)
-        
-        # Calculate service frequency based on schedule, limited by max capacity
         if desired_frequency == 0:
             return 0
-        
+
         # Get max frequency for peak (most restrictive)
         max_freq = self.get_max_frequency_per_hour('peak')
         if max_freq == 0:
@@ -249,6 +287,25 @@ class Line(RightOfWay):
         # Actual frequency is minimum of desired and max capacity
         actual_frequency = min(desired_frequency, max_freq, 60.0 / round_trip_time)
         return int(actual_frequency * hours_per_year)
+
+    def calc_schedule_operating_cost(self, current_year: int = None) -> int:
+        """Small annual cost for running scheduled service (crew, fuel wear)."""
+        if not self.vehicles:
+            return 0
+        from game_presets import SCHEDULE_OPERATING_COST_PER_TRAIN_HOUR
+        from inflation_utils import get_inflation_factor
+
+        trips_per_hour = (
+            float(self.schedule.get('peak', 0) or 0) * 0.4
+            + float(self.schedule.get('off_peak', 0) or 0) * 0.4
+            + float(self.schedule.get('night', 0) or 0) * 0.2
+        )
+        if trips_per_hour <= 0:
+            return 0
+        cy = int(current_year) if current_year is not None else 1830
+        infl = get_inflation_factor(cy, max_factor=5.5)
+        train_hours = trips_per_hour * 8760.0 * len(self.vehicles)
+        return max(0, int(round(train_hours * SCHEDULE_OPERATING_COST_PER_TRAIN_HOUR * infl)))
 
     def calc_profit(self, current_year=1830):
         """Calculate profit based on the number of times each trainset passes each station each year.
@@ -303,10 +360,9 @@ class Line(RightOfWay):
         except:
             pass
         
-        # Calculate max acceptable fare based on inflation (1830: $2, 2050: $15)
-        # Linear interpolation: fare_max = 2 + (year - 1830) * (15 - 2) / (2050 - 1830)
-        max_acceptable_fare = 2 + (current_year - 1830) * (15 - 2) / (2050 - 1830)
-        max_acceptable_fare = max(2, min(15, max_acceptable_fare))  # Clamp between 2 and 15
+        # Calculate max acceptable fare: $2 floor, timeline cap up to $15 (not inflation-scaled).
+        from inflation_utils import get_nominal_fare_cap
+        _, max_acceptable_fare = get_nominal_fare_cap(int(current_year))
         
         # If fare is too high, reduce capacity utilization (people won't ride)
         effective_fare = min(self.fare, max_acceptable_fare)
@@ -315,15 +371,17 @@ class Line(RightOfWay):
             # Reduce utilization if fare is too high
             fare_penalty = (self.fare - max_acceptable_fare) / max_acceptable_fare
             base_capacity_util = max(0.1, base_capacity_util * (1 - fare_penalty * 0.8))  # Up to 80% reduction
-        
-        # Calculate inflation factor to keep profits constant in real terms
-        # Inflation: prices increase over time (1830: 1x, 2050: 10x)
-        inflation_factor = 1.0 + (current_year - 1830) * (5.5 - 1.0) / (2050 - 1830)
-        inflation_factor = max(1.0, min(10.0, inflation_factor))  # Clamp between 1 and 10
-        
-        # Adjust effective_fare by inflation to keep profits constant in real terms
-        # This means a $15 fare in 2050 produces the same real profit as a $2 fare in 1830
-        real_fare = effective_fare / inflation_factor
+
+        # Line quality (maintenance workers + rolling stock) increases ridership (RULES.md; max quality 3.0)
+        if hasattr(self, 'update_quality'):
+            try:
+                self.update_quality()
+            except (AttributeError, TypeError, ValueError):
+                pass
+        q = float(getattr(self, 'quality', 1.0) or 1.0)
+        q = max(1.0, min(3.0, q))
+        quality_ridership_mult = 1.0 + (q - 1.0) * 0.25  # 1.0 at quality 1, 1.5 at quality 3
+        base_capacity_util = min(0.95, base_capacity_util * quality_ridership_mult)
         
         # Get map to access population data
         game_map = None
@@ -382,9 +440,8 @@ class Line(RightOfWay):
                     else:
                         actual_capacity_util = base_capacity_util * 0.1  # Minimum 10% of base
                 
-                # Each pass generates revenue based on real fare (adjusted for inflation), capacity, and actual utilization
-                # Using real_fare ensures profits don't increase with inflation
-                profit_per_pass = real_fare * vehicle_capacity * actual_capacity_util * PROFIT_MULTIPLIER
+                # Revenue uses the line fare as set (not inflation-adjusted).
+                profit_per_pass = effective_fare * vehicle_capacity * actual_capacity_util * PROFIT_MULTIPLIER
                 # Total profit from this trainset passing this station
                 station_profit = passes_per_station_per_year * profit_per_pass
                 total_profit += station_profit
@@ -396,13 +453,28 @@ class Line(RightOfWay):
         return self.profit
     
     def calc_maitnance(self, current_year: int = None):
-        """Calculate maintenance costs, accounting for outdated locomotives"""
+        """Calculate maintenance costs: vehicles, track length, and schedule operating cost.
+        Track cost is per unit of route distance (not per polyline vertex), so OSM street
+        polylines are not penalized for having more points than a straight chord.
+        Schedule operating cost scales with trips run per year - running trains costs money (crew, wear).
+        When trains are scheduled properly (match demand), profit exceeds this cost by a large margin."""
+        import math
         total_maitnance = 0
         for vehicle in self.vehicles:
             total_maitnance += vehicle.get_maitnance_costs(current_year)
-        length = len(self.route) if self.route else 0
-        PER_SEGMENT_COST = 50
-        total_maitnance += length * PER_SEGMENT_COST
+        # Distance-based track maintenance (grid units ≈ km). Vertex count must not matter.
+        PER_UNIT_DISTANCE_COST = 50
+        total_distance = 0.0
+        route = self.route or []
+        for i in range(len(route) - 1):
+            x1, y1 = float(route[i][0]), float(route[i][1])
+            x2, y2 = float(route[i + 1][0]), float(route[i + 1][1])
+            total_distance += math.hypot(x2 - x1, y2 - y1)
+        total_maitnance += int(round(total_distance * PER_UNIT_DISTANCE_COST))
+
+        if self.vehicles and current_year is not None:
+            total_maitnance += self.calc_schedule_operating_cost(current_year)
+
         self.maitnance = total_maitnance
         return self.maitnance
     
@@ -420,9 +492,9 @@ class Line(RightOfWay):
             except:
                 pass
         
-        # Inflation: prices increase over time (1830: 1x, 2050: 10x)
-        inflation_factor = 1.0 + (current_year - 1830) * (5.5 - 1.0) / (2050 - 1830)
-        inflation_factor = max(1.0, min(10.0, inflation_factor))  # Clamp between 1 and 10
+        # Inflation: use shared inflation so game setting applies
+        from inflation_utils import get_inflation_factor
+        inflation_factor = get_inflation_factor(current_year, max_factor=5.5)
         
         # Calculate actual distance of the line (not just number of points)
         import math
@@ -457,9 +529,10 @@ class Ferry(Line):
                  fare: int = 10,
                  profit: int = 0,
                  stations: list = None):
-        super().__init__(name, object_id, route, owner, vehicles, fare, profit, stations)
+        vehicles = vehicles if vehicles is not None else []
+        super().__init__(name, object_id, route, owner, vehicles, fare=fare, profit=profit, stations=stations)
         self.owner = owner
-        self.vehicles = vehicles if vehicles is not None else []
+        self.vehicles = vehicles
         self.profit = profit
         self.fare = fare
         self.stations = stations if stations is not None else []
@@ -495,7 +568,8 @@ class Bus(Line):
                  fare: int = 10,
                  profit: int = 0,
                  stations: list = None):
-        super().__init__(name, object_id, route)
+        vehicles = vehicles if vehicles is not None else []
+        super().__init__(name, object_id, route, owner, vehicles, fare=fare, profit=profit, stations=stations)
         self.owner = owner
         self.vehicles = vehicles if vehicles is not None else []
         self.profit = profit
@@ -521,15 +595,8 @@ class Bus(Line):
         """Buses can traverse land, but only on streets/roads."""
         return True
     
-    def calc_traversal_time(self, avg_speed_mph=20, current_year=1830, time_period='off_peak'):
-        """Calculate time (hours) to traverse the full bus line at average speed.
-        Accounts for traffic when it exists (after 1900).
-        
-        Args:
-            avg_speed_mph: Average speed in mph (default 20 for buses)
-            current_year: Current year (used to determine if traffic exists)
-            time_period: 'peak', 'off_peak', or 'night' (affects traffic multiplier)
-        """
+    def calc_traversal_time(self, avg_speed_mph=20, current_year=1830, time_period='off_peak', include_station_dwell=True):
+        """Calculate time (hours) to traverse the full bus line at average speed."""
         try:
             route = self.get_route()
             if not route or len(route) < 2:
@@ -537,18 +604,32 @@ class Bus(Line):
             total_distance = 0.0
             for i in range(len(route) - 1):
                 x1, y1 = route[i]
-                x2, y2 = route[i+1]
+                x2, y2 = route[i + 1]
                 total_distance += math.hypot(x2 - x1, y2 - y1)
-            
-            # Update traffic multiplier based on current year and time period
+
             self.update_traffic_multiplier(current_year, time_period)
-            
-            effective_speed = avg_speed_mph / self.traffic_multiplier
-            
-            self.traversal_time_hours = total_distance / effective_speed if effective_speed > 0 else 0
-            return self.traversal_time_hours
+            speed = self._effective_bus_speed_mph(avg_speed_mph)
+            effective_speed = speed / self.traffic_multiplier
+
+            travel_hours = total_distance / effective_speed if effective_speed > 0 else 0
+            if include_station_dwell:
+                from game_presets import STATION_DWELL_MINUTES_PER_STOP
+                num_stations = len(self.get_stations()) if hasattr(self, 'get_stations') else 0
+                travel_hours += num_stations * (STATION_DWELL_MINUTES_PER_STOP / 60.0)
+            self.traversal_time_hours = travel_hours
+            return travel_hours
         except Exception:
             return 0
+
+    def _effective_bus_speed_mph(self, fallback: float = 20.0) -> float:
+        speeds = []
+        for vehicle in self.vehicles or []:
+            s = getattr(vehicle, 'average_speed', None) or getattr(vehicle, 'top_speed', None)
+            if s is not None:
+                speeds.append(float(s))
+        if not speeds:
+            return float(fallback) if fallback else 20.0
+        return sum(speeds) / len(speeds)
     
     def update_traffic_multiplier(self, current_year: int, time_period: str = 'off_peak'):
         """Update traffic multiplier based on current year and time period.
@@ -574,44 +655,36 @@ class Bus(Line):
             self.traffic_multiplier = 1.0
     
     def get_max_frequency_per_hour(self, time_period: str = 'peak') -> float:
-        """Get maximum frequency per hour for a time period based on buses and busway capacity.
-        
-        Args:
-            time_period: 'peak', 'off_peak', or 'night'
-            
-        Returns:
-            Maximum buses per hour (limited by number of buses and busway capacity)
-        """
+        """Maximum physically feasible buses per hour."""
+        from game_presets import TERMINAL_TURNAROUND_MINUTES, TRACK_CAPACITY_TRAINS_PER_HOUR_BASE
+
+        num_buses = len(self.vehicles) if self.vehicles else 0
+        if num_buses <= 0:
+            return 0.0
+
+        trav_time = self.calc_traversal_time(current_year=1830, time_period=time_period, include_station_dwell=True)
+        if trav_time <= 0:
+            return 0.0
+
+        round_trip_hours = (2.0 * trav_time) + (TERMINAL_TURNAROUND_MINUTES / 60.0)
+        max_by_buses = num_buses / round_trip_hours
+
         if self.num_busways > 0:
-            busway_capacity = self.num_busways * 30.0
+            busway_capacity = self.num_busways * TRACK_CAPACITY_TRAINS_PER_HOUR_BASE
         else:
             busway_capacity = 15.0
-        
-        num_buses = len(self.vehicles) if self.vehicles else 0
-        
-        trav_time = self.calc_traversal_time(current_year=1830, time_period=time_period)
-        if trav_time == 0:
-            return 0.0
-        
-        max_by_busways = busway_capacity
-        max_by_buses = num_buses * (60.0 / (trav_time * 2)) if num_buses > 0 else 0
-        max_by_line = 60.0 / (trav_time * 2)
-        
-        max_frequency = min(max_by_busways, max_by_buses, max_by_line) if num_buses > 0 else 0.0
-        
-        schedule_multiplier = self.schedule.get(time_period, 1.0)
-        return min(max_frequency, schedule_multiplier * max_frequency)
+        return min(busway_capacity, max_by_buses)
     
     def set_schedule_frequency(self, time_period: str, frequency: float):
         """Set schedule frequency for a time period.
         Frequency is capped at physical feasible limit.
-        
-        Args:
-            time_period: 'peak', 'off_peak', or 'night'
-            frequency: Desired frequency (buses per hour)
-        """
+        Clearing profit cache ensures next profit calculation uses the new schedule."""
         max_frequency = self.get_max_frequency_per_hour(time_period)
         self.schedule[time_period] = max(0.0, min(frequency, max_frequency))
+        if hasattr(self, '_cached_profit'):
+            delattr(self, '_cached_profit')
+        if hasattr(self, '_cached_profit_year'):
+            delattr(self, '_cached_profit_year')
     
     def upgrade_busways(self, additional_busways: int = 1):
         """Upgrade bus line by adding separated busways (increases capacity and eliminates traffic impact).

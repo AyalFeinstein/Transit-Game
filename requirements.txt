@@ -7,3 +7,7 @@ PyQt6-WebEngine>=6.0.0
 # Install with: pip install requests
 requests>=2.25.0
 
+# Optional: Faster JSON for OSM roads (5x faster than stdlib)
+# Install with: pip install orjson
+orjson>=3.9.0
+

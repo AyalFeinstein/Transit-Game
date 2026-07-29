@@ -64,8 +64,8 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
 )
-from PyQt6.QtGui import QColor, QPalette, QPainter, QPen, QBrush, QFont, QAction, QPixmap
-from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtGui import QColor, QPalette, QPainter, QPen, QBrush, QFont, QAction, QPixmap, QIcon
+from PyQt6.QtCore import Qt, QRectF, QPointF, QObject, QEvent
 from operations import Operations
 from game_presets import STARTING_MONEY
 from inflation_utils import get_inflation_factor
@@ -75,6 +75,7 @@ from vehicle import Locomotive, Railcar, Trainset, Ferry, Bus
 # Maximum time (ms) for line creation and map refresh - prevents long freezes
 LINE_CREATION_MAX_MS = 15000
 MAP_REFRESH_MAX_MS = 15000
+MAP_DISPLAY_MAX_ROADS = 400
 
 # Save games directory (relative to project root)
 SAVEGAMES_DIR = Path(__file__).resolve().parent / "savegames"
@@ -95,6 +96,17 @@ def apply_application_logo(widget):
     icon = application_window_icon()
     if not icon.isNull():
         widget.setWindowIcon(icon)
+
+
+def _wrap_settings_tab_scroll(content: QWidget) -> QScrollArea:
+    """Wrap a settings tab body so long forms scroll instead of clipping."""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+    scroll.setWidget(content)
+    return scroll
 
 
 def _parse_rules_markdown_sections(content: str):
@@ -160,6 +172,47 @@ if WEBENGINE_AVAILABLE:
             info.setHttpHeader(b"User-Agent", b"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 else:
     OSMUrlRequestInterceptor = None
+
+# Keep Leaflet in sync when the QWebEngineView is resized (pan/zoom/size).
+_MAP_INVALIDATE_JS = "if(window.mapInstance){window.mapInstance.invalidateSize();}"
+
+
+class _MapWebViewResizeFilter(QObject):
+    """Debounced invalidateSize when the OSM map web view changes size."""
+
+    def __init__(self, web_view):
+        super().__init__(web_view)
+        self._web_view = web_view
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._invalidate)
+
+    def eventFilter(self, watched, event):
+        if watched is self._web_view and event.type() == QEvent.Type.Resize:
+            self._timer.start()
+        return False
+
+    def _invalidate(self):
+        wv = self._web_view
+        if wv is None:
+            return
+        try:
+            if wv.parent() is None:
+                return
+            page = wv.page() if hasattr(wv, 'page') else None
+            if page:
+                page.runJavaScript(_MAP_INVALIDATE_JS)
+        except Exception:
+            pass
+
+
+def _install_map_web_view_resize_filter(web_view) -> None:
+    if web_view is None or getattr(web_view, '_transit_resize_filter', None):
+        return
+    filt = _MapWebViewResizeFilter(web_view)
+    web_view.installEventFilter(filt)
+    web_view._transit_resize_filter = filt
 
 # Singleton interceptor instance - must be kept alive to prevent GC (Qt requires this)
 _OSM_INTERCEPTOR_INSTANCE = None
@@ -344,48 +397,88 @@ class AdvanceYearThread(QThread):
         self.finished_with_result.emit(result, ai_results_list, error_occurred, error_message, ai_build_failures)
 
 
-class LineCreationWorker(QObject):
-    """Runs create_line_complete in a background thread to avoid blocking the UI."""
-    finished = pyqtSignal(object, bool, str)  # result, error_occurred, error_message
-
-    def __init__(self, operations, line_name, grid_points, current_player, elevation_levels, is_ferry_line, is_bus_line, cost_info=None):
-        super().__init__()
-        self.operations = operations
-        self.line_name = line_name
-        self.grid_points = grid_points
-        self.current_player = current_player
-        self.elevation_levels = elevation_levels
-        self.is_ferry_line = is_ferry_line
-        self.is_bus_line = is_bus_line
-        self.cost_info = cost_info
-
-    def run(self):
-        result = None
-        error_occurred = False
-        error_message = ""
-        try:
-            result = self.operations.create_line_complete(
-                self.line_name, self.grid_points, self.current_player, self.elevation_levels,
-                is_ferry_line=self.is_ferry_line, is_bus_line=self.is_bus_line, cost_info=self.cost_info
-            )
-        except Exception as e:
-            import traceback
-            logger.error("Error in line creation worker: %s", e)
-            traceback.print_exc()
-            error_occurred = True
-            error_message = str(e)
-        self.finished.emit(result, error_occurred, error_message)
+from player_colors import (
+    PLAYER_COLORS,
+    PLAYER_COLORS_HEX,
+    NO_ALLEGIANCE_COLOR,
+    get_player_color_index,
+)
 
 
-# Player colors for government allegiance display and map lines (index = player_id)
-PLAYER_COLORS = [
-    QColor(34, 139, 34),   # green
-    QColor(65, 105, 225),  # blue
-    QColor(178, 34, 34),   # red
-    QColor(255, 165, 0),   # orange
-]
-PLAYER_COLORS_HEX = ['#228B22', '#4169E1', '#B22222', '#FFA500']  # Same as above, for map HTML
-NO_ALLEGIANCE_COLOR = QColor(192, 192, 192)  # light grey
+def player_color_icon(color_index: int, size: int = 10) -> QIcon:
+    """Small square icon in the player's assigned color."""
+    pm = QPixmap(size, size)
+    idx = max(0, int(color_index)) % len(PLAYER_COLORS)
+    pm.fill(PLAYER_COLORS[idx])
+    return QIcon(pm)
+
+
+def create_player_color_swatch(color_index: int, size: int = 10) -> QLabel:
+    """Small colored square for a player."""
+    swatch = QLabel()
+    swatch.setFixedSize(size, size)
+    idx = max(0, int(color_index)) % len(PLAYER_COLORS_HEX)
+    color = PLAYER_COLORS_HEX[idx]
+    swatch.setStyleSheet(f"background-color: {color}; border: 1px solid #666666;")
+    return swatch
+
+
+def create_player_color_name_row(color_index: int, name: str) -> QWidget:
+    """Colored square with player name (for legends and lists)."""
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 8, 0)
+    layout.setSpacing(4)
+    layout.addWidget(create_player_color_swatch(color_index))
+    label = QLabel(name)
+    label.setWordWrap(False)
+    layout.addWidget(label)
+    return row
+
+
+def create_status_player_money_widget():
+    """Status-bar row: colored square + name/money label."""
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+    swatch = create_player_color_swatch(0)
+    text = QLabel("")
+    text.setWordWrap(False)
+    text.setMinimumWidth(72)
+    text.setMaximumWidth(200)
+    text.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+    layout.addWidget(swatch)
+    layout.addWidget(text)
+    row.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+    row.setFixedHeight(max(16, swatch.sizeHint().height() + 2))
+    return row, swatch, text
+
+
+def _elide_status_label(text: QLabel, full: str) -> None:
+    text.setToolTip(full)
+    available = max(text.width(), text.minimumWidth(), 72)
+    available = min(available, text.maximumWidth() if text.maximumWidth() > 0 else available)
+    text.setText(text.fontMetrics().elidedText(full, Qt.TextElideMode.ElideRight, available))
+
+
+def set_status_player_money_display(swatch: QLabel, text: QLabel, color_index: int, name: str, money, row: QWidget = None) -> None:
+    idx = max(0, int(color_index)) % len(PLAYER_COLORS_HEX)
+    color = PLAYER_COLORS_HEX[idx]
+    swatch.setStyleSheet(f"background-color: {color}; border: 1px solid #666666;")
+    if name:
+        full = f"{name}: ${money}"
+        text.setMinimumWidth(min(text.fontMetrics().horizontalAdvance(full) + 4, text.maximumWidth()))
+        _elide_status_label(text, full)
+        swatch.setVisible(True)
+        if row is not None:
+            row.setVisible(True)
+    else:
+        text.setToolTip("")
+        text.setText("")
+        swatch.setVisible(False)
+        if row is not None:
+            row.setVisible(False)
 
 
 class GovernmentChamberWidget(QWidget):
@@ -395,11 +488,12 @@ class GovernmentChamberWidget(QWidget):
     NUM_ROWS = 5
     SEATS_PER_ROW = 10
 
-    def __init__(self, seats_data: list, on_lobby_seat, on_lobby_leader, seats_with_allegiance: list = None, player_names: list = None, parent=None):
+    def __init__(self, seats_data: list, on_lobby_seat, on_lobby_leader, seats_with_allegiance: list = None, player_names: list = None, player_color_by_id: dict = None, parent=None):
         super().__init__(parent)
         self.seats_data = seats_data  # list of (is_favorable, is_tiebreaker) for compatibility
         self.seats_with_allegiance = seats_with_allegiance or []  # (allegiance_player_id, influence, is_tiebreaker)
         self.player_names = player_names or []
+        self.player_color_by_id = player_color_by_id or {}
         self.on_lobby_seat = on_lobby_seat
         self.on_lobby_leader = on_lobby_leader
         self._seat_rects = []
@@ -452,7 +546,8 @@ class GovernmentChamberWidget(QWidget):
         """Player color or light grey for no allegiance."""
         if allegiance_player_id is None:
             return NO_ALLEGIANCE_COLOR
-        idx = allegiance_player_id % len(PLAYER_COLORS)
+        idx = self.player_color_by_id.get(allegiance_player_id, allegiance_player_id)
+        idx = max(0, int(idx)) % len(PLAYER_COLORS)
         return PLAYER_COLORS[idx]
 
     def paintEvent(self, event):
@@ -537,7 +632,7 @@ class GovernmentChamberWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Transit Game")
+        self.setWindowTitle("Railroad Baron")
         apply_application_logo(self)
         self.setGeometry(100, 100, 800, 600)
         # Constrain window to never extend beyond screen
@@ -613,6 +708,160 @@ class MainWindow(QMainWindow):
         self._message_widgets = []
         self._setup_menu_bar()
         self.SetupGameTab()
+
+    def _refresh_screen_geometry(self):
+        """Track available screen area and cap maximum window size."""
+        try:
+            from PyQt6.QtGui import QGuiApplication
+            screen = QGuiApplication.primaryScreen()
+            if screen:
+                self._screen_geom = screen.availableGeometry()
+                self.setMaximumSize(self._screen_geom.width(), self._screen_geom.height())
+        except Exception:
+            pass
+
+    def _clamp_window_to_screen(self):
+        """Keep the window fully inside the available screen area."""
+        self._refresh_screen_geometry()
+        geom = getattr(self, '_screen_geom', None)
+        if not geom:
+            return
+        if not self.isVisible():
+            r = self.geometry()
+            new_w = min(r.width(), geom.width())
+            new_h = min(r.height(), geom.height())
+            new_x = max(geom.x(), min(r.x(), geom.x() + geom.width() - new_w))
+            new_y = max(geom.y(), min(r.y(), geom.y() + geom.height() - new_h))
+            if (new_w, new_h, new_x, new_y) != (r.width(), r.height(), r.x(), r.y()):
+                self.setGeometry(int(new_x), int(new_y), int(new_w), int(new_h))
+            return
+        fg = self.frameGeometry()
+        dx = dy = 0
+        shrink_w = shrink_h = 0
+        if fg.left() < geom.left():
+            dx = geom.left() - fg.left()
+        elif fg.right() > geom.right():
+            dx = geom.right() - fg.right()
+        if fg.top() < geom.top():
+            dy = geom.top() - fg.top()
+        elif fg.bottom() > geom.bottom():
+            dy = geom.bottom() - fg.bottom()
+        if fg.width() > geom.width():
+            shrink_w = max(shrink_w, fg.width() - geom.width())
+        if fg.height() > geom.height():
+            shrink_h = max(shrink_h, fg.height() - geom.height())
+        if shrink_w or shrink_h:
+            self.resize(max(200, self.width() - shrink_w), max(200, self.height() - shrink_h))
+            fg = self.frameGeometry()
+            if fg.width() > geom.width():
+                self.resize(max(200, self.width() - (fg.width() - geom.width())), self.height())
+        if dx or dy:
+            self.move(self.x() + dx, self.y() + dy)
+        fg = self.frameGeometry()
+        if fg.right() > geom.right():
+            self.move(self.x() - (fg.right() - geom.right()), self.y())
+        if fg.bottom() > geom.bottom():
+            self.move(self.x(), self.y() - (fg.bottom() - geom.bottom()))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._clamp_window_to_screen()
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, self._clamp_window_to_screen)
+
+    def _attach_game_status_bar(self, central_layout):
+        """Build bottom status bar once; player list is a compact vertical column."""
+        if self.status_bar is not None:
+            return
+        self.status_bar = QWidget()
+        self.status_bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.status_bar_layout = QHBoxLayout()
+        self.status_bar_layout.setContentsMargins(4, 2, 4, 2)
+        self.status_bar_layout.setSpacing(6)
+        self.status_bar.setLayout(self.status_bar_layout)
+        self.status_year_label = QLabel("Year: 1830")
+        self.status_year_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.status_end_year_btn = QPushButton("End Year")
+        self.status_end_year_btn.clicked.connect(self.advance_year_button_clicked)
+        self.status_bar_layout.addWidget(self.status_year_label, 0, Qt.AlignmentFlag.AlignTop)
+
+        players_widget = QWidget()
+        players_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+        players_layout = QVBoxLayout(players_widget)
+        players_layout.setContentsMargins(0, 0, 0, 0)
+        players_layout.setSpacing(2)
+        self.status_money_labels = {}
+        for i in range(8):
+            row, swatch, text = create_status_player_money_widget()
+            self.status_money_labels[i] = {'widget': row, 'swatch': swatch, 'text': text}
+            players_layout.addWidget(row)
+        self.status_players_widget = players_widget
+        self.status_bar_layout.addWidget(players_widget, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.status_end_year_timer_label = QLabel("")
+        self.status_end_year_timer_label.setVisible(False)
+        self.status_end_year_timer_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.status_bar_layout.addWidget(self.status_end_year_timer_label, 0, Qt.AlignmentFlag.AlignTop)
+        self.status_bar_layout.addWidget(self.status_end_year_btn, 0, Qt.AlignmentFlag.AlignTop)
+        self.status_save_game_btn = QPushButton("Save Game")
+        self.status_save_game_btn.clicked.connect(self.on_save_game_clicked)
+        self.status_bar_layout.addWidget(self.status_save_game_btn, 0, Qt.AlignmentFlag.AlignTop)
+        self.status_end_game_btn = QPushButton("End Game")
+        self.status_end_game_btn.clicked.connect(self.on_end_game_clicked)
+        self.status_bar_layout.addWidget(self.status_end_game_btn, 0, Qt.AlignmentFlag.AlignTop)
+
+        messages_widget = QWidget()
+        messages_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+        messages_layout = QVBoxLayout()
+        messages_layout.setContentsMargins(0, 0, 0, 0)
+        messages_layout.setSpacing(2)
+        messages_widget.setLayout(messages_layout)
+        self.status_messages_list = QListWidget()
+        self.status_messages_list.setMaximumHeight(40)
+        self.status_messages_list.setMaximumWidth(220)
+        self.status_messages_list.setMinimumWidth(120)
+        for m in self._get_visible_messages():
+            self.status_messages_list.insertItem(0, QListWidgetItem(str(m)))
+        self._message_widgets.append(self.status_messages_list)
+        messages_layout.addWidget(self.status_messages_list)
+        chat_row = QHBoxLayout()
+        chat_row.setContentsMargins(0, 0, 0, 0)
+        chat_row.setSpacing(4)
+        self.status_chat_input = QLineEdit()
+        self.status_chat_input.setPlaceholderText("Chat...")
+        self.status_chat_input.setMaximumWidth(150)
+        self.status_chat_input.setFixedHeight(22)
+        chat_send_btn = QPushButton("Send")
+        chat_send_btn.setFixedHeight(22)
+        def _on_chat_send():
+            text = self.status_chat_input.text().strip()
+            if not text:
+                return
+            if getattr(self, 'is_network_mode', False) and getattr(self, 'network_client', None) and self.network_client.connected_flag:
+                self.network_client.send_chat(text)
+                self.status_chat_input.clear()
+            elif self.operations:
+                cp = self.operations.get_current_player(self.current_player_index)
+                name = self.operations.get_player_name(cp) if cp else "Player"
+                self.add_message(f"{name}: {text}")
+                self.status_chat_input.clear()
+        chat_send_btn.clicked.connect(_on_chat_send)
+        self.status_chat_input.returnPressed.connect(_on_chat_send)
+        chat_row.addWidget(self.status_chat_input)
+        chat_row.addWidget(chat_send_btn)
+        messages_layout.addLayout(chat_row)
+        self.status_bar_layout.addWidget(messages_widget, 0, Qt.AlignmentFlag.AlignTop)
+        self.status_bar_layout.addStretch(1)
+        central_layout.addWidget(self.status_bar)
+    
+    def _compact_status_bar_height(self):
+        """Shrink the status bar to fit visible player rows and controls."""
+        if not getattr(self, 'status_bar', None):
+            return
+        players_widget = getattr(self, 'status_players_widget', None)
+        if players_widget is not None:
+            players_widget.adjustSize()
+        self.status_bar.adjustSize()
     
     def _setup_menu_bar(self):
         """Create the menu bar with File menu and New Game action"""
@@ -653,6 +902,11 @@ class MainWindow(QMainWindow):
         self.propose_merge_action.triggered.connect(lambda: self._on_propose_merge_clicked(None))
         self.propose_merge_action.setEnabled(False)
         game_menu.addAction(self.propose_merge_action)
+        game_menu.addSeparator()
+        self.game_settings_action = QAction("Game Settings...", self)
+        self.game_settings_action.triggered.connect(self._show_in_game_settings_dialog)
+        self.game_settings_action.setEnabled(False)
+        game_menu.addAction(self.game_settings_action)
         game_menu.addSeparator()
         self.game_open_news_log_action = QAction("Open News Log", self)
         self.game_open_news_log_action.setShortcut("Ctrl+Shift+N")
@@ -820,6 +1074,42 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _get_assigned_player_id(self):
+        """Player id for the local user's tab (network assigned player or current player)."""
+        return getattr(self, '_our_player_id', None) or getattr(self, 'current_player_index', None)
+
+    def _get_assigned_player_tab_widget(self):
+        player_id = self._get_assigned_player_id()
+        if player_id is None:
+            return None
+        d = getattr(self, 'player_tabs_dict', {}).get(player_id)
+        return d.get('player_tabs') if d else None
+
+    def _is_assigned_player_main_tab(self, index: int) -> bool:
+        widget = self._get_assigned_player_tab_widget()
+        if widget is None or not hasattr(self, 'tabs'):
+            return False
+        return self.tabs.widget(index) is widget
+
+    def _remove_assigned_player_tab_close_button(self):
+        """Remove close button from the local user's player tab so it cannot be closed."""
+        if not hasattr(self, 'tabs') or self.tabs is None:
+            return
+        widget = self._get_assigned_player_tab_widget()
+        if widget is None:
+            return
+        try:
+            tab_bar = self.tabs.tabBar()
+            for i in range(self.tabs.count()):
+                if self.tabs.widget(i) is widget:
+                    btn = tab_bar.tabButton(i, QTabBar.ButtonPosition.RightSide)
+                    if btn is not None:
+                        btn.deleteLater()
+                        tab_bar.setTabButton(i, QTabBar.ButtonPosition.RightSide, None)
+                    break
+        except Exception:
+            pass
+
     def _player_subtab_text_to_action(self):
         """Map player subtab text to its View/Corporation menu action (for close -> uncheck)."""
         return {
@@ -850,6 +1140,8 @@ class MainWindow(QMainWindow):
         tab_text = self.tabs.tabText(index)
         if tab_text == "Game":
             return  # Game tab cannot be closed
+        if self._is_assigned_player_main_tab(index):
+            return  # Local user's player tab cannot be closed
         try:
             self.tabs.setTabVisible(index, False)
         except Exception:
@@ -861,27 +1153,24 @@ class MainWindow(QMainWindow):
         return
 
     def changeEvent(self, event):
-        """When maximized, lock size so window can't be expanded or resized."""
+        """Keep window within screen bounds when window state changes."""
         super().changeEvent(event)
-        if event.type() == event.Type.WindowStateChange and getattr(self, '_screen_geom', None):
-            if self.windowState() & Qt.WindowState.WindowMaximized:
-                self.setFixedSize(self.width(), self.height())
-            else:
+        if event.type() == event.Type.WindowStateChange:
+            self._refresh_screen_geometry()
+            if not (self.windowState() & Qt.WindowState.WindowMaximized):
                 self.setMinimumSize(0, 0)
-                self.setMaximumSize(self._screen_geom.width(), self._screen_geom.height())
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._clamp_window_to_screen)
 
     def resizeEvent(self, event):
-        """Clamp window to screen when resized."""
+        """Refresh elided status labels and keep Leaflet sized to the map view."""
         super().resizeEvent(event)
-        if getattr(self, '_screen_geom', None):
-            geom = self._screen_geom
-            r = self.geometry()
-            if r.x() + r.width() > geom.x() + geom.width() or r.y() + r.height() > geom.y() + geom.height():
-                new_w = min(r.width(), geom.width())
-                new_h = min(r.height(), geom.height())
-                new_x = max(geom.x(), min(r.x(), geom.x() + geom.width() - new_w))
-                new_y = max(geom.y(), min(r.y(), geom.y() + geom.height() - new_h))
-                self.setGeometry(int(new_x), int(new_y), new_w, new_h)
+        self._invalidate_all_map_web_views()
+        if self.operations and getattr(self, 'status_money_labels', None):
+            try:
+                self.update_status_bar()
+            except Exception:
+                pass
 
     def _update_propose_merge_action(self):
         """Update Propose Merge menu action and Law tab buttons enabled state. Propose Merge is available at any time when there is at least one merge target."""
@@ -1011,6 +1300,8 @@ class MainWindow(QMainWindow):
         self._station_creation_state = {}
         self.advance_year_action.setEnabled(False)
         self.refresh_displays_action.setEnabled(False)
+        if hasattr(self, 'game_settings_action'):
+            self.game_settings_action.setEnabled(False)
         if hasattr(self, 'game_open_news_log_action'):
             self.game_open_news_log_action.setEnabled(False)
         if hasattr(self, 'game_open_ai_watch_action'):
@@ -1027,6 +1318,8 @@ class MainWindow(QMainWindow):
             AI_MERGE_MIN_TURNS_TO_LIVE_FOR_ACCEPT,
             AI_MERGE_MIN_YEARS_BEFORE_CONSIDER,
             AI_MERGE_AUTO_FAIL_FIRST_N_YEARS,
+            AI_MERGE_HEALTHY_PROFIT_THRESHOLD_PCT,
+            AI_MERGE_REJECT_CHANCE_PCT,
             WAR_START_CHANCE_PER_YEAR,
             WAR_END_CHANCE_PER_YEAR,
             WAR_WORKER_DRAFT_CHANCE_PER_YEAR,
@@ -1073,13 +1366,7 @@ class MainWindow(QMainWindow):
         self.map_height_spin.setValue(75)
         map_size_layout.addWidget(self.map_height_spin)
         map_settings_layout.addLayout(map_size_layout)
-        map_settings_layout.addWidget(QLabel(""))
-        map_settings_layout.addWidget(QLabel("Edit Mode:"))
-        self.edit_mode_checkbox = QCheckBox("Enable Edit Mode (allows adding/removing population points)")
-        self.edit_mode_checkbox.setChecked(False)
-        map_settings_layout.addWidget(self.edit_mode_checkbox)
-        map_settings_layout.addStretch()
-        settings_tabs.addTab(map_settings_tab, "Map")
+        settings_tabs.addTab(_wrap_settings_tab_scroll(map_settings_tab), "Map")
         # --- AI Settings tab ---
         ai_settings_tab = QWidget()
         ai_settings_layout = QVBoxLayout()
@@ -1089,6 +1376,13 @@ class MainWindow(QMainWindow):
         self.ai_watch_checkbox.setChecked(False)
         self.ai_watch_checkbox.setToolTip("Only available when the game has AI players. Must be set before starting.")
         ai_settings_layout.addWidget(self.ai_watch_checkbox)
+        self.ai_debug_notifications_checkbox = QCheckBox("AI debug notifications (report AI logic bugs)")
+        self.ai_debug_notifications_checkbox.setChecked(True)
+        self.ai_debug_notifications_checkbox.setToolTip(
+            "When enabled, shows warnings when the AI fails to expand despite surplus cash, "
+            "street build failures, idle turns, and similar issues."
+        )
+        ai_settings_layout.addWidget(self.ai_debug_notifications_checkbox)
         ai_min_pop_layout = QHBoxLayout()
         ai_min_pop_layout.addWidget(QLabel("AI min population for build:"))
         self.ai_min_population_spin = QSpinBox()
@@ -1112,79 +1406,7 @@ class MainWindow(QMainWindow):
         self.random_ai_spawn_interval_spin.setToolTip("Average years between new AI joining (default 30)")
         ai_spawn_interval_layout.addWidget(self.random_ai_spawn_interval_spin)
         ai_settings_layout.addLayout(ai_spawn_interval_layout)
-        merge_healthy_layout = QHBoxLayout()
-        merge_healthy_layout.addWidget(QLabel("AI healthy profit threshold %:"))
-        self.merge_ai_healthy_threshold_spin = QDoubleSpinBox()
-        self.merge_ai_healthy_threshold_spin.setMinimum(0)
-        self.merge_ai_healthy_threshold_spin.setMaximum(100)
-        self.merge_ai_healthy_threshold_spin.setValue(25.0)
-        self.merge_ai_healthy_threshold_spin.setSuffix("%")
-        self.merge_ai_healthy_threshold_spin.setToolTip("If AI is not losing more than this % of its profit this year, it auto-rejects merger.")
-        merge_healthy_layout.addWidget(self.merge_ai_healthy_threshold_spin)
-        ai_settings_layout.addLayout(merge_healthy_layout)
-        merge_reject_layout = QHBoxLayout()
-        merge_reject_layout.addWidget(QLabel("AI reject merger chance %:"))
-        self.merge_ai_reject_chance_spin = QDoubleSpinBox()
-        self.merge_ai_reject_chance_spin.setMinimum(0)
-        self.merge_ai_reject_chance_spin.setMaximum(100)
-        self.merge_ai_reject_chance_spin.setValue(90.0)
-        self.merge_ai_reject_chance_spin.setSuffix("%")
-        self.merge_ai_reject_chance_spin.setToolTip("When not healthy, AI rejects merger with this probability (e.g. 90% = reject 9 out of 10).")
-        merge_reject_layout.addWidget(self.merge_ai_reject_chance_spin)
-        ai_settings_layout.addLayout(merge_reject_layout)
-        ai_settings_layout.addWidget(QLabel("Mergers involving AI:"))
-        self.merge_ai_ai_checkbox = QCheckBox("Allow mergers between AIs")
-        self.merge_ai_ai_checkbox.setChecked(True)
-        self.merge_ai_ai_checkbox.setToolTip("When enabled, desperate AIs can merge with other AIs (e.g. doomed-merge).")
-        ai_settings_layout.addWidget(self.merge_ai_ai_checkbox)
-        self.merge_ai_human_checkbox = QCheckBox("Allow mergers between humans and AIs")
-        self.merge_ai_human_checkbox.setChecked(True)
-        self.merge_ai_human_checkbox.setToolTip("When enabled, humans can propose merger with desperate AIs (and vice versa).")
-        ai_settings_layout.addWidget(self.merge_ai_human_checkbox)
-        merge_ttl_layout = QHBoxLayout()
-        merge_ttl_layout.addWidget(QLabel("AI auto-reject merge if turns to live >"))
-        self.merge_ai_min_turns_to_live_spin = QSpinBox()
-        self.merge_ai_min_turns_to_live_spin.setMinimum(0)
-        self.merge_ai_min_turns_to_live_spin.setMaximum(200)
-        self.merge_ai_min_turns_to_live_spin.setValue(int(AI_MERGE_MIN_TURNS_TO_LIVE_FOR_ACCEPT))
-        self.merge_ai_min_turns_to_live_spin.setToolTip(
-            "AI rejects merger offers when projected survival at current loss rate exceeds this many turns."
-        )
-        merge_ttl_layout.addWidget(self.merge_ai_min_turns_to_live_spin)
-        merge_ttl_layout.addWidget(QLabel("turns"))
-        merge_ttl_layout.addStretch()
-        ai_settings_layout.addLayout(merge_ttl_layout)
-        merge_early_layout = QHBoxLayout()
-        merge_early_layout.addWidget(QLabel("AI years before considering merge:"))
-        self.merge_ai_min_years_before_consider_spin = QSpinBox()
-        self.merge_ai_min_years_before_consider_spin.setMinimum(0)
-        self.merge_ai_min_years_before_consider_spin.setMaximum(50)
-        self.merge_ai_min_years_before_consider_spin.setValue(int(AI_MERGE_MIN_YEARS_BEFORE_CONSIDER))
-        self.merge_ai_min_years_before_consider_spin.setToolTip(
-            "Calendar years since game start before AI runs merge logic (proposals, AI–AI merges, desperate merge)."
-        )
-        merge_early_layout.addWidget(self.merge_ai_min_years_before_consider_spin)
-        merge_early_layout.addWidget(QLabel("Auto-fail AI merges first N years:"))
-        self.merge_ai_auto_fail_first_n_years_spin = QSpinBox()
-        self.merge_ai_auto_fail_first_n_years_spin.setMinimum(0)
-        self.merge_ai_auto_fail_first_n_years_spin.setMaximum(50)
-        self.merge_ai_auto_fail_first_n_years_spin.setValue(int(AI_MERGE_AUTO_FAIL_FIRST_N_YEARS))
-        self.merge_ai_auto_fail_first_n_years_spin.setToolTip(
-            "While elapsed years since start are below this, any merger involving an AI is rejected (default blocks first five calendar years)."
-        )
-        merge_early_layout.addWidget(self.merge_ai_auto_fail_first_n_years_spin)
-        merge_early_layout.addStretch()
-        ai_settings_layout.addLayout(merge_early_layout)
-        set_all_difficulty_layout = QHBoxLayout()
-        set_all_difficulty_layout.addWidget(QLabel("Set all AI difficulty:"))
-        self.set_all_ai_difficulty_combo = QComboBox()
-        self.set_all_ai_difficulty_combo.addItems(["Easy", "Medium", "Hard"])
-        self.set_all_ai_difficulty_combo.setCurrentIndex(1)
-        self.set_all_ai_difficulty_combo.currentIndexChanged.connect(self._on_set_all_ai_difficulty_changed)
-        set_all_difficulty_layout.addWidget(self.set_all_ai_difficulty_combo)
-        ai_settings_layout.addLayout(set_all_difficulty_layout)
-        ai_settings_layout.addStretch()
-        settings_tabs.addTab(ai_settings_tab, "AI")
+        settings_tabs.addTab(_wrap_settings_tab_scroll(ai_settings_tab), "AI")
         # --- Player Settings tab ---
         player_settings_tab = QWidget()
         player_settings_layout = QVBoxLayout()
@@ -1216,6 +1438,18 @@ class MainWindow(QMainWindow):
         self.starting_money_spin.setSingleStep(1000)
         starting_money_layout.addWidget(self.starting_money_spin)
         player_settings_layout.addLayout(starting_money_layout)
+        set_all_difficulty_layout = QHBoxLayout()
+        set_all_difficulty_layout.addWidget(QLabel("Set all AI difficulty:"))
+        self.set_all_ai_difficulty_combo = QComboBox()
+        self.set_all_ai_difficulty_combo.addItems(["Easy", "Medium", "Hard"])
+        self.set_all_ai_difficulty_combo.setCurrentIndex(2)  # Hard
+        self.set_all_ai_difficulty_combo.setToolTip(
+            "Applies to every AI player below and sets the default for random AI spawns."
+        )
+        self.set_all_ai_difficulty_combo.currentIndexChanged.connect(self._on_set_all_ai_difficulty_changed)
+        set_all_difficulty_layout.addWidget(self.set_all_ai_difficulty_combo)
+        set_all_difficulty_layout.addStretch()
+        player_settings_layout.addLayout(set_all_difficulty_layout)
         player_settings_layout.addWidget(QLabel("Player names and AI settings (focus/difficulty for each AI):"))
         self.names_container = QVBoxLayout()
         self.name_edits = []
@@ -1223,8 +1457,7 @@ class MainWindow(QMainWindow):
         self.ai_difficulty_combos = []
         self.rebuild_player_name_fields(self.player_count_spin.value())
         player_settings_layout.addLayout(self.names_container)
-        player_settings_layout.addStretch()
-        settings_tabs.addTab(player_settings_tab, "Players")
+        settings_tabs.addTab(_wrap_settings_tab_scroll(player_settings_tab), "Players")
         # --- Game Settings tab ---
         game_settings_tab = QWidget()
         game_settings_layout = QVBoxLayout()
@@ -1329,18 +1562,80 @@ class MainWindow(QMainWindow):
         self.profit_margin_spin.setValue(1.0)
         self.profit_margin_spin.setSingleStep(0.25)
         self.profit_margin_spin.setDecimals(2)
-        self.profit_margin_spin.setToolTip("Multiplier applied to line revenue (1.0 = default, 2.0 = double revenue).")
+        self.profit_margin_spin.setToolTip("Multiplier applied to line revenue (1.0 = default). Lower = harder economy.")
         profit_margin_layout.addWidget(self.profit_margin_spin)
         game_settings_layout.addLayout(profit_margin_layout)
         game_settings_layout.addWidget(QLabel("Mergers:"))
+        self.merge_enabled_checkbox = QCheckBox("Allow mergers (master switch)")
+        self.merge_enabled_checkbox.setChecked(True)
+        self.merge_enabled_checkbox.setToolTip("When unchecked, no mergers are allowed.")
+        game_settings_layout.addWidget(self.merge_enabled_checkbox)
         self.merge_human_human_checkbox = QCheckBox("Allow mergers between humans")
         self.merge_human_human_checkbox.setChecked(True)
         self.merge_human_human_checkbox.setToolTip("When enabled, two human players can merge; both then control the merged company from their own tab/device.")
         game_settings_layout.addWidget(self.merge_human_human_checkbox)
-        self.merge_enabled_checkbox = QCheckBox("Allow mergers (master switch)")
-        self.merge_enabled_checkbox.setChecked(True)
-        self.merge_enabled_checkbox.setToolTip("When enabled, mergers are allowed according to the AI tab options. If unchecked, no mergers at all.")
-        game_settings_layout.addWidget(self.merge_enabled_checkbox)
+        self.merge_ai_ai_checkbox = QCheckBox("Allow mergers between AIs")
+        self.merge_ai_ai_checkbox.setChecked(True)
+        self.merge_ai_ai_checkbox.setToolTip("When enabled, desperate AIs can merge with other AIs (e.g. doomed-merge).")
+        game_settings_layout.addWidget(self.merge_ai_ai_checkbox)
+        self.merge_ai_human_checkbox = QCheckBox("Allow mergers between humans and AIs")
+        self.merge_ai_human_checkbox.setChecked(True)
+        self.merge_ai_human_checkbox.setToolTip("When enabled, humans can propose merger with desperate AIs (and vice versa).")
+        game_settings_layout.addWidget(self.merge_ai_human_checkbox)
+        merge_healthy_layout = QHBoxLayout()
+        merge_healthy_layout.addWidget(QLabel("AI healthy profit threshold %:"))
+        self.merge_ai_healthy_threshold_spin = QDoubleSpinBox()
+        self.merge_ai_healthy_threshold_spin.setMinimum(0)
+        self.merge_ai_healthy_threshold_spin.setMaximum(100)
+        self.merge_ai_healthy_threshold_spin.setValue(float(AI_MERGE_HEALTHY_PROFIT_THRESHOLD_PCT))
+        self.merge_ai_healthy_threshold_spin.setSuffix("%")
+        self.merge_ai_healthy_threshold_spin.setToolTip("If AI is not losing more than this % of its profit this year, it auto-rejects merger.")
+        merge_healthy_layout.addWidget(self.merge_ai_healthy_threshold_spin)
+        game_settings_layout.addLayout(merge_healthy_layout)
+        merge_reject_layout = QHBoxLayout()
+        merge_reject_layout.addWidget(QLabel("AI reject merger chance %:"))
+        self.merge_ai_reject_chance_spin = QDoubleSpinBox()
+        self.merge_ai_reject_chance_spin.setMinimum(0)
+        self.merge_ai_reject_chance_spin.setMaximum(100)
+        self.merge_ai_reject_chance_spin.setValue(float(AI_MERGE_REJECT_CHANCE_PCT))
+        self.merge_ai_reject_chance_spin.setSuffix("%")
+        self.merge_ai_reject_chance_spin.setToolTip("When not healthy, AI rejects merger with this probability (e.g. 90% = reject 9 out of 10).")
+        merge_reject_layout.addWidget(self.merge_ai_reject_chance_spin)
+        game_settings_layout.addLayout(merge_reject_layout)
+        merge_ttl_layout = QHBoxLayout()
+        merge_ttl_layout.addWidget(QLabel("AI auto-reject merge if turns to live >"))
+        self.merge_ai_min_turns_to_live_spin = QSpinBox()
+        self.merge_ai_min_turns_to_live_spin.setMinimum(0)
+        self.merge_ai_min_turns_to_live_spin.setMaximum(200)
+        self.merge_ai_min_turns_to_live_spin.setValue(int(AI_MERGE_MIN_TURNS_TO_LIVE_FOR_ACCEPT))
+        self.merge_ai_min_turns_to_live_spin.setToolTip(
+            "AI rejects merger offers when projected survival at current loss rate exceeds this many turns."
+        )
+        merge_ttl_layout.addWidget(self.merge_ai_min_turns_to_live_spin)
+        merge_ttl_layout.addWidget(QLabel("turns"))
+        merge_ttl_layout.addStretch()
+        game_settings_layout.addLayout(merge_ttl_layout)
+        merge_early_layout = QHBoxLayout()
+        merge_early_layout.addWidget(QLabel("AI years before considering merge:"))
+        self.merge_ai_min_years_before_consider_spin = QSpinBox()
+        self.merge_ai_min_years_before_consider_spin.setMinimum(0)
+        self.merge_ai_min_years_before_consider_spin.setMaximum(50)
+        self.merge_ai_min_years_before_consider_spin.setValue(int(AI_MERGE_MIN_YEARS_BEFORE_CONSIDER))
+        self.merge_ai_min_years_before_consider_spin.setToolTip(
+            "Calendar years since game start before AI runs merge logic (proposals, AI–AI merges, desperate merge)."
+        )
+        merge_early_layout.addWidget(self.merge_ai_min_years_before_consider_spin)
+        merge_early_layout.addWidget(QLabel("Auto-fail AI merges first N years:"))
+        self.merge_ai_auto_fail_first_n_years_spin = QSpinBox()
+        self.merge_ai_auto_fail_first_n_years_spin.setMinimum(0)
+        self.merge_ai_auto_fail_first_n_years_spin.setMaximum(50)
+        self.merge_ai_auto_fail_first_n_years_spin.setValue(int(AI_MERGE_AUTO_FAIL_FIRST_N_YEARS))
+        self.merge_ai_auto_fail_first_n_years_spin.setToolTip(
+            "While elapsed years since start are below this, any merger involving an AI is rejected."
+        )
+        merge_early_layout.addWidget(self.merge_ai_auto_fail_first_n_years_spin)
+        merge_early_layout.addStretch()
+        game_settings_layout.addLayout(merge_early_layout)
         inflation_layout = QHBoxLayout()
         inflation_layout.addWidget(QLabel("Inflation Rate:"))
         self.inflation_rate_spin = QDoubleSpinBox()
@@ -1353,8 +1648,7 @@ class MainWindow(QMainWindow):
         inflation_layout.addWidget(self.inflation_rate_spin)
         inflation_layout.addWidget(QLabel("(1.0 = default, 0.5 = half, 2.0 = double)"))
         game_settings_layout.addLayout(inflation_layout)
-        game_settings_layout.addStretch()
-        settings_tabs.addTab(game_settings_tab, "Game")
+        settings_tabs.addTab(_wrap_settings_tab_scroll(game_settings_tab), "Game")
         game_tab_index = settings_tabs.indexOf(game_settings_tab)
         if game_tab_index > 0:
             settings_tabs.tabBar().moveTab(game_tab_index, 0)
@@ -1391,9 +1685,9 @@ class MainWindow(QMainWindow):
         bulk_threshold_layout.addWidget(self.bulk_threshold_spin)
         bulk_threshold_layout.addWidget(QLabel("(min items for bulk discount)"))
         marketplace_settings_layout.addLayout(bulk_threshold_layout)
-        marketplace_settings_layout.addStretch()
-        settings_tabs.addTab(marketplace_settings_tab, "Marketplace")
+        settings_tabs.addTab(_wrap_settings_tab_scroll(marketplace_settings_tab), "Marketplace")
         # --- Add settings tabs and action buttons ---
+        self.settings_tabs = settings_tabs
         self.layout.addWidget(settings_tabs)
         self.layout.addWidget(QLabel(""))
         self.load_game_button = QPushButton("Load Game")
@@ -1458,7 +1752,7 @@ class MainWindow(QMainWindow):
                 focus_layout.addWidget(QLabel("Difficulty:"))
                 diff_combo = QComboBox()
                 diff_combo.addItems(difficulty_items)
-                diff_val = saved_difficulty_by_ai_index[ai_index] if ai_index < len(saved_difficulty_by_ai_index) else (self.set_all_ai_difficulty_combo.currentText() if hasattr(self, 'set_all_ai_difficulty_combo') else "Medium")
+                diff_val = saved_difficulty_by_ai_index[ai_index] if ai_index < len(saved_difficulty_by_ai_index) else (self.set_all_ai_difficulty_combo.currentText() if hasattr(self, 'set_all_ai_difficulty_combo') else "Hard")
                 diff_idx = difficulty_items.index(diff_val) if diff_val in difficulty_items else 1
                 diff_combo.setCurrentIndex(diff_idx)
                 diff_combo.setToolTip("Hard = construction/marketplace discounts, lobby bonus. Easy = penalties.")
@@ -1473,7 +1767,7 @@ class MainWindow(QMainWindow):
     
     def _on_set_all_ai_difficulty_changed(self):
         """Apply selected difficulty to all AI combos instantly."""
-        level = self.set_all_ai_difficulty_combo.currentText() if hasattr(self, 'set_all_ai_difficulty_combo') else "Medium"
+        level = self.set_all_ai_difficulty_combo.currentText() if hasattr(self, 'set_all_ai_difficulty_combo') else "Hard"
         for combo in getattr(self, 'ai_difficulty_combos', []):
             if combo is not None:
                 idx = combo.findText(level)
@@ -1500,7 +1794,6 @@ class MainWindow(QMainWindow):
         worker_replenishment_rate = self.replenishment_rate_spin.value()
         natural_disaster_frequency = self.disaster_frequency_spin.value()
         marketplace_years_visible = self.marketplace_years_spin.value()
-        edit_mode_enabled = self.edit_mode_checkbox.isChecked()
         line_build_speed = self.line_build_speed_spin.value() if hasattr(self, 'line_build_speed_spin') else None
         bulk_discount = (self.bulk_discount_spin.value() / 100.0) if hasattr(self, 'bulk_discount_spin') else None
         bulk_threshold = self.bulk_threshold_spin.value() if hasattr(self, 'bulk_threshold_spin') else None
@@ -1521,9 +1814,13 @@ class MainWindow(QMainWindow):
                 if focus_val:
                     ai_focus_per_player[i] = focus_val
             if i < len(getattr(self, 'ai_difficulty_combos', [])) and self.ai_difficulty_combos[i]:
-                diff_val = ai_difficulty_map.get(self.ai_difficulty_combos[i].currentText(), "medium")
+                diff_val = ai_difficulty_map.get(self.ai_difficulty_combos[i].currentText(), "hard")
                 ai_difficulty_per_player[i] = diff_val
         ai_watch_enabled = ai_count > 0 and getattr(self, 'ai_watch_checkbox', None) and self.ai_watch_checkbox.isChecked()
+        ai_debug_notifications_enabled = (
+            getattr(self, 'ai_debug_notifications_checkbox', None) is None
+            or self.ai_debug_notifications_checkbox.isChecked()
+        )
         random_ai_spawn_enabled = getattr(self, 'random_ai_spawn_checkbox', None) and self.random_ai_spawn_checkbox.isChecked()
         random_ai_spawn_interval = self.random_ai_spawn_interval_spin.value() if hasattr(self, 'random_ai_spawn_interval_spin') else 30
         merge_enabled = getattr(self, 'merge_enabled_checkbox', None) and self.merge_enabled_checkbox.isChecked()
@@ -1535,7 +1832,7 @@ class MainWindow(QMainWindow):
         ai_min_population = self.ai_min_population_spin.value() if hasattr(self, 'ai_min_population_spin') else 100
         self.start_game_with_players(
             names, map_width, map_height, starting_money, worker_replenishment_rate,
-            natural_disaster_frequency, marketplace_years_visible, edit_mode_enabled,
+            natural_disaster_frequency, marketplace_years_visible,
             line_build_speed_multiplier=line_build_speed,
             inflation_rate=inflation_rate,
             profit_margin=profit_margin,
@@ -1545,6 +1842,7 @@ class MainWindow(QMainWindow):
             ai_focus_per_player=ai_focus_per_player,
             ai_difficulty_per_player=ai_difficulty_per_player,
             ai_watch_enabled=ai_watch_enabled,
+            ai_debug_notifications_enabled=ai_debug_notifications_enabled,
             random_ai_spawn_enabled=random_ai_spawn_enabled,
             random_ai_spawn_interval_years=random_ai_spawn_interval,
             merge_enabled=merge_enabled,
@@ -1568,21 +1866,22 @@ class MainWindow(QMainWindow):
         self.get_player_info_button.clicked.connect(self.on_player_info_button_clicked)
         self.info_layout.addWidget(self.get_player_info_button)
 
-    def start_game_with_players(self, player_names: list[str], map_width: int = 100, map_height: int = 100, starting_money: int = 50000, worker_replenishment_rate: float = 1.0, natural_disaster_frequency: float = 1.0, marketplace_years_visible: int = None, edit_mode_enabled: bool = False, line_build_speed_multiplier: float = None, marketplace_bulk_discount_percent: float = None, marketplace_bulk_discount_threshold: int = None, ai_player_indices: list[int] = None, ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, ai_watch_enabled: bool = False, random_ai_spawn_enabled: bool = True, random_ai_spawn_interval_years: int = 30, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = 1.0, default_ai_difficulty_for_spawns: str = None, ai_min_population: int = 100, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None, war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None):
+    def start_game_with_players(self, player_names: list[str], map_width: int = 100, map_height: int = 100, starting_money: int = 50000, worker_replenishment_rate: float = 1.0, natural_disaster_frequency: float = 1.0, marketplace_years_visible: int = None, line_build_speed_multiplier: float = None, marketplace_bulk_discount_percent: float = None, marketplace_bulk_discount_threshold: int = None, ai_player_indices: list[int] = None, ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, ai_watch_enabled: bool = False, ai_debug_notifications_enabled: bool = True, random_ai_spawn_enabled: bool = True, random_ai_spawn_interval_years: int = 30, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = 1.0, default_ai_difficulty_for_spawns: str = None, ai_min_population: int = 100, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None, war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None):
         # Map selection from dynamic preset discovery (map type combo)
         combo_index = self.map_type_combo.currentIndex()
         map_preset_name = self._map_preset_names[combo_index] if combo_index < len(self._map_preset_names) else "standard"
-        # Reload map preset from disk so edit-mode changes (removed points) persist into new game
-        if map_preset_name:
+        # Reload map preset from disk only when edit mode changed population files.
+        if map_preset_name and getattr(self, '_map_preset_reload_needed', False):
             try:
                 from map_preset_loader import reload_map_preset_from_disk
                 reload_map_preset_from_disk(map_preset_name)
             except Exception:
                 pass
+            self._map_preset_reload_needed = False
         default_diff = default_ai_difficulty_for_spawns
         if default_diff is None and hasattr(self, 'set_all_ai_difficulty_combo'):
             t = self.set_all_ai_difficulty_combo.currentText()
-            default_diff = {'Easy': 'easy', 'Medium': 'medium', 'Hard': 'hard'}.get(t, 'medium')
+            default_diff = {'Easy': 'easy', 'Medium': 'medium', 'Hard': 'hard'}.get(t, 'hard')
         from ruleset_loader import get_active_ruleset
         ruleset_name = (
             self.game_ruleset_combo.currentText()
@@ -1609,7 +1908,7 @@ class MainWindow(QMainWindow):
             merge_human_human_enabled=merge_human_human_enabled,
             inflation_rate=inflation_rate,
             profit_margin=profit_margin,
-            default_ai_difficulty_for_spawns=default_diff or 'medium',
+            default_ai_difficulty_for_spawns=default_diff or 'hard',
             ai_min_population=ai_min_population,
             merge_ai_healthy_profit_threshold_pct=merge_ai_healthy_profit_threshold_pct,
             merge_ai_reject_chance_pct=merge_ai_reject_chance_pct,
@@ -1620,86 +1919,19 @@ class MainWindow(QMainWindow):
             war_end_chance_per_year=war_end_chance_per_year,
             war_worker_draft_chance_per_year=war_worker_draft_chance_per_year,
             war_new_worker_cost_multiplier=war_new_worker_cost_multiplier,
+            ai_debug_notifications_enabled=ai_debug_notifications_enabled,
         )
         from inflation_utils import set_inflation_rate_multiplier
         set_inflation_rate_multiplier(inflation_rate)
-        self.edit_mode_enabled = edit_mode_enabled
         self.ai_watch_enabled = ai_watch_enabled
-        self.edit_history = []
         
-        for player_id, player_tabs_dict in self.player_tabs_dict.items():
-            edit_mode_section = player_tabs_dict.get('edit_mode_section')
-            undo_btn = player_tabs_dict.get('undo_btn')
-            if edit_mode_section:
-                edit_mode_section.setVisible(edit_mode_enabled)
-            if undo_btn:
-                undo_btn.setEnabled(False)  # Disabled until first edit
         if self.status_bar is None:
-            central_layout = self.centralWidget().layout()
-            self.status_bar = QWidget()
-            self.status_bar_layout = QHBoxLayout()
-            self.status_bar.setLayout(self.status_bar_layout)
-            self.status_year_label = QLabel("Year: 1830")
-            self.status_end_year_btn = QPushButton("End Year")
-            self.status_end_year_btn.clicked.connect(self.advance_year_button_clicked)
-            self.status_bar_layout.addWidget(self.status_year_label)
-            for i in range(8):
-                money_label = QLabel("")
-                money_label.setWordWrap(True)
-                money_label.setMaximumWidth(140)
-                self.status_money_labels[i] = money_label
-                self.status_bar_layout.addWidget(money_label)
-            self.status_bar_layout.addStretch()
-            self.status_end_year_timer_label = QLabel("")
-            self.status_end_year_timer_label.setVisible(False)
-            self.status_bar_layout.addWidget(self.status_end_year_timer_label)
-            self.status_bar_layout.addWidget(self.status_end_year_btn)
-            self.status_save_game_btn = QPushButton("Save Game")
-            self.status_save_game_btn.clicked.connect(self.on_save_game_clicked)
-            self.status_bar_layout.addWidget(self.status_save_game_btn)
-            self.status_end_game_btn = QPushButton("End Game")
-            self.status_end_game_btn.clicked.connect(self.on_end_game_clicked)
-            self.status_bar_layout.addWidget(self.status_end_game_btn)
-            messages_widget = QWidget()
-            messages_layout = QVBoxLayout()
-            messages_widget.setLayout(messages_layout)
-            self.status_messages_list = QListWidget()
-            self.status_messages_list.setMaximumHeight(56)
-            self.status_messages_list.setMaximumWidth(220)
-            self.status_messages_list.setMinimumWidth(150)
-            for m in self._get_visible_messages():
-                self.status_messages_list.insertItem(0, QListWidgetItem(str(m)))
-            self._message_widgets.append(self.status_messages_list)
-            messages_layout.addWidget(self.status_messages_list)
-            chat_row = QHBoxLayout()
-            self.status_chat_input = QLineEdit()
-            self.status_chat_input.setPlaceholderText("Chat...")
-            self.status_chat_input.setMaximumWidth(150)
-            self.status_chat_input.setMaximumHeight(24)
-            chat_send_btn = QPushButton("Send")
-            chat_send_btn.setMaximumHeight(24)
-            def _on_chat_send():
-                text = self.status_chat_input.text().strip()
-                if not text:
-                    return
-                if getattr(self, 'is_network_mode', False) and getattr(self, 'network_client', None) and self.network_client.connected_flag:
-                    self.network_client.send_chat(text)
-                    self.status_chat_input.clear()
-                elif self.operations:
-                    cp = self.operations.get_current_player(self.current_player_index)
-                    name = self.operations.get_player_name(cp) if cp else "Player"
-                    self.add_message(f"{name}: {text}")
-                    self.status_chat_input.clear()
-            chat_send_btn.clicked.connect(_on_chat_send)
-            self.status_chat_input.returnPressed.connect(_on_chat_send)
-            chat_row.addWidget(self.status_chat_input)
-            chat_row.addWidget(chat_send_btn)
-            messages_layout.addLayout(chat_row)
-            self.status_bar_layout.addWidget(messages_widget)
-            central_layout.addWidget(self.status_bar)
+            self._attach_game_status_bar(self.centralWidget().layout())
         self.save_game_action.setEnabled(True)
         self.advance_year_action.setEnabled(True)
         self.refresh_displays_action.setEnabled(True)
+        if hasattr(self, 'game_settings_action'):
+            self.game_settings_action.setEnabled(True)
         if hasattr(self, 'propose_merge_action'):
             self._update_propose_merge_action()
         
@@ -1760,10 +1992,15 @@ class MainWindow(QMainWindow):
             for player, acts in ai_results_list:
                 if acts:
                     self.ai_watch_text.append(f"{player.get_name()}: {len(acts)} action(s) (in-year)")
+                else:
+                    self.ai_watch_text.append(f"{player.get_name()}: No actions")
         self.refresh_all_displays()
         self._update_year_end_waiting_ui()
         QTimer.singleShot(50, self._try_complete_year_end)
-        QTimer.singleShot(100, self._maybe_auto_advance_year_if_ai)
+        if self.operations.get_ai_players_needing_in_year_turn():
+            QTimer.singleShot(50, self._start_background_ai_in_year_turns)
+        else:
+            QTimer.singleShot(100, self._maybe_auto_advance_year_if_ai)
 
     def _humans_to_mark_ready_on_end_year(self) -> list:
         """Human player(s) signaled ready by the current End Year click."""
@@ -1978,71 +2215,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'status_messages_list') and self.status_messages_list is not None:
             self._message_widgets.append(self.status_messages_list)
         if self.status_bar is None:
-            central_layout = self.centralWidget().layout()
-            self.status_bar = QWidget()
-            self.status_bar_layout = QHBoxLayout()
-            self.status_bar.setLayout(self.status_bar_layout)
-            self.status_year_label = QLabel("Year: 1830")
-            self.status_end_year_btn = QPushButton("End Year")
-            self.status_end_year_btn.clicked.connect(self.advance_year_button_clicked)
-            self.status_bar_layout.addWidget(self.status_year_label)
-            for i in range(8):
-                money_label = QLabel("")
-                money_label.setWordWrap(True)
-                money_label.setMaximumWidth(140)
-                self.status_money_labels[i] = money_label
-                self.status_bar_layout.addWidget(self.status_money_labels[i])
-            self.status_bar_layout.addStretch()
-            self.status_end_year_timer_label = QLabel("")
-            self.status_end_year_timer_label.setVisible(False)
-            self.status_bar_layout.addWidget(self.status_end_year_timer_label)
-            self.status_bar_layout.addWidget(self.status_end_year_btn)
-            self.status_save_game_btn = QPushButton("Save Game")
-            self.status_save_game_btn.clicked.connect(self.on_save_game_clicked)
-            self.status_bar_layout.addWidget(self.status_save_game_btn)
-            self.status_end_game_btn = QPushButton("End Game")
-            self.status_end_game_btn.clicked.connect(self.on_end_game_clicked)
-            self.status_bar_layout.addWidget(self.status_end_game_btn)
-            messages_widget = QWidget()
-            messages_layout = QVBoxLayout()
-            messages_widget.setLayout(messages_layout)
-            self.status_messages_list = QListWidget()
-            self.status_messages_list.setMaximumHeight(56)
-            self.status_messages_list.setMaximumWidth(220)
-            self.status_messages_list.setMinimumWidth(150)
-            for m in self._get_visible_messages():
-                self.status_messages_list.insertItem(0, QListWidgetItem(str(m)))
-            self._message_widgets.append(self.status_messages_list)
-            messages_layout.addWidget(self.status_messages_list)
-            chat_row = QHBoxLayout()
-            self.status_chat_input = QLineEdit()
-            self.status_chat_input.setPlaceholderText("Chat...")
-            self.status_chat_input.setMaximumWidth(150)
-            self.status_chat_input.setMaximumHeight(24)
-            chat_send_btn = QPushButton("Send")
-            chat_send_btn.setMaximumHeight(24)
-            def _on_chat_send():
-                text = self.status_chat_input.text().strip()
-                if not text:
-                    return
-                if getattr(self, 'is_network_mode', False) and getattr(self, 'network_client', None) and self.network_client.connected_flag:
-                    self.network_client.send_chat(text)
-                    self.status_chat_input.clear()
-                elif self.operations:
-                    cp = self.operations.get_current_player(self.current_player_index)
-                    name = self.operations.get_player_name(cp) if cp else "Player"
-                    self.add_message(f"{name}: {text}")
-                    self.status_chat_input.clear()
-            chat_send_btn.clicked.connect(_on_chat_send)
-            self.status_chat_input.returnPressed.connect(_on_chat_send)
-            chat_row.addWidget(self.status_chat_input)
-            chat_row.addWidget(chat_send_btn)
-            messages_layout.addLayout(chat_row)
-            self.status_bar_layout.addWidget(messages_widget)
-            central_layout.addWidget(self.status_bar)
+            self._attach_game_status_bar(self.centralWidget().layout())
             self.save_game_action.setEnabled(True)
             self.advance_year_action.setEnabled(True)
             self.refresh_displays_action.setEnabled(True)
+            if hasattr(self, 'game_settings_action'):
+                self.game_settings_action.setEnabled(True)
         # Clear stale refs before creating new tabs to avoid deleted layout errors
         self.player_tabs_dict = {}
         self._player_tabs_keepalive = []
@@ -2055,7 +2233,8 @@ class MainWindow(QMainWindow):
         # Tab 0: Our Player (full tabs)
         our_player = next((p for p in players if self.operations.get_player_id(p) == our_player_id), players[0])
         our_player_tabs = self._create_player_tabs(our_player, for_other_player=False)
-        self.tabs.addTab(our_player_tabs, our_player.get_name())
+        our_tab_idx = self.tabs.addTab(our_player_tabs, our_player.get_name())
+        self.tabs.setTabIcon(our_tab_idx, player_color_icon(self.operations.get_player_color_index(our_player)))
         # Tab 1: Other Players (parent with read-only subtabs)
         if other_player_ids:
             other_container = QTabWidget()
@@ -2063,7 +2242,8 @@ class MainWindow(QMainWindow):
                 other_player = next((p for p in players if self.operations.get_player_id(p) == pid), None)
                 if other_player:
                     other_tabs = self._create_player_tabs(other_player, for_other_player=True)
-                    other_container.addTab(other_tabs, other_player.get_name())
+                    sub_idx = other_container.addTab(other_tabs, other_player.get_name())
+                    other_container.setTabIcon(sub_idx, player_color_icon(self.operations.get_player_color_index(other_player)))
             self._other_players_container = other_container
             self.tabs.addTab(other_container, "Other Players")
         else:
@@ -2129,6 +2309,8 @@ class MainWindow(QMainWindow):
             self._other_players_container.currentChanged.connect(self._on_game_session_other_subtab_changed)
         self._apply_view_only_state()
         self._update_game_session_tab_menu_actions()
+        self._remove_assigned_player_tab_close_button()
+        QTimer.singleShot(100, self._start_background_ai_in_year_turns)
 
     def _game_session_update_refs_for_player(self, ref_id):
         if ref_id in self.player_tabs_dict:
@@ -2203,10 +2385,12 @@ class MainWindow(QMainWindow):
         other_tabs = self._create_player_tabs(new_player, for_other_player=True)
         container = getattr(self, '_other_players_container', None)
         if container is not None:
-            container.addTab(other_tabs, new_player.get_name())
+            sub_idx = container.addTab(other_tabs, new_player.get_name())
+            container.setTabIcon(sub_idx, player_color_icon(self.operations.get_player_color_index(new_player)))
         else:
             self._other_players_container = QTabWidget()
-            self._other_players_container.addTab(other_tabs, new_player.get_name())
+            sub_idx = self._other_players_container.addTab(other_tabs, new_player.get_name())
+            self._other_players_container.setTabIcon(sub_idx, player_color_icon(self.operations.get_player_color_index(new_player)))
             self._other_players_container.currentChanged.connect(self._on_game_session_other_subtab_changed)
             self.tabs.insertTab(1, self._other_players_container, "Other Players")
         self.DisplayRollingStockInfo(new_player)
@@ -2342,6 +2526,232 @@ class MainWindow(QMainWindow):
 
     def _on_game_open_ai_watch(self):
         self._focus_main_tab_by_title("AI Watch")
+
+    def _show_in_game_settings_dialog(self):
+        """Open a dialog to change runtime game settings (AI, economy, mergers, marketplace)."""
+        if not self.operations:
+            return
+        from PyQt6.QtWidgets import QDialogButtonBox
+
+        current = self.operations.get_runtime_game_settings()
+        has_ai = any(getattr(p, 'is_ai', False) for p in self.operations.get_players())
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Game Settings")
+        dlg.setMinimumWidth(520)
+        outer = QVBoxLayout(dlg)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+
+        ai_group = QGroupBox("AI")
+        ai_layout = QVBoxLayout(ai_group)
+        ai_watch_cb = QCheckBox("Enable AI Watch tab")
+        ai_watch_cb.setChecked(bool(getattr(self, 'ai_watch_enabled', False)))
+        ai_watch_cb.setEnabled(has_ai)
+        ai_watch_cb.setToolTip("Show the AI Watch tab to monitor AI actions during End Year.")
+        ai_layout.addWidget(ai_watch_cb)
+        ai_debug_cb = QCheckBox("AI debug notifications")
+        ai_debug_cb.setChecked(bool(current.get('ai_debug_notifications_enabled', True)))
+        ai_layout.addWidget(ai_debug_cb)
+        random_spawn_cb = QCheckBox("Random AI spawn (new AI joins periodically)")
+        random_spawn_cb.setChecked(bool(current.get('random_ai_spawn_enabled', False)))
+        ai_layout.addWidget(random_spawn_cb)
+        spawn_row = QHBoxLayout()
+        spawn_row.addWidget(QLabel("Spawn interval (years):"))
+        spawn_interval_spin = QSpinBox()
+        spawn_interval_spin.setRange(5, 200)
+        spawn_interval_spin.setValue(int(current.get('random_ai_spawn_interval_years', 30)))
+        spawn_row.addWidget(spawn_interval_spin)
+        spawn_row.addStretch()
+        ai_layout.addLayout(spawn_row)
+        min_pop_row = QHBoxLayout()
+        min_pop_row.addWidget(QLabel("AI minimum endpoint population:"))
+        ai_min_pop_spin = QSpinBox()
+        ai_min_pop_spin.setRange(0, 10000)
+        ai_min_pop_spin.setValue(int(current.get('ai_min_population', 100)))
+        min_pop_row.addWidget(ai_min_pop_spin)
+        min_pop_row.addStretch()
+        ai_layout.addLayout(min_pop_row)
+        layout.addWidget(ai_group)
+
+        economy_group = QGroupBox("Economy & events")
+        economy_layout = QVBoxLayout(economy_group)
+
+        def _add_double_row(parent_layout, label, value, minimum, maximum, step=0.1, decimals=2, suffix=""):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            spin = QDoubleSpinBox()
+            spin.setRange(minimum, maximum)
+            spin.setSingleStep(step)
+            spin.setDecimals(decimals)
+            spin.setValue(float(value))
+            if suffix:
+                spin.setSuffix(suffix)
+            row.addWidget(spin)
+            row.addStretch()
+            parent_layout.addLayout(row)
+            return spin
+
+        inflation_spin = _add_double_row(economy_layout, "Inflation rate:", current.get('inflation_rate', 1.0), 0.25, 3.0, 0.25)
+        profit_spin = _add_double_row(economy_layout, "Profit margin:", current.get('profit_margin', 1.0), 0.25, 5.0, 0.25)
+        replen_spin = _add_double_row(economy_layout, "Worker replenishment:", current.get('worker_replenishment_rate', 1.0), 0.1, 5.0, 0.1, 1)
+        disaster_spin = _add_double_row(economy_layout, "Disaster frequency:", current.get('natural_disaster_frequency', 1.0), 0.1, 5.0, 0.1, 1)
+        build_speed_spin = _add_double_row(economy_layout, "Line build speed:", current.get('line_build_speed_multiplier', 1.0), 0.5, 5.0, 0.1, 1)
+        layout.addWidget(economy_group)
+
+        merge_group = QGroupBox("Mergers")
+        merge_layout = QVBoxLayout(merge_group)
+        merge_enabled_cb = QCheckBox("Allow mergers (master switch)")
+        merge_enabled_cb.setChecked(bool(current.get('merge_enabled', False)))
+        merge_layout.addWidget(merge_enabled_cb)
+        merge_hh_cb = QCheckBox("Allow mergers between humans")
+        merge_hh_cb.setChecked(bool(current.get('merge_human_human_enabled', True)))
+        merge_layout.addWidget(merge_hh_cb)
+        merge_aa_cb = QCheckBox("Allow mergers between AIs")
+        merge_aa_cb.setChecked(bool(current.get('merge_ai_ai_enabled', True)))
+        merge_layout.addWidget(merge_aa_cb)
+        merge_ah_cb = QCheckBox("Allow mergers between humans and AIs")
+        merge_ah_cb.setChecked(bool(current.get('merge_ai_human_enabled', True)))
+        merge_layout.addWidget(merge_ah_cb)
+        merge_healthy_spin = _add_double_row(
+            merge_layout, "AI healthy profit threshold:", current.get('merge_ai_healthy_profit_threshold_pct', 25.0), 0, 100, 1, 0, "%",
+        )
+        merge_reject_spin = _add_double_row(
+            merge_layout, "AI reject merger chance:", current.get('merge_ai_reject_chance_pct', 90.0), 0, 100, 1, 0, "%",
+        )
+        merge_ttl_row = QHBoxLayout()
+        merge_ttl_row.addWidget(QLabel("AI auto-reject if turns to live >"))
+        merge_ttl_spin = QSpinBox()
+        merge_ttl_spin.setRange(0, 200)
+        merge_ttl_spin.setValue(int(current.get('merge_ai_min_turns_to_live_for_accept', 10)))
+        merge_ttl_row.addWidget(merge_ttl_spin)
+        merge_ttl_row.addStretch()
+        merge_layout.addLayout(merge_ttl_row)
+        merge_years_row = QHBoxLayout()
+        merge_years_row.addWidget(QLabel("AI years before considering merge:"))
+        merge_years_spin = QSpinBox()
+        merge_years_spin.setRange(0, 50)
+        merge_years_spin.setValue(int(current.get('merge_ai_min_years_before_consider', 0)))
+        merge_years_row.addWidget(merge_years_spin)
+        merge_years_row.addWidget(QLabel("Auto-fail AI merges first N years:"))
+        merge_fail_spin = QSpinBox()
+        merge_fail_spin.setRange(0, 50)
+        merge_fail_spin.setValue(int(current.get('merge_ai_auto_fail_first_n_years', 0)))
+        merge_years_row.addWidget(merge_fail_spin)
+        merge_years_row.addStretch()
+        merge_layout.addLayout(merge_years_row)
+        layout.addWidget(merge_group)
+
+        market_group = QGroupBox("Marketplace")
+        market_layout = QVBoxLayout(market_group)
+        mp_years_row = QHBoxLayout()
+        mp_years_row.addWidget(QLabel("Years visible:"))
+        mp_years_spin = QSpinBox()
+        mp_years_spin.setRange(1, 200)
+        mp_years_spin.setValue(int(current.get('marketplace_years_visible', 40)))
+        mp_years_row.addWidget(mp_years_spin)
+        mp_years_row.addStretch()
+        market_layout.addLayout(mp_years_row)
+        bulk_pct_spin = _add_double_row(
+            market_layout, "Bulk discount:", current.get('marketplace_bulk_discount_percent', 0.0), 0, 100, 1, 0, "%",
+        )
+        bulk_thr_row = QHBoxLayout()
+        bulk_thr_row.addWidget(QLabel("Bulk discount threshold (items):"))
+        bulk_thr_spin = QSpinBox()
+        bulk_thr_spin.setRange(1, 100)
+        bulk_thr_spin.setValue(int(current.get('marketplace_bulk_discount_threshold', 10)))
+        bulk_thr_row.addWidget(bulk_thr_spin)
+        bulk_thr_row.addStretch()
+        market_layout.addLayout(bulk_thr_row)
+        layout.addWidget(market_group)
+
+        war_group = QGroupBox("War events")
+        war_layout = QVBoxLayout(war_group)
+        war_start_spin = QSpinBox()
+        war_start_spin.setRange(0, 100)
+        war_start_spin.setValue(int(round(float(current.get('war_start_chance_per_year', 0.0)) * 100)))
+        war_start_row = QHBoxLayout()
+        war_start_row.addWidget(QLabel("Start chance per year (%):"))
+        war_start_row.addWidget(war_start_spin)
+        war_start_row.addStretch()
+        war_layout.addLayout(war_start_row)
+        war_end_spin = QSpinBox()
+        war_end_spin.setRange(0, 100)
+        war_end_spin.setValue(int(round(float(current.get('war_end_chance_per_year', 0.0)) * 100)))
+        war_end_row = QHBoxLayout()
+        war_end_row.addWidget(QLabel("End chance per year (%):"))
+        war_end_row.addWidget(war_end_spin)
+        war_end_row.addStretch()
+        war_layout.addLayout(war_end_row)
+        war_draft_spin = QSpinBox()
+        war_draft_spin.setRange(0, 100)
+        war_draft_spin.setValue(int(round(float(current.get('war_worker_draft_chance_per_year', 0.0)) * 100)))
+        war_draft_row = QHBoxLayout()
+        war_draft_row.addWidget(QLabel("Worker draft chance per war year (%):"))
+        war_draft_row.addWidget(war_draft_spin)
+        war_draft_row.addStretch()
+        war_layout.addLayout(war_draft_row)
+        war_cost_spin = _add_double_row(
+            war_layout, "New worker cost multiplier:", current.get('war_new_worker_cost_multiplier', 1.0), 1.0, 3.0, 0.05,
+        )
+        layout.addWidget(war_group)
+        layout.addStretch()
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        outer.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        settings = {
+            'ai_debug_notifications_enabled': ai_debug_cb.isChecked(),
+            'random_ai_spawn_enabled': random_spawn_cb.isChecked(),
+            'random_ai_spawn_interval_years': spawn_interval_spin.value(),
+            'ai_min_population': ai_min_pop_spin.value(),
+            'merge_enabled': merge_enabled_cb.isChecked(),
+            'merge_human_human_enabled': merge_hh_cb.isChecked(),
+            'merge_ai_ai_enabled': merge_aa_cb.isChecked(),
+            'merge_ai_human_enabled': merge_ah_cb.isChecked(),
+            'merge_ai_healthy_profit_threshold_pct': merge_healthy_spin.value(),
+            'merge_ai_reject_chance_pct': merge_reject_spin.value(),
+            'merge_ai_min_turns_to_live_for_accept': merge_ttl_spin.value(),
+            'merge_ai_min_years_before_consider': merge_years_spin.value(),
+            'merge_ai_auto_fail_first_n_years': merge_fail_spin.value(),
+            'worker_replenishment_rate': replen_spin.value(),
+            'natural_disaster_frequency': disaster_spin.value(),
+            'inflation_rate': inflation_spin.value(),
+            'profit_margin': profit_spin.value(),
+            'line_build_speed_multiplier': build_speed_spin.value(),
+            'marketplace_years_visible': mp_years_spin.value(),
+            'marketplace_bulk_discount_percent': bulk_pct_spin.value(),
+            'marketplace_bulk_discount_threshold': bulk_thr_spin.value(),
+            'war_start_chance_per_year': war_start_spin.value() / 100.0,
+            'war_end_chance_per_year': war_end_spin.value() / 100.0,
+            'war_worker_draft_chance_per_year': war_draft_spin.value() / 100.0,
+            'war_new_worker_cost_multiplier': war_cost_spin.value(),
+        }
+        self.operations.apply_runtime_game_settings(settings)
+
+        want_ai_watch = ai_watch_cb.isChecked() and has_ai
+        if want_ai_watch and not getattr(self, 'ai_watch_enabled', False):
+            self.ai_watch_enabled = True
+            self._create_ai_watch_tab()
+            self._update_game_session_tab_menu_actions()
+        elif not want_ai_watch:
+            self.ai_watch_enabled = False
+            self._update_game_session_tab_menu_actions()
+
+        if hasattr(self, '_update_propose_merge_action'):
+            self._update_propose_merge_action()
+        self.add_message("Game settings updated.")
 
     def _is_viewing_other_player(self) -> bool:
         """True when viewing another player's tab (read-only). Our player has full tabs; Other Players tab has no Map/Law/Government."""
@@ -2566,12 +2976,17 @@ class MainWindow(QMainWindow):
         map_main_layout = QHBoxLayout()
         map_tab.setLayout(map_main_layout)
         
-        # Create sidebar for map controls
+        # Create sidebar for map controls (scrollable so labels never overlap)
+        map_sidebar_scroll = QScrollArea()
+        map_sidebar_scroll.setFixedWidth(250)
+        map_sidebar_scroll.setWidgetResizable(False)
+        map_sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        map_sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        map_sidebar_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         map_sidebar = QWidget()
-        map_sidebar.setFixedWidth(250)  # Fixed width sidebar
         map_sidebar_layout = QVBoxLayout()
         map_sidebar.setLayout(map_sidebar_layout)
-        map_sidebar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)  # Ensure clickable
+        map_sidebar_scroll.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         
         # Map info section
         map_info_label = QLabel("Map Info")
@@ -2649,26 +3064,14 @@ class MainWindow(QMainWindow):
         map_sidebar_layout.addWidget(_hidden_station_widget)
         
         # Edit mode section (only shown when edit mode is enabled)
-        edit_mode_section = QWidget()
-        edit_mode_section_layout = QVBoxLayout()
-        edit_mode_section.setLayout(edit_mode_section_layout)
-        edit_mode_section.setVisible(False)  # Hidden by default
-        map_sidebar_layout.addWidget(edit_mode_section)
-        
-        edit_mode_label = QLabel("Edit Mode")
-        edit_mode_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        edit_mode_section_layout.addWidget(edit_mode_label)
-        
-        undo_btn = QPushButton("Undo Last Edit")
-        undo_btn.setEnabled(False)
-        undo_btn.clicked.connect(self._undo_last_edit)
-        edit_mode_section_layout.addWidget(undo_btn)
-        
         map_sidebar_layout.addStretch()  # Push everything to top
-        
+        map_sidebar.adjustSize()
+        map_sidebar.setMinimumHeight(map_sidebar.sizeHint().height())
+        map_sidebar_scroll.setWidget(map_sidebar)
+
         # Add sidebar to main layout (fixed width, no stretch)
         logger.debug("Adding sidebar to map_main_layout")
-        map_main_layout.addWidget(map_sidebar, 0)  # Stretch factor 0 - fixed width
+        map_main_layout.addWidget(map_sidebar_scroll, 0)  # Stretch factor 0 - fixed width
         logger.debug("Sidebar added, map_main_layout count: %d", map_main_layout.count())
         
         # Create map layout for the actual map display
@@ -2688,6 +3091,10 @@ class MainWindow(QMainWindow):
             from PyQt6.QtCore import QTimer
             try:
                 if index == map_tab_index:
+                    QTimer.singleShot(100, self._invalidate_all_map_web_views)
+                    web_view = player_tabs_dict.get(f'map_web_view_{player_id}')
+                    if web_view is not None:
+                        QTimer.singleShot(150, web_view.setFocus)
                     if f'map_web_view_{player_id}' not in player_tabs_dict or player_tabs_dict.get(f'map_web_view_{player_id}') is None:
                         def create_webview_delayed():
                             try:
@@ -2707,6 +3114,7 @@ class MainWindow(QMainWindow):
         
         logger.debug("Storing references in player_tabs_dict")
         player_tabs_dict['map_sidebar'] = map_sidebar
+        player_tabs_dict['map_sidebar_scroll'] = map_sidebar_scroll
         player_tabs_dict['map_info_text'] = map_info_text
         player_tabs_dict['map_tab_index'] = map_tab_index
         player_tabs_dict['create_line_btn'] = create_line_btn
@@ -2947,15 +3355,29 @@ class MainWindow(QMainWindow):
         ranking_label = QLabel("Government favor (by influence, seats controlled): " + (", ".join(ranking_parts) if ranking_parts else "No players with influence"))
         ranking_label.setWordWrap(True)
         layout.addWidget(ranking_label)
-        layout.addWidget(QLabel("Right-click a seat to see allegiance/influence and lobby. Player color=allegiance, grey=no allegiance. L=leader."))
+        legend_row = QWidget()
+        legend_layout = QHBoxLayout(legend_row)
+        legend_layout.setContentsMargins(0, 0, 0, 0)
+        legend_layout.setSpacing(4)
+        for p in self.operations.get_active_players():
+            color_idx = self.operations.get_player_color_index(p)
+            legend_layout.addWidget(create_player_color_name_row(color_idx, self.operations.get_player_name(p)))
+        legend_layout.addStretch()
+        layout.addWidget(legend_row)
+        layout.addWidget(QLabel("Right-click a seat to see allegiance/influence and lobby. Grey=no allegiance. L=leader."))
         seats_with_allegiance = self.operations.get_government_seats_with_allegiance()
         player_names = [self.operations.get_player_name(p) for p in self.operations.get_players()]
+        player_color_by_id = {
+            self.operations.get_player_id(p): self.operations.get_player_color_index(p)
+            for p in self.operations.get_players()
+        }
         chamber = GovernmentChamberWidget(
             seats,
             on_lobby_seat=lambda idx, p=player: self._open_lobby_seat_dialog(p, idx),
             on_lobby_leader=lambda p=player: self._open_lobby_leader_dialog(p),
             seats_with_allegiance=seats_with_allegiance,
             player_names=player_names,
+            player_color_by_id=player_color_by_id,
         )
         layout.addWidget(chamber, 1)
         lobby_btn = QPushButton("Lobby seats (pay government)")
@@ -3009,29 +3431,106 @@ class MainWindow(QMainWindow):
         self.ai_watch_text.setMaximumHeight(400)
         self.ai_watch_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layout.addWidget(self.ai_watch_text, 1)
-        # AI Finances (all years) - money up/down log, scrollable
+        # AI Finances (all years) — money up/down side by side
         ai_fin_label = QLabel("AI Finances (all years)")
         ai_fin_label.setStyleSheet("font-weight: bold; margin-top: 8px;")
         layout.addWidget(ai_fin_label)
-        self.ai_watch_finances_text = QLabel("")
-        self.ai_watch_finances_text.setWordWrap(True)
-        self.ai_watch_finances_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.ai_watch_finances_text.setMinimumWidth(200)
-        ai_fin_scroll = QScrollArea()
-        ai_fin_scroll.setWidget(self.ai_watch_finances_text)
-        ai_fin_scroll.setWidgetResizable(True)
-        ai_fin_scroll.setMinimumHeight(120)
-        ai_fin_scroll.setMaximumHeight(400)
-        ai_fin_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        ai_fin_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        ai_fin_scroll.setFrameShape(QScrollArea.Shape.StyledPanel)
-        layout.addWidget(ai_fin_scroll, 1)
+        from PyQt6.QtWidgets import QHBoxLayout
+        fin_row = QHBoxLayout()
+        self.ai_watch_finances_down_text = QTextEdit()
+        self.ai_watch_finances_down_text.setReadOnly(True)
+        self.ai_watch_finances_down_text.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        down_scroll = QScrollArea()
+        down_scroll.setWidget(self.ai_watch_finances_down_text)
+        down_scroll.setWidgetResizable(True)
+        down_scroll.setMinimumHeight(120)
+        down_scroll.setMaximumHeight(400)
+        down_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        down_label = QLabel("Money down")
+        down_label.setStyleSheet("font-weight: bold;")
+        down_col = QVBoxLayout()
+        down_col.addWidget(down_label)
+        down_col.addWidget(down_scroll)
+        down_wrap = QWidget()
+        down_wrap.setLayout(down_col)
+        self.ai_watch_finances_up_text = QTextEdit()
+        self.ai_watch_finances_up_text.setReadOnly(True)
+        self.ai_watch_finances_up_text.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        up_scroll = QScrollArea()
+        up_scroll.setWidget(self.ai_watch_finances_up_text)
+        up_scroll.setWidgetResizable(True)
+        up_scroll.setMinimumHeight(120)
+        up_scroll.setMaximumHeight(400)
+        up_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        up_label = QLabel("Money up")
+        up_label.setStyleSheet("font-weight: bold;")
+        up_col = QVBoxLayout()
+        up_col.addWidget(up_label)
+        up_col.addWidget(up_scroll)
+        up_wrap = QWidget()
+        up_wrap.setLayout(up_col)
+        fin_row.addWidget(down_wrap, 1)
+        fin_row.addWidget(up_wrap, 1)
+        fin_row_widget = QWidget()
+        fin_row_widget.setLayout(fin_row)
+        layout.addWidget(fin_row_widget, 1)
+        # Legacy alias for refresh code
+        self.ai_watch_finances_text = self.ai_watch_finances_down_text
         self.tabs.addTab(ai_watch_tab, "AI Watch")
 
     def _on_ai_progress(self, player_name: str, description: str):
         """Append AI action (detailed description) to the AI Watch tab."""
         if hasattr(self, 'ai_watch_text') and self.ai_watch_text:
             self.ai_watch_text.append(f"{player_name}: {description}")
+        if description.startswith(("Built line", "Extended line", "Bought line")):
+            self._schedule_ai_map_refresh()
+
+    def _schedule_ai_map_refresh(self):
+        """Debounced map refresh so AI-built lines appear during the year, not only at year-end."""
+        if not hasattr(self, '_ai_map_refresh_timer'):
+            self._ai_map_refresh_timer = QTimer(self)
+            self._ai_map_refresh_timer.setSingleShot(True)
+            self._ai_map_refresh_timer.timeout.connect(self._refresh_map_after_ai_action)
+        self._ai_map_refresh_timer.start(300)
+
+    def _refresh_map_after_ai_action(self):
+        """Lightweight map update only — never reload HTML (preserves in-progress line creation)."""
+        if not self.operations:
+            return
+        try:
+            game_map = self.operations.get_map()
+            if game_map and hasattr(self, '_build_map_overview_text'):
+                self._update_map_sidebars(self._build_map_overview_text(game_map))
+            if hasattr(self, '_refresh_map_overlays'):
+                self._refresh_map_overlays()
+        except Exception as e:
+            logger.debug("AI map refresh failed: %s", e)
+        if hasattr(self, 'refresh_construction_tab'):
+            self.refresh_construction_tab()
+
+    def _any_map_edit_in_progress(self) -> bool:
+        """True when a human is placing line/extension points (map HTML must not reload)."""
+        tabs = getattr(self, 'player_tabs_dict', None) or {}
+        for player_tabs in tabs.values():
+            if not isinstance(player_tabs, dict):
+                continue
+            if player_tabs.get('line_creation_active') or player_tabs.get('line_extension_active'):
+                return True
+            if player_tabs.get('line_creation_finishing') or player_tabs.get('line_extension_finishing'):
+                return True
+        return False
+
+    def _set_line_creation_active(self, player_tabs_dict: dict, active: bool) -> None:
+        if player_tabs_dict is not None:
+            player_tabs_dict['line_creation_active'] = bool(active)
+            if not active:
+                player_tabs_dict['line_creation_finishing'] = False
+
+    def _set_line_extension_active(self, player_tabs_dict: dict, active: bool) -> None:
+        if player_tabs_dict is not None:
+            player_tabs_dict['line_extension_active'] = bool(active)
+            if not active:
+                player_tabs_dict['line_extension_finishing'] = False
 
     def _create_news_log_tab(self):
         """Create a News Log tab with generated yearly newspaper-style articles."""
@@ -3777,12 +4276,8 @@ class MainWindow(QMainWindow):
         line_combo.currentIndexChanged.connect(update_route_display)
         update_route_display()
 
-        layout.addWidget(QLabel("Extend from:"))
-        direction_combo = QComboBox()
-        direction_combo.addItems(["End of line", "Beginning of line"])
-        layout.addWidget(direction_combo)
-
         layout.addWidget(QLabel("Enter new points (x, y) - one per line:"))
+        layout.addWidget(QLabel("The first point attaches to whichever line end is closer; each next point connects to the prior point."))
         layout.addWidget(QLabel("Example: 5,10 then 6,11"))
         from PyQt6.QtWidgets import QTextEdit
         points_text = QTextEdit()
@@ -3824,65 +4319,18 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(dlg, "Error", "No valid points entered.")
                 return
 
-            extend_from_end = direction_combo.currentText() == "End of line"
-            
-            # Show elevation selection dialog
-            required_elevations = len(new_points)
-            elev_dlg = QDialog(self)
-            elev_dlg.setWindowTitle("Select Elevation Levels")
-            elev_dlg.setGeometry(300, 300, 400, min(600, 180 + required_elevations * 50))
-            elev_layout = QVBoxLayout()
-            elev_layout.addWidget(QLabel(f"Select elevation level for each of {required_elevations} points:"))
-            elev_layout.addWidget(QLabel("Note: Cannot use 'street' on water"))
-            all_seg_row = QHBoxLayout()
-            all_seg_row.addWidget(QLabel("Apply to all:"))
-            all_combo_ext = QComboBox()
-            all_combo_ext.addItems(['street', 'above_ground', 'underground'])
-            all_combo_ext.setCurrentText('street')
-            all_seg_row.addWidget(all_combo_ext)
-            elevation_combos = []
-            def apply_all_ext():
-                for c in elevation_combos:
-                    c.setCurrentText(all_combo_ext.currentText())
-            apply_btn_ext = QPushButton("Apply")
-            apply_btn_ext.clicked.connect(apply_all_ext)
-            all_seg_row.addWidget(apply_btn_ext)
-            all_seg_row.addStretch()
-            elev_layout.addLayout(all_seg_row)
-            
-            from PyQt6.QtWidgets import QScrollArea, QWidget as QWidget2
-            elev_scroll = QScrollArea()
-            elev_scroll.setWidgetResizable(True)
-            elev_widget = QWidget2()
-            elev_widget_layout = QVBoxLayout()
-            elev_widget.setLayout(elev_widget_layout)
-            elev_scroll.setWidget(elev_widget)
-            elev_layout.addWidget(elev_scroll)
-            
-            for i in range(required_elevations):
-                point_label = QLabel(f"Point {i+1} ({new_points[i][0]:.1f}, {new_points[i][1]:.1f}):")
-                elev_widget_layout.addWidget(point_label)
-                combo = QComboBox()
-                combo.addItems(['street', 'above_ground', 'underground'])
-                combo.setCurrentText('street')  # Default
-                elev_widget_layout.addWidget(combo)
-                elevation_combos.append(combo)
-            
-            elev_btn_layout = QHBoxLayout()
-            elev_ok_btn = QPushButton("OK")
-            elev_cancel_btn = QPushButton("Cancel")
-            elev_ok_btn.clicked.connect(elev_dlg.accept)
-            elev_cancel_btn.clicked.connect(elev_dlg.reject)
-            elev_btn_layout.addWidget(elev_ok_btn)
-            elev_btn_layout.addWidget(elev_cancel_btn)
-            elev_layout.addLayout(elev_btn_layout)
-            elev_dlg.setLayout(elev_layout)
-            
-            if elev_dlg.exec() != QDialog.DialogCode.Accepted:
+            extend_from_end = self.operations.extension_attach_from_closest_end(
+                selected_line_name, new_points[0],
+            )
+
+            segment_specs = self.operations.get_extension_elevation_specs(
+                selected_line_name, new_points, extend_from_end,
+            )
+            elevation_levels = self._prompt_route_elevation_levels(
+                segment_specs, parent=dlg,
+            )
+            if elevation_levels is None:
                 return
-            
-            # Get elevation levels from combo boxes
-            elevation_levels = [combo.currentText() for combo in elevation_combos]
             
             try:
                 cost_info = self.operations.calculate_extend_cost(selected_line_name, new_points, extend_from_end, elevation_levels)
@@ -3897,8 +4345,10 @@ class MainWindow(QMainWindow):
                 return
 
             try:
-                
-                result = self.operations.extend_line_complete(selected_line_name, current_player, new_points, extend_from_end, elevation_levels)
+                result = self.operations.extend_line_complete(
+                    selected_line_name, current_player, new_points, extend_from_end,
+                    elevation_levels, cost_info=cost_info,
+                )
                 self.check_and_eliminate_player(current_player)
                 self.add_message(f"Line '{result['line_name']}' extension started.")
                 QMessageBox.information(dlg, "Line Extension Started", 
@@ -3976,63 +4426,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "A line must have at least 2 points")
                 return
 
-            # Show elevation selection dialog
-            required_elevations = len(points) - 1
-            elev_dlg = QDialog(self)
-            elev_dlg.setWindowTitle("Select Elevation Levels")
-            elev_dlg.setGeometry(300, 300, 400, min(600, 180 + required_elevations * 50))
-            elev_layout = QVBoxLayout()
-            elev_layout.addWidget(QLabel(f"Select elevation level for each of {required_elevations} segments:"))
-            elev_layout.addWidget(QLabel("Note: Cannot use 'street' on water"))
-            all_row = QHBoxLayout()
-            all_row.addWidget(QLabel("Apply to all segments:"))
-            all_combo_pt = QComboBox()
-            all_combo_pt.addItems(['street', 'above_ground', 'underground'])
-            all_combo_pt.setCurrentText('street')
-            all_row.addWidget(all_combo_pt)
-            elevation_combos = []
-            def apply_all_pt():
-                for c in elevation_combos:
-                    c.setCurrentText(all_combo_pt.currentText())
-            apply_btn_pt = QPushButton("Apply")
-            apply_btn_pt.clicked.connect(apply_all_pt)
-            all_row.addWidget(apply_btn_pt)
-            all_row.addStretch()
-            elev_layout.addLayout(all_row)
-            
-            from PyQt6.QtWidgets import QScrollArea, QWidget as QWidget2
-            elev_scroll = QScrollArea()
-            elev_scroll.setWidgetResizable(True)
-            elev_widget = QWidget2()
-            elev_widget_layout = QVBoxLayout()
-            elev_widget.setLayout(elev_widget_layout)
-            elev_scroll.setWidget(elev_widget)
-            elev_layout.addWidget(elev_scroll)
-            
-            for i in range(required_elevations):
-                segment_label = QLabel(f"Segment {i+1} (point {i} → {i+1}):")
-                elev_widget_layout.addWidget(segment_label)
-                combo = QComboBox()
-                combo.addItems(['street', 'above_ground', 'underground'])
-                combo.setCurrentText('street')  # Default
-                elev_widget_layout.addWidget(combo)
-                elevation_combos.append(combo)
-            
-            elev_btn_layout = QHBoxLayout()
-            elev_ok_btn = QPushButton("OK")
-            elev_cancel_btn = QPushButton("Cancel")
-            elev_ok_btn.clicked.connect(elev_dlg.accept)
-            elev_cancel_btn.clicked.connect(elev_dlg.reject)
-            elev_btn_layout.addWidget(elev_ok_btn)
-            elev_btn_layout.addWidget(elev_cancel_btn)
-            elev_layout.addLayout(elev_btn_layout)
-            elev_dlg.setLayout(elev_layout)
-            
-            if elev_dlg.exec() != QDialog.DialogCode.Accepted:
+            segment_specs = self.operations.get_line_creation_elevation_specs(points)
+            elevation_levels = self._prompt_route_elevation_levels(
+                segment_specs, parent=points_dialog,
+            )
+            if elevation_levels is None:
                 return
-            
-            # Get elevation levels from combo boxes
-            elevation_levels = [combo.currentText() for combo in elevation_combos]
 
             try:
                 cost_info = self.operations.calculate_line_cost(points, elevation_levels)
@@ -4047,8 +4446,10 @@ class MainWindow(QMainWindow):
                 return
 
             try:
-                
                 result = self.operations.create_line_complete(line_name, points, current_player, elevation_levels)
+                if result and result.get('success') is False:
+                    QMessageBox.warning(self, "Cannot Create Line", result.get('error_message', 'Unknown error'))
+                    return
                 self.check_and_eliminate_player(current_player)
                 self.add_message(f"Line '{line_name}' construction started.")
                 QMessageBox.information(self, "Line Construction Started", 
@@ -4107,12 +4508,97 @@ class MainWindow(QMainWindow):
                     name = self.operations.get_player_name(effective)
                     if effective is not player:
                         name = f"{self.operations.get_player_name(player)} (with {name})"
-                    self.status_money_labels[i].setText(f"{name}: ${money}")
+                    entry = self.status_money_labels[i]
+                    color_idx = self.operations.get_player_color_index(player)
+                    set_status_player_money_display(
+                        entry['swatch'], entry['text'], color_idx, name, money,
+                        row=entry.get('widget'),
+                    )
             for i in range(len(active_players), len(self.status_money_labels)):
                 if i in self.status_money_labels:
-                    self.status_money_labels[i].setText("")
+                    entry = self.status_money_labels[i]
+                    set_status_player_money_display(
+                        entry['swatch'], entry['text'], 0, "", "",
+                        row=entry.get('widget'),
+                    )
+            self._compact_status_bar_height()
         except Exception:
             pass
+
+    def _prompt_route_elevation_levels(
+        self,
+        segment_specs: list,
+        *,
+        is_bus_line: bool = False,
+        parent=None,
+        title: str = "Select Elevation Levels",
+    ):
+        """Prompt for one elevation per spec. Returns list or None if cancelled."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QHBoxLayout, QComboBox, QPushButton, QScrollArea, QWidget
+        from operations import _LAND_SEGMENT_ELEVATIONS
+
+        if not segment_specs:
+            return []
+        dlg_parent = parent if parent is not None else self
+        elev_dlg = QDialog(dlg_parent)
+        elev_dlg.setWindowTitle(title)
+        elev_dlg.setGeometry(300, 300, 400, min(600, 180 + len(segment_specs) * 50))
+        elev_layout = QVBoxLayout()
+        elev_layout.addWidget(QLabel(f"Select elevation for each of {len(segment_specs)} segment(s):"))
+        elev_layout.addWidget(QLabel("Over-water segments: above-ground or underground only (default above-ground)."))
+        all_row = QHBoxLayout()
+        all_row.addWidget(QLabel("Apply to all:"))
+        all_combo = QComboBox()
+        all_combo.addItems(list(_LAND_SEGMENT_ELEVATIONS))
+        all_combo.setCurrentText('street')
+        all_row.addWidget(all_combo)
+        elevation_combos = []
+
+        def apply_all():
+            choice = all_combo.currentText()
+            for combo in elevation_combos:
+                idx = combo.findText(choice)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(apply_all)
+        all_row.addWidget(apply_btn)
+        all_row.addStretch()
+        elev_layout.addLayout(all_row)
+
+        elev_scroll = QScrollArea()
+        elev_scroll.setWidgetResizable(True)
+        elev_widget = QWidget()
+        elev_widget_layout = QVBoxLayout()
+        elev_widget.setLayout(elev_widget_layout)
+        elev_scroll.setWidget(elev_widget)
+        elev_layout.addWidget(elev_scroll)
+
+        for spec in segment_specs:
+            elev_widget_layout.addWidget(QLabel(spec['label']))
+            choices, default = self.operations.get_segment_elevation_options(
+                spec['p1'], spec['p2'], is_bus_line=is_bus_line,
+            )
+            combo = QComboBox()
+            combo.addItems(choices)
+            combo.setCurrentText(default if default in choices else choices[0])
+            elev_widget_layout.addWidget(combo)
+            elevation_combos.append(combo)
+
+        elev_btn_layout = QHBoxLayout()
+        elev_ok_btn = QPushButton("OK")
+        elev_cancel_btn = QPushButton("Cancel")
+        elev_ok_btn.clicked.connect(elev_dlg.accept)
+        elev_cancel_btn.clicked.connect(elev_dlg.reject)
+        elev_btn_layout.addWidget(elev_ok_btn)
+        elev_btn_layout.addWidget(elev_cancel_btn)
+        elev_layout.addLayout(elev_btn_layout)
+        elev_dlg.setLayout(elev_layout)
+
+        if elev_dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return [combo.currentText() for combo in elevation_combos]
 
     def refresh_all_displays(self):
         """Refresh all UI displays. Uses assigned_player for government when in network mode."""
@@ -4295,20 +4781,20 @@ class MainWindow(QMainWindow):
         self._apply_advance_year_result(result, ai_results_list)
 
     def _show_ai_build_failure_popup(self, ai_build_failures: list):
-        """Show chat message and popup when AI(s) could not build on required street polylines."""
+        """Show chat message and popup for AI build failures and debug issues."""
         from PyQt6.QtWidgets import QMessageBox
         lines = []
         for player_name, err in ai_build_failures:
             lines.append(f"• {player_name}: {err}")
-            self.add_message(f"AI build failure ({player_name}): {err}")
+            self.add_message(f"AI issue ({player_name}): {err}")
         msg = (
-            "AI could not build a line on this turn.\n\n"
-            "Reason:\n" + "\n".join(lines) + "\n\n"
-            "On OSM maps (NYC, NY Metro), the AI must build on street polylines. "
-            "Straight lines between population points are not allowed. "
-            "If no valid street route was found, the AI skips building and reports the failure here."
+            "AI reported one or more issues this turn.\n\n"
+            + "\n".join(lines)
+            + "\n\n"
+            "On OSM maps, lines must follow street polylines. "
+            "Disable AI debug notifications in Game → AI settings if these alerts are not needed."
         )
-        QMessageBox.warning(self, "AI Build Failure", msg)
+        QMessageBox.warning(self, "AI Issue", msg)
 
     def _apply_advance_year_result(self, result, ai_results_list):
         """Apply advance year result: update UI, show dialogs. AI actions are not shown in messages."""
@@ -4781,68 +5267,7 @@ class MainWindow(QMainWindow):
                 self.operations.set_current_player_index(current_player_index)
                 
                 if self.status_bar is None:
-                    central_layout = self.centralWidget().layout()
-                    self.status_bar = QWidget()
-                    self.status_bar_layout = QHBoxLayout()
-                    self.status_bar.setLayout(self.status_bar_layout)
-                    self.status_year_label = QLabel("Year: 1830")
-                    self.status_end_year_btn = QPushButton("End Year")
-                    self.status_end_year_btn.clicked.connect(self.advance_year_button_clicked)
-                    self.status_bar_layout.addWidget(self.status_year_label)
-                    for i in range(8):
-                        money_label = QLabel("")
-                        money_label.setWordWrap(True)
-                        money_label.setMaximumWidth(140)
-                        self.status_money_labels[i] = money_label
-                        self.status_bar_layout.addWidget(money_label)
-                    self.status_bar_layout.addStretch()
-                    self.status_end_year_timer_label = QLabel("")
-                    self.status_end_year_timer_label.setVisible(False)
-                    self.status_bar_layout.addWidget(self.status_end_year_timer_label)
-                    self.status_bar_layout.addWidget(self.status_end_year_btn)
-                    self.status_save_game_btn = QPushButton("Save Game")
-                    self.status_save_game_btn.clicked.connect(self.on_save_game_clicked)
-                    self.status_bar_layout.addWidget(self.status_save_game_btn)
-                    self.status_end_game_btn = QPushButton("End Game")
-                    self.status_end_game_btn.clicked.connect(self.on_end_game_clicked)
-                    self.status_bar_layout.addWidget(self.status_end_game_btn)
-                    messages_widget = QWidget()
-                    messages_layout = QVBoxLayout()
-                    messages_widget.setLayout(messages_layout)
-                    self.status_messages_list = QListWidget()
-                    self.status_messages_list.setMaximumHeight(56)
-                    self.status_messages_list.setMaximumWidth(220)
-                    self.status_messages_list.setMinimumWidth(150)
-                    for m in self._get_visible_messages()[-5:]:
-                        self.status_messages_list.insertItem(0, QListWidgetItem(str(m)))
-                    self._message_widgets.append(self.status_messages_list)
-                    messages_layout.addWidget(self.status_messages_list)
-                    chat_row = QHBoxLayout()
-                    self.status_chat_input = QLineEdit()
-                    self.status_chat_input.setPlaceholderText("Chat...")
-                    self.status_chat_input.setMaximumWidth(150)
-                    self.status_chat_input.setMaximumHeight(24)
-                    chat_send_btn = QPushButton("Send")
-                    chat_send_btn.setMaximumHeight(24)
-                    def _on_chat_send():
-                        text = self.status_chat_input.text().strip()
-                        if not text:
-                            return
-                        if getattr(self, 'is_network_mode', False) and getattr(self, 'network_client', None) and self.network_client.connected_flag:
-                            self.network_client.send_chat(text)
-                            self.status_chat_input.clear()
-                        elif self.operations:
-                            cp = self.operations.get_current_player(self.current_player_index)
-                            name = self.operations.get_player_name(cp) if cp else "Player"
-                            self.add_message(f"{name}: {text}")
-                            self.status_chat_input.clear()
-                    chat_send_btn.clicked.connect(_on_chat_send)
-                    self.status_chat_input.returnPressed.connect(_on_chat_send)
-                    chat_row.addWidget(self.status_chat_input)
-                    chat_row.addWidget(chat_send_btn)
-                    messages_layout.addLayout(chat_row)
-                    self.status_bar_layout.addWidget(messages_widget)
-                    central_layout.addWidget(self.status_bar)
+                    self._attach_game_status_bar(self.centralWidget().layout())
                 
                 try:
                     self.tabs.removeTab(0)
@@ -4853,6 +5278,8 @@ class MainWindow(QMainWindow):
                 self.save_game_action.setEnabled(True)
                 self.advance_year_action.setEnabled(True)
                 self.refresh_displays_action.setEnabled(True)
+                if hasattr(self, 'game_settings_action'):
+                    self.game_settings_action.setEnabled(True)
                 
                 QMessageBox.information(dlg, "Game Loaded", f"Game '{save_combo.currentText()}' loaded successfully.")
                 dlg.close()
@@ -4886,6 +5313,7 @@ class MainWindow(QMainWindow):
         self._create_vehicles_tab()
         first_human_idx = next((i for i, p in enumerate(players) if not getattr(p, 'is_ai', False)), 0)
         self.current_player_index = self.operations.get_player_id(players[first_human_idx])
+        self._our_player_id = self.current_player_index
         self.tabs.setCurrentIndex(first_human_idx)
         if players:
             first_player = players[first_human_idx]
@@ -4956,6 +5384,7 @@ class MainWindow(QMainWindow):
                 self.refresh_construction_tab()
         self._apply_view_tab_visibility()
         self._remove_game_tab_close_button()
+        self._remove_assigned_player_tab_close_button()
         try:
             self.tabs.currentChanged.disconnect()
         except Exception:
@@ -5280,6 +5709,61 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", str(e))
             if "Out of Stock" in str(e) or "no longer available" in str(e):
                 self.DisplayMarketplaceInfo()
+
+    def buy_line_from_marketplace(self, sale_item):
+        self._ensure_correct_player()
+        current_player = self.operations.get_current_player(self.current_player_index)
+        if not current_player:
+            QMessageBox.warning(self, "No Active Players", "No active players remaining.")
+            return
+
+        current_year = self.operations.get_year()
+        if self.is_network_mode and self.network_client:
+            try:
+                marketplace = self.operations.game.get_marketplace()
+                sale_items = marketplace.get_available_items(current_year)
+                item_index = None
+                for i, si in enumerate(sale_items):
+                    if si == sale_item or (
+                        si.get_item() == sale_item.get_item()
+                        and si.get_seller() == sale_item.get_seller()
+                    ):
+                        item_index = i
+                        break
+                if item_index is None:
+                    QMessageBox.warning(self, "Error", "Could not find line in marketplace")
+                    return
+                self.network_client.buy_trainset(str(item_index))
+                QMessageBox.information(self, "Purchase Requested", "Purchase request sent to server. Waiting for confirmation...")
+            except Exception as e:
+                QMessageBox.warning(self, "Network Error", f"Failed to send purchase request: {str(e)}")
+            return
+        try:
+            line = sale_item.get_item()
+            line_name = getattr(line, 'name', 'Line')
+            price = self.operations.get_effective_marketplace_price_for_player(
+                current_player, sale_item.get_price(current_year=current_year),
+            )
+            purchased = self.operations.buy_line_by_purchase(sale_item, current_player)
+            if not purchased:
+                QMessageBox.warning(self, "Purchase Failed", "Insufficient funds or line unavailable.")
+                return
+            self.DisplayMarketplaceInfo()
+            self.update_status_bar()
+            self.DisplayLinesControls(current_player)
+            self._schedule_ai_map_refresh()
+            QApplication.processEvents()
+            self.check_and_eliminate_player(current_player)
+            self.add_message(f"Purchased line '{purchased.name}' for ${price}.")
+            QMessageBox.information(
+                self,
+                "Line Purchased",
+                f"Line '{purchased.name}' purchased for ${price}.\n"
+                f"Remaining Money: ${self.operations.get_player_money(current_player)}",
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+            self.DisplayMarketplaceInfo()
     
     def on_assemble_trainset_clicked(self):
         
@@ -5663,7 +6147,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel(f"Route Length: {stats['route_length']} segments"))
         layout.addWidget(QLabel(f"Stations: {stats['num_stations']}"))
         layout.addWidget(QLabel(f"Vehicles: {stats['num_vehicles']}"))
-        layout.addWidget(QLabel(f"Fare: ${stats['fare']}"))
+        from inflation_utils import format_fare_display
+        layout.addWidget(QLabel(f"Fare: {format_fare_display(stats['fare'])}"))
         layout.addWidget(QLabel(f"Profit (this year): ${stats['profit']}"))
         layout.addWidget(QLabel(f"Maintenance: ${stats['maintenance']}"))
         
@@ -5678,34 +6163,46 @@ class MainWindow(QMainWindow):
             if hasattr(line, 'schedule') and hasattr(line, 'set_schedule_frequency'):
                 schedule_group = QGroupBox("Schedule (trains/hour)")
                 schedule_layout = QHBoxLayout()
+                import math
+                def schedule_spin_max(period: str) -> int:
+                    if hasattr(line, 'get_max_frequency_per_hour'):
+                        return max(0, int(math.ceil(line.get_max_frequency_per_hour(period))))
+                    return 60
                 peak_label = QLabel("Peak:")
                 peak_spin = QSpinBox()
                 peak_spin.setMinimum(0)
-                peak_spin.setMaximum(60)
-                peak_spin.setValue(int(getattr(line, 'schedule', {}).get('peak', 4)))
+                peak_spin.setMaximum(schedule_spin_max('peak'))
+                peak_spin.setValue(min(int(getattr(line, 'schedule', {}).get('peak', 4)), peak_spin.maximum()))
                 schedule_layout.addWidget(peak_label)
                 schedule_layout.addWidget(peak_spin)
                 off_peak_label = QLabel("Off Peak:")
                 off_peak_spin = QSpinBox()
                 off_peak_spin.setMinimum(0)
-                off_peak_spin.setMaximum(60)
-                off_peak_spin.setValue(int(getattr(line, 'schedule', {}).get('off_peak', 2)))
+                off_peak_spin.setMaximum(schedule_spin_max('off_peak'))
+                off_peak_spin.setValue(min(int(getattr(line, 'schedule', {}).get('off_peak', 2)), off_peak_spin.maximum()))
                 schedule_layout.addWidget(off_peak_label)
                 schedule_layout.addWidget(off_peak_spin)
                 night_label = QLabel("Night:")
                 night_spin = QSpinBox()
                 night_spin.setMinimum(0)
-                night_spin.setMaximum(60)
-                night_spin.setValue(int(getattr(line, 'schedule', {}).get('night', 1)))
+                night_spin.setMaximum(schedule_spin_max('night'))
+                night_spin.setValue(min(int(getattr(line, 'schedule', {}).get('night', 1)), night_spin.maximum()))
                 schedule_layout.addWidget(night_label)
                 schedule_layout.addWidget(night_spin)
-                max_freq_label = QLabel(f"Max: {int(line.get_max_frequency_per_hour('peak'))}/hr" if hasattr(line, 'get_max_frequency_per_hour') else "")
+                max_freq_label = QLabel(
+                    f"Max: {int(line.get_max_frequency_per_hour('peak'))}/hr"
+                    if hasattr(line, 'get_max_frequency_per_hour') else ""
+                )
                 schedule_layout.addWidget(max_freq_label)
                 if hasattr(line, 'upgrade_tracks') and hasattr(line, 'num_tracks'):
                     upgrade_tracks_btn = QPushButton("Add Track")
                     upgrade_tracks_btn.setToolTip(f"Current tracks: {getattr(line, 'num_tracks', 1)}")
                     def upgrade_tracks():
                         line.upgrade_tracks(1)
+                        for spin, period in (
+                            (peak_spin, 'peak'), (off_peak_spin, 'off_peak'), (night_spin, 'night')
+                        ):
+                            spin.setMaximum(schedule_spin_max(period))
                         max_freq_label.setText(f"Max: {int(line.get_max_frequency_per_hour('peak'))}/hr")
                         upgrade_tracks_btn.setToolTip(f"Current tracks: {getattr(line, 'num_tracks', 1)}")
                     upgrade_tracks_btn.clicked.connect(upgrade_tracks)
@@ -5714,6 +6211,15 @@ class MainWindow(QMainWindow):
                     line.set_schedule_frequency('peak', peak_spin.value())
                     line.set_schedule_frequency('off_peak', off_peak_spin.value())
                     line.set_schedule_frequency('night', night_spin.value())
+                    for spin, period in (
+                        (peak_spin, 'peak'), (off_peak_spin, 'off_peak'), (night_spin, 'night')
+                    ):
+                        spin.setMaximum(schedule_spin_max(period))
+                        actual = int(line.schedule.get(period, 0))
+                        if spin.value() != actual:
+                            spin.blockSignals(True)
+                            spin.setValue(actual)
+                            spin.blockSignals(False)
                     if hasattr(line, 'get_max_frequency_per_hour'):
                         max_freq_label.setText(f"Max: {int(line.get_max_frequency_per_hour('peak'))}/hr")
                 peak_spin.valueChanged.connect(update_schedule)
@@ -5724,9 +6230,9 @@ class MainWindow(QMainWindow):
             
             extend_layout = QVBoxLayout()
             extend_layout.addWidget(QLabel("Extend Line:"))
-            direction_combo = QComboBox()
-            direction_combo.addItems(["End of line", "Beginning of line"])
-            extend_layout.addWidget(direction_combo)
+            extend_layout.addWidget(QLabel(
+                "First point attaches to the closer line end; each next point connects to the prior point."
+            ))
             
             from PyQt6.QtWidgets import QTextEdit
             points_text = QTextEdit()
@@ -5760,65 +6266,18 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(dlg, "Error", "No valid points entered.")
                     return
                 
-                extend_from_end = direction_combo.currentText() == "End of line"
-                
-                # Show elevation selection dialog
-                required_elevations = len(new_points)
-                elev_dlg = QDialog(self)
-                elev_dlg.setWindowTitle("Select Elevation Levels")
-                elev_dlg.setGeometry(300, 300, 400, min(600, 180 + required_elevations * 50))
-                elev_layout = QVBoxLayout()
-                elev_layout.addWidget(QLabel(f"Select elevation level for each of {required_elevations} points:"))
-                elev_layout.addWidget(QLabel("Note: Cannot use 'street' on water"))
-                all_seg_row2 = QHBoxLayout()
-                all_seg_row2.addWidget(QLabel("Apply to all:"))
-                all_combo_ext2 = QComboBox()
-                all_combo_ext2.addItems(['street', 'above_ground', 'underground'])
-                all_combo_ext2.setCurrentText('street')
-                all_seg_row2.addWidget(all_combo_ext2)
-                elevation_combos = []
-                def apply_all_ext2():
-                    for c in elevation_combos:
-                        c.setCurrentText(all_combo_ext2.currentText())
-                apply_btn_ext2 = QPushButton("Apply")
-                apply_btn_ext2.clicked.connect(apply_all_ext2)
-                all_seg_row2.addWidget(apply_btn_ext2)
-                all_seg_row2.addStretch()
-                elev_layout.addLayout(all_seg_row2)
-                
-                from PyQt6.QtWidgets import QScrollArea, QWidget as QWidget2
-                elev_scroll = QScrollArea()
-                elev_scroll.setWidgetResizable(True)
-                elev_widget = QWidget2()
-                elev_widget_layout = QVBoxLayout()
-                elev_widget.setLayout(elev_widget_layout)
-                elev_scroll.setWidget(elev_widget)
-                elev_layout.addWidget(elev_scroll)
-                
-                for i in range(required_elevations):
-                    point_label = QLabel(f"Point {i+1} ({new_points[i][0]:.1f}, {new_points[i][1]:.1f}):")
-                    elev_widget_layout.addWidget(point_label)
-                    combo = QComboBox()
-                    combo.addItems(['street', 'above_ground', 'underground'])
-                    combo.setCurrentText('street')  # Default
-                    elev_widget_layout.addWidget(combo)
-                    elevation_combos.append(combo)
-                
-                elev_btn_layout = QHBoxLayout()
-                elev_ok_btn = QPushButton("OK")
-                elev_cancel_btn = QPushButton("Cancel")
-                elev_ok_btn.clicked.connect(elev_dlg.accept)
-                elev_cancel_btn.clicked.connect(elev_dlg.reject)
-                elev_btn_layout.addWidget(elev_ok_btn)
-                elev_btn_layout.addWidget(elev_cancel_btn)
-                elev_layout.addLayout(elev_btn_layout)
-                elev_dlg.setLayout(elev_layout)
-                
-                if elev_dlg.exec() != QDialog.DialogCode.Accepted:
+                extend_from_end = self.operations.extension_attach_from_closest_end(
+                    line_name, new_points[0],
+                )
+
+                segment_specs = self.operations.get_extension_elevation_specs(
+                    line_name, new_points, extend_from_end,
+                )
+                elevation_levels = self._prompt_route_elevation_levels(
+                    segment_specs, parent=dlg,
+                )
+                if elevation_levels is None:
                     return
-                
-                # Get elevation levels from combo boxes
-                elevation_levels = [combo.currentText() for combo in elevation_combos]
                 
                 try:
                     cost_info = self.operations.calculate_extend_cost(line_name, new_points, extend_from_end, elevation_levels)
@@ -5833,7 +6292,10 @@ class MainWindow(QMainWindow):
                     return
                 
                 try:
-                    result = self.operations.extend_line_complete(line_name, current_player, new_points, extend_from_end, elevation_levels)
+                    result = self.operations.extend_line_complete(
+                        line_name, current_player, new_points, extend_from_end,
+                        elevation_levels, cost_info=cost_info,
+                    )
                     self.check_and_eliminate_player(current_player)
                     QMessageBox.information(dlg, "Line Extension Started", 
                         f"Extension of line '{result['line_name']}' has been started.\n"
@@ -6146,28 +6608,145 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def on_modify_trainset_for_trainset(self, trainset, player):
-        """Open disassemble dialog for this specific trainset (Modify button)."""
+        """Modify trainset: swap locomotive, add/remove railcars, or disassemble entirely."""
         current_player = self.operations.get_current_player(self.current_player_index)
-        if not current_player or current_player != player:
+        if not current_player or self.operations.get_player_id(current_player) != self.operations.get_player_id(player):
             current_player = player
-        disassemble_info = self.operations.get_disassemble_info(current_player)
-        if not disassemble_info['trainsets'] or trainset not in disassemble_info['trainsets']:
+        if trainset not in self.operations.get_player_trainsets(current_player):
             QMessageBox.information(self, "No Trainsets", "This trainset is no longer available.")
             return
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Modify Trainset (Disassemble)")
-        dlg.setGeometry(200, 200, 400, 200)
-        l = QVBoxLayout()
+
+        try:
+            info = self.operations.get_modify_trainset_info(current_player, trainset)
+        except ValueError as e:
+            QMessageBox.warning(self, "Modify Trainset", str(e))
+            return
+
+        loco = info.get('locomotive')
         loco_name = self.operations.get_trainset_locomotive_name(trainset)
-        num_cars = len(self.operations.get_trainset_cars(trainset))
-        l.addWidget(QLabel(f"Disassemble: {loco_name} ({num_cars} cars) into locomotive and railcars?"))
+        cars = info.get('cars') or []
+        max_cars = info.get('max_cars', 5)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Modify Trainset")
+        dlg.setGeometry(220, 220, 520, 420)
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(f"<b>{loco_name}</b> — {len(cars)}/{max_cars} railcars, capacity {self.operations.get_trainset_capacity(trainset)}"))
+        if cars:
+            car_names = ", ".join(self.operations.get_vehicle_name(c) for c in cars)
+            layout.addWidget(QLabel(f"Railcars: {car_names}"))
+        else:
+            layout.addWidget(QLabel("Railcars: none"))
+
+        # Replace locomotive
+        compat_locos = info.get('compatible_locomotives') or []
+        loco_combo = None
+        if compat_locos:
+            loco_row = QHBoxLayout()
+            loco_row.addWidget(QLabel("Replace locomotive:"))
+            loco_combo = QComboBox()
+            for l in compat_locos:
+                loco_combo.addItem(getattr(l, 'name', 'Locomotive'), l)
+            loco_row.addWidget(loco_combo)
+            replace_loco_btn = QPushButton("Replace")
+            loco_row.addWidget(replace_loco_btn)
+            layout.addLayout(loco_row)
+
+            def do_replace_loco():
+                new_loco = loco_combo.currentData()
+                if not new_loco:
+                    return
+                try:
+                    result = self.operations.replace_trainset_locomotive_for_player(
+                        current_player, trainset, new_loco,
+                    )
+                    self.add_message(
+                        f"Locomotive replaced: {result['old_locomotive_name']} → {result['new_locomotive_name']}"
+                    )
+                    QMessageBox.information(
+                        dlg, "Locomotive Replaced",
+                        f"Swapped to {result['new_locomotive_name']}.\nCapacity: {result['capacity']}",
+                    )
+                    dlg.close()
+                    self.DisplayRollingStockInfo(current_player)
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Cannot Replace Locomotive", str(e))
+
+            replace_loco_btn.clicked.connect(do_replace_loco)
+
+        # Add railcar
+        compat_cars = info.get('compatible_railcars') or []
+        if info.get('can_add_cars') and compat_cars:
+            add_row = QHBoxLayout()
+            add_row.addWidget(QLabel("Add railcar:"))
+            add_car_combo = QComboBox()
+            for c in compat_cars:
+                add_car_combo.addItem(
+                    f"{self.operations.get_vehicle_name(c)} (cap {self.operations.get_vehicle_capacity(c)})", c,
+                )
+            add_row.addWidget(add_car_combo)
+            add_car_btn = QPushButton("Add")
+            add_row.addWidget(add_car_btn)
+            layout.addLayout(add_row)
+
+            def do_add_car():
+                car = add_car_combo.currentData()
+                if not car:
+                    return
+                try:
+                    result = self.operations.add_railcar_to_trainset_for_player(current_player, trainset, car)
+                    QMessageBox.information(
+                        dlg, "Railcar Added",
+                        f"Capacity: {result['capacity']} ({result['cars_count']}/{max_cars} cars)",
+                    )
+                    dlg.close()
+                    self.DisplayRollingStockInfo(current_player)
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Cannot Add Railcar", str(e))
+
+            add_car_btn.clicked.connect(do_add_car)
+
+        # Remove railcar
+        if info.get('can_remove_cars') and cars:
+            rem_row = QHBoxLayout()
+            rem_row.addWidget(QLabel("Remove railcar:"))
+            rem_car_combo = QComboBox()
+            for c in cars:
+                rem_car_combo.addItem(self.operations.get_vehicle_name(c), c)
+            rem_row.addWidget(rem_car_combo)
+            rem_car_btn = QPushButton("Remove")
+            rem_row.addWidget(rem_car_btn)
+            layout.addLayout(rem_row)
+
+            def do_remove_car():
+                car = rem_car_combo.currentData()
+                if not car:
+                    return
+                try:
+                    result = self.operations.remove_railcar_from_trainset_for_player(
+                        current_player, trainset, railcar=car,
+                    )
+                    QMessageBox.information(
+                        dlg, "Railcar Removed",
+                        f"Removed {result['railcar_name']}.\nCapacity: {result['capacity']}",
+                    )
+                    dlg.close()
+                    self.DisplayRollingStockInfo(current_player)
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Cannot Remove Railcar", str(e))
+
+            rem_car_btn.clicked.connect(do_remove_car)
+
+        layout.addWidget(QLabel(""))
+        disassemble_btn = QPushButton("Disassemble Entire Trainset")
+        layout.addWidget(disassemble_btn)
+
         btn_layout = QHBoxLayout()
-        ok = QPushButton("Disassemble")
-        cancel = QPushButton("Cancel")
-        btn_layout.addWidget(ok)
-        btn_layout.addWidget(cancel)
-        l.addLayout(btn_layout)
-        dlg.setLayout(l)
+        close_btn = QPushButton("Close")
+        btn_layout.addStretch()
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+        dlg.setLayout(layout)
 
         def do_disassemble():
             line_name = self.operations.get_trainset_line_assignment(trainset)
@@ -6175,13 +6754,13 @@ class MainWindow(QMainWindow):
                 reply = QMessageBox.question(
                     dlg, "Trainset Assigned",
                     f"This trainset is assigned to line '{line_name}'. Disassembling will unassign it. Continue?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
                 if reply != QMessageBox.StandardButton.Yes:
                     return
                 self.operations.unassign_trainset_from_line(trainset, None)
             locomotive = self.operations.get_trainset_locomotive(trainset)
-            railcars = self.operations.get_trainset_cars(trainset)
+            railcars = list(self.operations.get_trainset_cars(trainset))
             self.operations.remove_player_trainset(current_player, trainset)
             if locomotive:
                 self.operations.acquire_locomotive_for_player(current_player, locomotive)
@@ -6190,14 +6769,14 @@ class MainWindow(QMainWindow):
             self.add_message("Trainset disassembled.")
             QMessageBox.information(
                 dlg, "Trainset Disassembled",
-                f"Trainset disassembled!\nLocomotive: {locomotive.name if locomotive else 'None'}\n"
-                f"Railcars: {len(railcars)}\nYou can now use these components to assemble new trainsets."
+                f"Locomotive: {locomotive.name if locomotive else 'None'}\n"
+                f"Railcars returned: {len(railcars)}",
             )
             dlg.close()
             self.DisplayRollingStockInfo(current_player)
 
-        ok.clicked.connect(do_disassemble)
-        cancel.clicked.connect(dlg.close)
+        disassemble_btn.clicked.connect(do_disassemble)
+        close_btn.clicked.connect(dlg.close)
         dlg.exec()
 
     def on_unassign_trainset_for_trainset(self, trainset, player):
@@ -6568,14 +7147,17 @@ class MainWindow(QMainWindow):
                 return
             
             
-            if self.operations.add_railcar_to_trainset(selected_trainset, selected_railcar):
-                
-                railcars.remove(selected_railcar)
-                QMessageBox.information(dlg, "Railcar Added", 
-                    f"Railcar added to trainset!\nNew capacity: {self.operations.get_trainset_capacity(selected_trainset)}\nRailcars: {len(self.operations.get_trainset_cars(selected_trainset))}/{max_cars}")
+            try:
+                result = self.operations.add_railcar_to_trainset_for_player(
+                    current_player, selected_trainset, selected_railcar,
+                )
+                QMessageBox.information(dlg, "Railcar Added",
+                    f"Railcar added to trainset!\nNew capacity: {result['capacity']}\n"
+                    f"Railcars: {result['cars_count']}/{max_cars}")
                 dlg.close()
-            else:
-                QMessageBox.warning(dlg, "Error", "Failed to add railcar. Trainset may be at maximum capacity.")
+                self.DisplayRollingStockInfo(current_player)
+            except Exception as e:
+                QMessageBox.warning(dlg, "Error", str(e))
         
         add_btn.clicked.connect(do_add)
         cancel_btn.clicked.connect(dlg.close)
@@ -6830,7 +7412,22 @@ class MainWindow(QMainWindow):
                             sale_text = f" <span style='color: red; font-weight: bold;'>SALE: {sale_item.discount_percent}% OFF (was ${original_price})</span>"
                         line_info = QLabel(f"• {line_name}: ${price} (Qty: {total_qty}) | Seller: {seller}{sale_text}")
                         line_info.setTextFormat(Qt.TextFormat.RichText)
-                        marketplace_lines_layout.addWidget(line_info)
+                        item_layout = QHBoxLayout()
+                        item_layout.addWidget(line_info)
+                        if total_qty > 0 and not for_other_player:
+                            buy_button = QPushButton("Buy")
+                            first_available = next(
+                                (si for si in sale_items if si.get_quantity_available() > 0),
+                                sale_items[0],
+                            )
+                            buy_button.clicked.connect(
+                                lambda checked, si=first_available: self.buy_line_from_marketplace(si)
+                            )
+                            item_layout.addWidget(buy_button)
+                        item_layout.addStretch()
+                        item_widget = QWidget()
+                        item_widget.setLayout(item_layout)
+                        marketplace_lines_layout.addWidget(item_widget)
                 else:
                     no_lines_label = QLabel("No lines available")
                     marketplace_lines_layout.addWidget(no_lines_label)
@@ -7273,7 +7870,11 @@ class MainWindow(QMainWindow):
                               f"Not enough money. Need ${total_cost} for {quantity} {worker_type.name}(s).")
             return
         
-        self.operations.rent_workers_for_player(current_player, worker_type, quantity, current_year)
+        try:
+            self.operations.rent_workers_for_player(current_player, worker_type, quantity, current_year)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot Hire Workers", str(e))
+            return
         self.operations.marketplace_deduct_worker_supply(worker_type.name, quantity)
         self.operations.deduct_player_money(current_player, total_cost, reason='Worker rental')
         # Update display immediately so user sees new money before modal dialog
@@ -7469,7 +8070,356 @@ class MainWindow(QMainWindow):
             dlg.exec()
 
     
-    def DisplayMapInfo(self):
+    def _build_map_overview_text(self, game_map) -> str:
+        """Build sidebar map overview text without regenerating map HTML."""
+        all_lines = self.operations.get_map_lines()
+        map_info_text = "Map Overview\n\n"
+        preset_name = getattr(game_map, 'map_preset_name', None)
+        if preset_name:
+            from map_preset_loader import get_map_display_name
+            display_name = get_map_display_name(preset_name)
+            map_info_text += f"Map Type: {display_name or preset_name}\n"
+        else:
+            map_info_text += "Map Type: Standard\n"
+        if hasattr(game_map, 'width') and hasattr(game_map, 'height'):
+            map_info_text += f"Size: {game_map.width}x{game_map.height}\n"
+        if hasattr(game_map, 'start_year') and hasattr(game_map, 'end_year'):
+            start_year = game_map.start_year
+            end_year = game_map.end_year
+            if start_year is not None and end_year is not None:
+                map_info_text += f"Timeline: {start_year}-{end_year}\n"
+        total_population = 0
+        if hasattr(game_map, 'population') and game_map.population:
+            total_population = sum(pop for pop in game_map.population.values() if pop > 0)
+        map_info_text += f"Total Population: {total_population:,}\n"
+        map_info_text += f"\nTotal Lines: {len(all_lines) if all_lines else 0}\n"
+        if all_lines:
+            for line_name, line in all_lines.items():
+                owner = self.operations.get_line_owner(line)
+                owner_name = self.operations.get_player_name(owner) if owner else "Unclaimed"
+                num_stations = len(self.operations.get_line_stations(line))
+                num_trainsets = len(self.operations.get_line_vehicles(line))
+                line_type_str = "Train"
+                try:
+                    from line import Ferry, Bus
+                    if isinstance(line, Ferry):
+                        line_type_str = "Ferry"
+                    elif isinstance(line, Bus):
+                        line_type_str = "Bus"
+                except Exception:
+                    pass
+                map_info_text += f"\n{line_name} ({owner_name})\n"
+                map_info_text += f"  Type: {line_type_str}\n"
+                map_info_text += f"  Stations: {num_stations}\n"
+                map_info_text += f"  Trainsets: {num_trainsets}\n"
+        return map_info_text
+
+    def _update_map_sidebars(self, map_info_text: str) -> None:
+        """Update map sidebar text and line combos without reloading map HTML."""
+        if not hasattr(self, 'player_tabs_dict') or not self.player_tabs_dict:
+            return
+        all_lines = self.operations.get_map_lines()
+        first_value = next(iter(self.player_tabs_dict.values()))
+        if not isinstance(first_value, dict):
+            return
+        for player_id, player_tabs_dict in self.player_tabs_dict.items():
+            map_info_text_widget = player_tabs_dict.get('map_info_text')
+            if map_info_text_widget:
+                map_info_text_widget.setText(map_info_text)
+            station_line_combo = player_tabs_dict.get('station_line_combo')
+            current_player = None
+            current_player_id = None
+            players = self.operations.get_players()
+            for p in players:
+                if self.operations.get_player_id(p) == player_id:
+                    current_player = p
+                    current_player_id = self.operations.get_player_id(current_player)
+                    break
+            if station_line_combo:
+                station_line_combo.clear()
+                station_line_combo.addItem("Select line...")
+                if current_player and current_player_id is not None:
+                    line_names_set = set()
+                    if all_lines:
+                        for line_name, line in all_lines.items():
+                            owner = self.operations.get_line_owner(line)
+                            if owner and self.operations.get_player_id(owner) == current_player_id:
+                                if line_name not in line_names_set:
+                                    station_line_combo.addItem(line_name, line)
+                                    line_names_set.add(line_name)
+                    build_queue = self.operations.get_build_queue()
+                    for build in build_queue:
+                        if build.get('type') == 'line' and build.get('player'):
+                            build_player_id = self.operations.get_player_id(build.get('player'))
+                            if build_player_id == current_player_id:
+                                line_name = build.get('data', {}).get('name')
+                                if line_name and line_name not in line_names_set:
+                                    station_line_combo.addItem(line_name, None)
+                                    line_names_set.add(line_name)
+            extend_line_combo = player_tabs_dict.get('extend_line_combo')
+            if extend_line_combo:
+                extend_line_combo.clear()
+                extend_line_combo.addItem("Select line...")
+                if current_player:
+                    extend_line_names_set = set()
+                    if all_lines:
+                        for line_name, line in all_lines.items():
+                            owner = self.operations.get_line_owner(line)
+                            if owner and self.operations.get_player_id(owner) == current_player_id:
+                                if line_name not in extend_line_names_set:
+                                    extend_line_combo.addItem(line_name, line)
+                                    extend_line_names_set.add(line_name)
+                    build_queue = self.operations.get_build_queue()
+                    for build in build_queue:
+                        if build.get('type') == 'line' and build.get('player'):
+                            build_player_id = self.operations.get_player_id(build.get('player'))
+                            if build_player_id == current_player_id:
+                                line_name = build.get('data', {}).get('name')
+                                if line_name and line_name not in extend_line_names_set:
+                                    extend_line_combo.addItem(line_name, None)
+                                    extend_line_names_set.add(line_name)
+
+    def _build_map_lines_overlay_data(self, game_map) -> list:
+        """Build line overlay data for lightweight map refresh after line creation."""
+        import math
+        from map_preset_loader import get_map_bounds, get_default_center_lat, get_default_center_lon
+
+        preset_name = getattr(game_map, 'map_preset_name', None)
+        preset_bounds = get_map_bounds(preset_name) if preset_name else None
+        center_lat = (
+            game_map.map_center_lat
+            if hasattr(game_map, 'map_center_lat') and game_map.map_center_lat is not None
+            else get_default_center_lat(preset_name)
+        )
+        center_lon = (
+            game_map.map_center_lon
+            if hasattr(game_map, 'map_center_lon') and game_map.map_center_lon is not None
+            else get_default_center_lon(preset_name)
+        )
+        if preset_bounds and all(k in preset_bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon')):
+            min_lat, max_lat = preset_bounds['min_lat'], preset_bounds['max_lat']
+            min_lon, max_lon = preset_bounds['min_lon'], preset_bounds['max_lon']
+        else:
+            min_lat, max_lat = center_lat - 0.5, center_lat + 0.5
+            min_lon, max_lon = center_lon - 0.5, center_lon + 0.5
+
+        lines_data = []
+        map_width_val = game_map.width if getattr(game_map, 'width', None) else 50
+        map_height_val = game_map.height if getattr(game_map, 'height', None) else 50
+        grid_size = max(map_width_val, map_height_val)
+        use_preset_bounds = preset_bounds and all(
+            k in preset_bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon')
+        )
+        if use_preset_bounds:
+            preset_min_lat = preset_bounds['min_lat']
+            preset_max_lat = preset_bounds['max_lat']
+            preset_min_lon = preset_bounds['min_lon']
+            preset_max_lon = preset_bounds['max_lon']
+            preset_lat_scale = (preset_max_lat - preset_min_lat) / map_height_val if map_height_val > 0 else 0
+            preset_lon_scale = (preset_max_lon - preset_min_lon) / map_width_val if map_width_val > 0 else 0
+        else:
+            lon_deg_per_km = 111.0 * math.cos(math.radians(center_lat)) or 111.0
+
+        if hasattr(game_map, 'lines') and game_map.lines and grid_size > 0:
+            for line_name, line in game_map.lines.items():
+                if not hasattr(line, 'get_route'):
+                    continue
+                route = line.get_route()
+                if not route:
+                    continue
+                line_points = []
+                for point in route:
+                    if isinstance(point, (list, tuple)) and len(point) >= 2:
+                        x, y = float(point[0]), float(point[1])
+                    elif hasattr(point, 'x') and hasattr(point, 'y'):
+                        x, y = float(point.x), float(point.y)
+                    else:
+                        continue
+                    if use_preset_bounds:
+                        lat = preset_min_lat + y * preset_lat_scale
+                        lon = preset_min_lon + x * preset_lon_scale
+                    else:
+                        lat_km = y - grid_size // 2
+                        lon_km = x - grid_size // 2
+                        lat = center_lat + (lat_km / 111.0)
+                        lon = center_lon + (lon_km / lon_deg_per_km)
+                    if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+                        line_points.append([lat, lon])
+                if len(line_points) >= 2:
+                    owner = self.operations.get_line_owner(line) if self.operations else None
+                    if owner is None or (self.operations and self.operations.is_player_eliminated(owner)):
+                        owner_id = -1
+                    else:
+                        owner_id = self.operations.get_player_id(owner)
+                    line_type = 'train'
+                    try:
+                        from line import Ferry, Bus
+                        if isinstance(line, Ferry):
+                            line_type = 'ferry'
+                        elif isinstance(line, Bus):
+                            line_type = 'bus'
+                    except Exception:
+                        pass
+                    lines_data.append({
+                        'name': line_name,
+                        'points': line_points,
+                        'under_construction': False,
+                        'owner_id': owner_id,
+                        'line_type': line_type,
+                    })
+
+        if grid_size > 0 and self.operations is not None:
+            line_builds_by_name = {}
+            for build in self.operations.get_build_queue():
+                if build.get('type') != 'line':
+                    continue
+                build_data = build.get('data', {})
+                line_name = build_data.get('name')
+                points = build_data.get('points', [])
+                if not line_name or not points:
+                    continue
+                line_points = []
+                for point in points:
+                    if isinstance(point, (list, tuple)) and len(point) >= 2:
+                        x, y = float(point[0]), float(point[1])
+                    elif hasattr(point, 'x') and hasattr(point, 'y'):
+                        x, y = float(point.x), float(point.y)
+                    else:
+                        continue
+                    if use_preset_bounds:
+                        lat = preset_min_lat + y * preset_lat_scale
+                        lon = preset_min_lon + x * preset_lon_scale
+                    else:
+                        lat_km = y - grid_size // 2
+                        lon_km = x - grid_size // 2
+                        lat = center_lat + (lat_km / 111.0)
+                        lon = center_lon + (lon_km / lon_deg_per_km)
+                    if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+                        line_points.append([lat, lon])
+                if len(line_points) >= 2:
+                    seg_idx = build_data.get('segment_index', 0)
+                    if line_name not in line_builds_by_name:
+                        lt = 'ferry' if build_data.get('is_ferry_line') else (
+                            'bus' if build_data.get('is_bus_line') else 'train'
+                        )
+                        line_builds_by_name[line_name] = {
+                            'segments': [],
+                            'player': build.get('player'),
+                            'line_type': lt,
+                        }
+                    line_builds_by_name[line_name]['segments'].append((seg_idx, line_points))
+            for line_name, info in line_builds_by_name.items():
+                segments = sorted(info['segments'], key=lambda x: x[0])
+                merged = []
+                for _idx, pts in segments:
+                    for p in pts:
+                        if not merged or merged[-1] != p:
+                            merged.append(p)
+                if len(merged) >= 2:
+                    build_player = info.get('player')
+                    owner_id = self.operations.get_player_id(build_player) if build_player else -1
+                    lines_data.append({
+                        'name': line_name,
+                        'points': merged,
+                        'under_construction': True,
+                        'owner_id': owner_id,
+                        'line_type': info.get('line_type', 'train'),
+                    })
+        return lines_data
+
+    def _build_map_stations_overlay_data(self, game_map) -> list:
+        """Build station overlay data for lightweight map refresh."""
+        if not self.operations:
+            return []
+        current_player = None
+        try:
+            current_player = self.operations.get_current_player(self.current_player_index)
+        except Exception:
+            pass
+        return self.operations.get_stations_for_map_display(game_map, current_player=current_player)
+
+    def _invalidate_all_map_web_views(self) -> None:
+        """Tell Leaflet to recalculate map size after the window or map pane resizes."""
+        if not hasattr(self, 'player_tabs_dict') or not self.player_tabs_dict:
+            return
+        for player_id, player_tabs_dict in self.player_tabs_dict.items():
+            if not isinstance(player_tabs_dict, dict):
+                continue
+            web_view = player_tabs_dict.get(f'map_web_view_{player_id}')
+            if not web_view:
+                continue
+            page = self._safe_get_webview_page(web_view)
+            if page:
+                page.runJavaScript(_MAP_INVALIDATE_JS)
+
+    def _refresh_map_stations_overlay(self) -> None:
+        """Redraw station markers on existing map webviews without reloading HTML."""
+        import json
+        game_map = self.operations.get_map() if self.operations else None
+        if not game_map or not hasattr(self, 'player_tabs_dict'):
+            return
+        stations_data = self._build_map_stations_overlay_data(game_map)
+        stations_json = json.dumps(stations_data)
+        js = f"if (window.refreshMapStations) {{ window.refreshMapStations({stations_json}); }}"
+        for player_id, player_tabs_dict in self.player_tabs_dict.items():
+            web_view = player_tabs_dict.get(f'map_web_view_{player_id}')
+            if not web_view:
+                continue
+            page = self._safe_get_webview_page(web_view)
+            if page:
+                page.runJavaScript(js)
+
+    def _refresh_map_overlays(self) -> None:
+        """Redraw lines and stations on existing map webviews without reloading HTML."""
+        self._refresh_map_lines_overlay()
+        self._refresh_map_stations_overlay()
+        self._invalidate_all_map_web_views()
+
+    def _refresh_map_lines_overlay(self) -> None:
+        """Redraw line polylines on existing map webviews without reloading HTML."""
+        import json
+        game_map = self.operations.get_map() if self.operations else None
+        if not game_map or not hasattr(self, 'player_tabs_dict'):
+            return
+        lines_data = self._build_map_lines_overlay_data(game_map)
+        lines_json = json.dumps(lines_data)
+        js = f"if (window.refreshMapLines) {{ window.refreshMapLines({lines_json}); }}"
+        for player_id, player_tabs_dict in self.player_tabs_dict.items():
+            web_view = player_tabs_dict.get(f'map_web_view_{player_id}')
+            if not web_view:
+                continue
+            page = self._safe_get_webview_page(web_view)
+            if page:
+                page.runJavaScript(js)
+
+    def _refresh_after_human_line_build(self) -> None:
+        """Update UI after line build without regenerating full OSM map HTML (avoids WebEngine OOM)."""
+        try:
+            if not self.operations:
+                return
+            game_map = self.operations.get_map()
+            if not game_map:
+                return
+            map_info_text = self._build_map_overview_text(game_map)
+            self._update_map_sidebars(map_info_text)
+            self._refresh_map_overlays()
+            if hasattr(self, 'refresh_construction_tab'):
+                self.refresh_construction_tab()
+            if hasattr(self, 'update_status_bar'):
+                self.update_status_bar()
+            current_player = self.operations.get_current_player(self.current_player_index)
+            if current_player and hasattr(self, 'DisplayLinesControls'):
+                self.DisplayLinesControls(current_player)
+        except Exception as e:
+            logger.error("Error in _refresh_after_human_line_build: %s", e)
+
+    def DisplayMapInfo(self, force_reload: bool = False):
+        import time
+
+        t0 = time.perf_counter()
+        refresh_kind = "skipped"
+        preset_name = None
+        logger.debug("Map refresh started (force_reload=%s)", force_reload)
         try:
             if not hasattr(self, 'player_tabs_dict'):
                 return
@@ -7477,6 +8427,20 @@ class MainWindow(QMainWindow):
                 return
             game_map = self.operations.get_map()
             if not game_map:
+                return
+            preset_name = getattr(game_map, 'map_preset_name', None)
+
+            # Never reload map HTML while the player is placing line points — that wipes
+            # isCreatingLine / clickedPoints and aborts in-progress creation.
+            if self._any_map_edit_in_progress():
+                try:
+                    map_info_text = self._build_map_overview_text(game_map)
+                    self._update_map_sidebars(map_info_text)
+                    self._refresh_map_overlays()
+                    refresh_kind = "overlay-during-line-edit"
+                except Exception as e:
+                    logger.debug("Lightweight DisplayMapInfo during line edit failed: %s", e)
+                    refresh_kind = "overlay-during-line-edit-failed"
                 return
             
             all_lines = self.operations.get_map_lines()
@@ -7541,6 +8505,8 @@ class MainWindow(QMainWindow):
             first_value = self.player_tabs_dict[first_key]
             
             if isinstance(first_value, dict):
+                overlay_refresh_needed = False
+                html_reload_players = 0
                 for player_id, player_tabs_dict in self.player_tabs_dict.items():
                     map_layout = player_tabs_dict.get('map_layout')
                     map_info_text_widget = player_tabs_dict.get('map_info_text')
@@ -7551,6 +8517,10 @@ class MainWindow(QMainWindow):
                     # Update sidebar map info
                     if map_info_text_widget:
                         map_info_text_widget.setText(map_info_text)
+
+                    # Other players' tabs are read-only — skip expensive WebEngine map HTML.
+                    if player_tabs_dict.get('for_other_player'):
+                        continue
                     
                     # Update station line combo
                     station_line_combo = player_tabs_dict.get('station_line_combo')
@@ -7634,7 +8604,15 @@ class MainWindow(QMainWindow):
                                     existing_web_view = None
                         except Exception:
                             existing_web_view = None
-                    
+
+                    # Reuse loaded map HTML — only refresh line overlays (avoids WebEngine OOM
+                    # and preserves in-progress line creation / extension point placement).
+                    if existing_web_view and not force_reload:
+                        _install_map_web_view_resize_filter(existing_web_view)
+                        overlay_refresh_needed = True
+                        continue
+
+                    html_reload_players += 1
                     if not existing_web_view:
                         # Safely clear map_layout before creating new
                         try:
@@ -7659,7 +8637,7 @@ class MainWindow(QMainWindow):
                     # Add refresh button when creating new (like qt.py)
                     if not existing_web_view:
                         refresh_btn = QPushButton("Refresh Map")
-                        refresh_btn.clicked.connect(self.DisplayMapInfo)
+                        refresh_btn.clicked.connect(lambda: self.DisplayMapInfo(force_reload=True))
                         refresh_btn.setMinimumHeight(30)
                         refresh_btn.setMinimumWidth(100)
                         map_layout.addWidget(refresh_btn, 0)
@@ -7707,15 +8685,14 @@ class MainWindow(QMainWindow):
                             
                             web_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
                             web_view.setMinimumSize(400, 300)
-                            if getattr(self, '_screen_geom', None):
-                                mw = max(400, self._screen_geom.width() - 100)
-                                mh = max(300, self._screen_geom.height() - 150)
-                                web_view.setMaximumSize(mw, mh)
+                            web_view.setMaximumSize(16777215, 16777215)
+                            web_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                             if not existing_web_view:
                                 logger.debug("Adding web_view to map_layout...")
                                 map_layout.addWidget(web_view, 1)
                             
                             player_tabs_dict[f'map_web_view_{player_id}'] = web_view
+                            _install_map_web_view_resize_filter(web_view)
                             
                             # Sync load for both new and existing (like qt.py, but with _load_map_from_file for OSM tiles)
                             logger.debug("Generating HTML content...")
@@ -7792,11 +8769,28 @@ class MainWindow(QMainWindow):
                         error_label = QLabel("Error: Failed to load map. Please check console for details.")
                         error_label.setStyleSheet("color: red; font-weight: bold; padding: 20px;")
                         map_layout.addWidget(error_label)
-                
+
+                if overlay_refresh_needed:
+                    self._refresh_map_overlays()
+                    refresh_kind = "overlay"
+                elif html_reload_players:
+                    refresh_kind = f"full-reload({html_reload_players})"
+                else:
+                    refresh_kind = "sidebar-only"
+
         except Exception as e:
             import traceback
+            refresh_kind = "error"
             logger.error("ERROR in DisplayMapInfo: %s", e)
             logger.debug(traceback.format_exc())
+        finally:
+            logger.debug(
+                "Map refresh finished (%s, force_reload=%s, preset=%s) in %.3fs",
+                refresh_kind,
+                force_reload,
+                preset_name or "standard",
+                time.perf_counter() - t0,
+            )
     
     def _connect_map_sidebar_buttons(self, player_id, player_tabs_dict):
         if player_tabs_dict.get('for_other_player'):
@@ -7867,6 +8861,7 @@ class MainWindow(QMainWindow):
                 page = self._safe_get_webview_page(web_view)
                 if page:
                     page.runJavaScript("window.startLineCreation();")
+                    self._set_line_creation_active(current_player_tabs_dict, True)
                     logger.debug("Started line creation for player %s: %s", player_id, line_name)
                 else:
                     QMessageBox.warning(self, "Error", "Map is not ready. Please wait for map to load.")
@@ -7899,6 +8894,7 @@ class MainWindow(QMainWindow):
                 page = self._safe_get_webview_page(web_view)
                 if page:
                     page.runJavaScript("window.cancelLineCreation();")
+                self._set_line_creation_active(current_player_tabs_dict, False)
                 
                 line_points_label = current_player_tabs_dict.get('line_points_label')
                 if create_line_btn:
@@ -7953,271 +8949,220 @@ class MainWindow(QMainWindow):
                 if not page:
                     QMessageBox.warning(self, "Error", "Map is not ready.")
                     return
-                
-                def handle_points(points_json):
-                    import json
-                    if not points_json:
-                        QMessageBox.warning(self, "Error", "No points received from map.")
-                        return
-                    
-                    latlon_points = json.loads(points_json) if isinstance(points_json, str) else points_json
-                    if not latlon_points or len(latlon_points) < 2:
-                        QMessageBox.warning(self, "Error", "A line needs at least 2 points.")
-                        return
-                    
-                    grid_points = self.operations.convert_latlon_points_to_grid(latlon_points)
-                    if not grid_points or len(grid_points) < 2:
-                        QMessageBox.warning(self, "Error", "Failed to convert coordinates.")
-                        return
-                    
-                    # Ask user to choose between train line, ferry line, and bus line
-                    line_type_dlg = QDialog(self)
-                    line_type_dlg.setWindowTitle("Select Line Type")
-                    line_type_dlg.setGeometry(300, 300, 300, 150)
-                    line_type_layout = QVBoxLayout()
-                    line_type_layout.addWidget(QLabel("What type of line do you want to create?"))
-                    
-                    line_type_combo = QComboBox()
-                    line_type_combo.addItems(['Train Line', 'Ferry Line', 'Bus Line'])
-                    line_type_layout.addWidget(line_type_combo)
-                    
-                    line_type_btn_layout = QHBoxLayout()
-                    line_type_ok_btn = QPushButton("OK")
-                    line_type_cancel_btn = QPushButton("Cancel")
-                    line_type_ok_btn.clicked.connect(line_type_dlg.accept)
-                    line_type_cancel_btn.clicked.connect(line_type_dlg.reject)
-                    line_type_btn_layout.addWidget(line_type_ok_btn)
-                    line_type_btn_layout.addWidget(line_type_cancel_btn)
-                    line_type_layout.addLayout(line_type_btn_layout)
-                    line_type_dlg.setLayout(line_type_layout)
-                    
-                    if line_type_dlg.exec() != QDialog.DialogCode.Accepted:
-                        return
-                    
-                    selected_type = line_type_combo.currentText()
-                    is_ferry_line = (selected_type == 'Ferry Line')
-                    is_bus_line = (selected_type == 'Bus Line')
-                    
-                    # For ferry lines, skip elevation selection (they're always on water)
-                    if is_ferry_line:
-                        elevation_levels = ['water'] * (len(grid_points) - 1)
-                    else:
-                        # Ask for elevation levels with dropdowns
-                        required_elevations = len(grid_points) - 1
-                        elev_dlg = QDialog(self)
-                        elev_dlg.setWindowTitle("Select Elevation Levels")
-                        elev_dlg.setGeometry(300, 300, 400, min(600, 180 + required_elevations * 50))
-                        elev_layout = QVBoxLayout()
-                        elev_layout.addWidget(QLabel(f"Select elevation level for each of {required_elevations} segments:"))
-                        elev_layout.addWidget(QLabel("Note: Cannot use 'street' on water"))
-                        all_segments_row = QHBoxLayout()
-                        all_segments_row.addWidget(QLabel("Apply to all segments:"))
-                        all_combo = QComboBox()
-                        all_combo.addItems(['street', 'above_ground', 'underground'])
-                        all_combo.setCurrentText('street')
-                        all_segments_row.addWidget(all_combo)
-                        def apply_all_segments():
-                            for c in elevation_combos:
-                                c.setCurrentText(all_combo.currentText())
-                        apply_btn = QPushButton("Apply")
-                        apply_btn.clicked.connect(apply_all_segments)
-                        all_segments_row.addWidget(apply_btn)
-                        all_segments_row.addStretch()
-                        elev_layout.addLayout(all_segments_row)
-                        
-                        from PyQt6.QtWidgets import QScrollArea, QWidget as QWidget2
-                        elev_scroll = QScrollArea()
-                        elev_scroll.setWidgetResizable(True)
-                        elev_widget = QWidget2()
-                        elev_widget_layout = QVBoxLayout()
-                        elev_widget.setLayout(elev_widget_layout)
-                        elev_scroll.setWidget(elev_widget)
-                        elev_layout.addWidget(elev_scroll)
-                        
-                        elevation_combos = []
-                        for i in range(required_elevations):
-                            segment_label = QLabel(f"Segment {i+1} (point {i} → {i+1}):")
-                            elev_widget_layout.addWidget(segment_label)
-                            combo = QComboBox()
-                            combo.addItems(['street', 'above_ground', 'underground'])
-                            combo.setCurrentText('street')  # Default
-                            elev_widget_layout.addWidget(combo)
-                            elevation_combos.append(combo)
-                        
-                        elev_btn_layout = QHBoxLayout()
-                        elev_ok_btn = QPushButton("OK")
-                        elev_cancel_btn = QPushButton("Cancel")
-                        elev_ok_btn.clicked.connect(elev_dlg.accept)
-                        elev_cancel_btn.clicked.connect(elev_dlg.reject)
-                        elev_btn_layout.addWidget(elev_ok_btn)
-                        elev_btn_layout.addWidget(elev_cancel_btn)
-                        elev_layout.addLayout(elev_btn_layout)
-                        elev_dlg.setLayout(elev_layout)
-                        
-                        if elev_dlg.exec() != QDialog.DialogCode.Accepted:
-                            return
-                        
-                        # Get elevation levels from combo boxes
-                        elevation_levels = [combo.currentText() for combo in elevation_combos]
-                    
-                    try:
-                        cost_info = self.operations.calculate_line_cost(
-                            grid_points,
-                            elevation_levels,
-                            is_bus_line=is_bus_line,
-                            is_ferry_line=is_ferry_line
-                        )
-                    except Exception as e:
-                        QMessageBox.warning(self, "Error", str(e))
-                        return
-                    
-                    reply = QMessageBox.question(self, "Confirm Line Creation",
-                                                 f"Creating this line will cost ${cost_info['cost']} (distance: {cost_info['length']:.2f} units). Proceed?",
-                                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                    if reply != QMessageBox.StandardButton.Yes:
-                        return
-                    
-                    # Brief process events after message box closes
-                    for _ in range(2):
-                        QApplication.processEvents()
-                    
-                    result = None
-                    error_occurred = False
-                    error_message = ""
-                    line_creation_timeout_timer = None
-                    
-                    def handle_line_creation_result(res=None, err_occurred=False, err_msg=""):
-                        nonlocal line_creation_timeout_timer
-                        if line_creation_timeout_timer is not None:
-                            line_creation_timeout_timer.stop()
-                            line_creation_timeout_timer = None
-                        # CRITICAL: Ensure UI is responsive before showing any dialogs
-                        QApplication.processEvents()
-                        
-                        if err_occurred:
-                            QMessageBox.warning(self, "Error", f"Failed to create line: {err_msg}")
-                            QApplication.processEvents()
-                            return
-                        if not res:
-                            QMessageBox.warning(self, "Error", "Failed to create line.")
-                            QApplication.processEvents()
-                            return
-                        
-                        # Check if validation failed (for ferry or bus lines)
-                        if res.get('success') == False:
-                            error_message = res.get('error_message', 'Unknown error')
-                            if is_ferry_line:
-                                QMessageBox.warning(self, "Cannot Create Ferry Line", error_message)
-                            elif is_bus_line:
-                                QMessageBox.warning(self, "Cannot Create Bus Line", error_message)
-                            else:
-                                QMessageBox.warning(self, "Cannot Create Line", error_message)
-                            QApplication.processEvents()
-                            return
-                        
-                        if is_ferry_line:
-                            line_type_str = "Ferry line"
-                        elif is_bus_line:
-                            line_type_str = "Bus line"
-                        else:
-                            line_type_str = "Line"
-                        
-                        self.add_message(f"Line '{line_name}' construction started.")
-                        seg_queued = res.get('segments_queued')
-                        seg_note = f"\n{seg_queued} segment(s) added to the construction queue." if seg_queued else ""
-                        nimby = res.get('nimby_lawsuit')
-                        if nimby:
-                            if nimby.get('agency_won'):
-                                self.add_message(
-                                    f"NIMBYs sued {current_player.get_name()} over the new line "
-                                    f"({nimby.get('excuse', 'complaint')}) — penalty ${nimby.get('penalty', 0)}."
-                                )
-                            else:
-                                self.add_message(
-                                    f"NIMBYs challenged {current_player.get_name()} over the new line "
-                                    f"({nimby.get('excuse', 'complaint')}) — your lawyers won."
-                                )
-                        # Show success message
-                        QMessageBox.information(self, f"{line_type_str} Created",
-                                                 f"Line '{line_name}' is being built. Estimated completion: {res['build_time']} turns.{seg_note}")
-                        
-                        for _ in range(2):
-                            QApplication.processEvents()
-                        
-                        # Update UI elements immediately
-                        finish_web_view = current_player_tabs_dict.get(f'map_web_view_{player_id}')
-                        if not finish_web_view:
-                            finish_web_view = self.map_web_view
-                        
-                        finish_page = self._safe_get_webview_page(finish_web_view)
-                        if finish_page:
-                            finish_page.runJavaScript("window.cancelLineCreation();")
-                        
-                        create_line_btn = current_player_tabs_dict.get('create_line_btn')
-                        finish_line_btn = current_player_tabs_dict.get('finish_line_btn')
-                        cancel_line_btn = current_player_tabs_dict.get('cancel_line_btn')
-                        line_points_label = current_player_tabs_dict.get('line_points_label')
-                        
-                        if create_line_btn:
-                            create_line_btn.setEnabled(True)
-                        if finish_line_btn:
-                            finish_line_btn.setEnabled(False)
-                        if cancel_line_btn:
-                            cancel_line_btn.setEnabled(False)
-                        if line_name_widget:
-                            line_name_widget.clear()
-                        if line_points_label:
-                            line_points_label.setText("Points: 0")
-                        
-                        for _ in range(2):
-                            QApplication.processEvents()
-                        
-                        # Defer map refresh briefly to prevent UI freeze
-                        QTimer.singleShot(300, self.DisplayMapInfo)
-                    
-                    # Run line creation in a background thread so UI never freezes (max 15s effective limit)
-                    def start_line_creation_worker():
-                        nonlocal line_creation_timeout_timer
-                        for _ in range(2):
-                            QApplication.processEvents()
-                        worker = LineCreationWorker(
-                            self.operations, line_name, grid_points, current_player, elevation_levels,
-                            is_ferry_line, is_bus_line, cost_info
-                        )
-                        thread = QThread()
-                        worker.moveToThread(thread)
-                        thread.started.connect(worker.run)
-                        def on_worker_finished(res, err_occurred, err_msg):
-                            handle_line_creation_result(res, err_occurred, err_msg)
-                            thread.quit()
-                        worker.finished.connect(on_worker_finished)
-                        worker.finished.connect(thread.quit)
-                        # Keep references so thread/worker are not garbage-collected
-                        self._line_creation_thread = thread
-                        self._line_creation_worker = worker
-                        thread.finished.connect(lambda: (setattr(self, '_line_creation_thread', None), setattr(self, '_line_creation_worker', None)))
-                        thread.start()
-                        # 15-second timeout: if work takes longer, show message (work continues in background)
-                        def on_timeout():
-                            nonlocal line_creation_timeout_timer
-                            line_creation_timeout_timer = None
-                            QMessageBox.information(
-                                self, "Still Working",
-                                "Line creation is taking longer than expected (max 15 seconds). You can continue using the app; you'll be notified when it finishes."
-                            )
-                        line_creation_timeout_timer = QTimer(self)
-                        line_creation_timeout_timer.setSingleShot(True)
-                        line_creation_timeout_timer.timeout.connect(on_timeout)
-                        line_creation_timeout_timer.start(LINE_CREATION_MAX_MS)
-                    
-                    QTimer.singleShot(50, start_line_creation_worker)  
-                
-                page = self._safe_get_webview_page(current_web_view)
-                if page:
-                    page.runJavaScript("JSON.stringify(window.finishLineCreation());", handle_points)
-                else:
-                    QMessageBox.warning(self, "Error", "Map is not ready.")
+
+                if current_player_tabs_dict.get('line_creation_finishing'):
                     return
+                current_player_tabs_dict['line_creation_finishing'] = True
+
+                def process_line_points(points_json):
+                    """Run on the Qt main loop — never open modal dialogs from a WebEngine JS callback."""
+                    import json
+
+                    def _reenable_finish():
+                        current_player_tabs_dict['line_creation_finishing'] = False
+                        fl_btn = current_player_tabs_dict.get('finish_line_btn')
+                        if fl_btn:
+                            fl_btn.setEnabled(True)
+
+                    try:
+                        if not points_json:
+                            QMessageBox.warning(self, "Error", "No points received from map.")
+                            _reenable_finish()
+                            return
+
+                        latlon_points = json.loads(points_json) if isinstance(points_json, str) else points_json
+                        if not latlon_points or len(latlon_points) < 2:
+                            QMessageBox.warning(self, "Error", "A line needs at least 2 points.")
+                            _reenable_finish()
+                            return
+
+                        try:
+                            grid_points = self.operations.convert_latlon_points_to_grid(latlon_points)
+                        except Exception as e:
+                            QMessageBox.warning(self, "Error", str(e))
+                            _reenable_finish()
+                            return
+                        if not grid_points or len(grid_points) < 2:
+                            QMessageBox.warning(self, "Error", "Failed to convert coordinates.")
+                            _reenable_finish()
+                            return
+
+                        line_type_dlg = QDialog(self)
+                        line_type_dlg.setWindowTitle("Select Line Type")
+                        line_type_dlg.setGeometry(300, 300, 300, 150)
+                        line_type_layout = QVBoxLayout()
+                        line_type_layout.addWidget(QLabel("What type of line do you want to create?"))
+                        line_type_combo = QComboBox()
+                        line_type_combo.addItems(['Train Line', 'Ferry Line', 'Bus Line'])
+                        line_type_layout.addWidget(line_type_combo)
+                        line_type_btn_layout = QHBoxLayout()
+                        line_type_ok_btn = QPushButton("OK")
+                        line_type_cancel_btn = QPushButton("Cancel")
+                        line_type_ok_btn.clicked.connect(line_type_dlg.accept)
+                        line_type_cancel_btn.clicked.connect(line_type_dlg.reject)
+                        line_type_btn_layout.addWidget(line_type_ok_btn)
+                        line_type_btn_layout.addWidget(line_type_cancel_btn)
+                        line_type_layout.addLayout(line_type_btn_layout)
+                        line_type_dlg.setLayout(line_type_layout)
+
+                        if line_type_dlg.exec() != QDialog.DialogCode.Accepted:
+                            _reenable_finish()
+                            return
+
+                        selected_type = line_type_combo.currentText()
+                        is_ferry_line = (selected_type == 'Ferry Line')
+                        is_bus_line = (selected_type == 'Bus Line')
+
+                        if is_ferry_line:
+                            elevation_levels = ['water'] * (len(grid_points) - 1)
+                        else:
+                            segment_specs = self.operations.get_line_creation_elevation_specs(grid_points)
+                            elevation_levels = self._prompt_route_elevation_levels(
+                                segment_specs, is_bus_line=is_bus_line,
+                            )
+                            if elevation_levels is None:
+                                _reenable_finish()
+                                return
+
+                        try:
+                            cost_info = self.operations.calculate_line_cost(
+                                grid_points,
+                                elevation_levels,
+                                is_bus_line=is_bus_line,
+                                is_ferry_line=is_ferry_line,
+                            )
+                        except Exception as e:
+                            QMessageBox.warning(self, "Error", str(e))
+                            _reenable_finish()
+                            return
+
+                        reply = QMessageBox.question(
+                            self, "Confirm Line Creation",
+                            f"Creating this line will cost ${cost_info['cost']} "
+                            f"(distance: {cost_info['length']:.2f} units). Proceed?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        )
+                        if reply != QMessageBox.StandardButton.Yes:
+                            _reenable_finish()
+                            return
+
+                        line_creation_timeout_timer = None
+
+                        def handle_line_creation_result(res=None, err_occurred=False, err_msg=""):
+                            nonlocal line_creation_timeout_timer
+                            if line_creation_timeout_timer is not None:
+                                line_creation_timeout_timer.stop()
+                                line_creation_timeout_timer = None
+
+                            if err_occurred:
+                                QMessageBox.warning(self, "Error", f"Failed to create line: {err_msg}")
+                                _reenable_finish()
+                                return
+                            if not res:
+                                QMessageBox.warning(self, "Error", "Failed to create line.")
+                                _reenable_finish()
+                                return
+
+                            if res.get('success') is False:
+                                error_message = res.get('error_message', 'Unknown error')
+                                if is_ferry_line:
+                                    QMessageBox.warning(self, "Cannot Create Ferry Line", error_message)
+                                elif is_bus_line:
+                                    QMessageBox.warning(self, "Cannot Create Bus Line", error_message)
+                                else:
+                                    QMessageBox.warning(self, "Cannot Create Line", error_message)
+                                _reenable_finish()
+                                return
+
+                            if is_ferry_line:
+                                line_type_str = "Ferry line"
+                            elif is_bus_line:
+                                line_type_str = "Bus line"
+                            else:
+                                line_type_str = "Line"
+
+                            self.add_message(f"Line '{line_name}' construction started.")
+                            seg_queued = res.get('segments_queued')
+                            seg_note = (
+                                f"\n{seg_queued} segment(s) added to the construction queue."
+                                if seg_queued else ""
+                            )
+                            nimby = res.get('nimby_lawsuit')
+                            if nimby:
+                                if nimby.get('agency_won'):
+                                    self.add_message(
+                                        f"NIMBYs sued {current_player.get_name()} over the new line "
+                                        f"({nimby.get('excuse', 'complaint')}) — penalty ${nimby.get('penalty', 0)}."
+                                    )
+                                else:
+                                    self.add_message(
+                                        f"NIMBYs challenged {current_player.get_name()} over the new line "
+                                        f"({nimby.get('excuse', 'complaint')}) — your lawyers won."
+                                    )
+                            QMessageBox.information(
+                                self, f"{line_type_str} Created",
+                                f"Line '{line_name}' is being built. Estimated completion: "
+                                f"{res['build_time']} turns.{seg_note}",
+                            )
+
+                            finish_web_view = current_player_tabs_dict.get(f'map_web_view_{player_id}')
+                            if not finish_web_view:
+                                finish_web_view = self.map_web_view
+                            finish_page = self._safe_get_webview_page(finish_web_view)
+                            if finish_page:
+                                finish_page.runJavaScript("window.cancelLineCreation();")
+                            self._set_line_creation_active(current_player_tabs_dict, False)
+
+                            create_btn = current_player_tabs_dict.get('create_line_btn')
+                            finish_btn = current_player_tabs_dict.get('finish_line_btn')
+                            cancel_btn = current_player_tabs_dict.get('cancel_line_btn')
+                            line_points_label = current_player_tabs_dict.get('line_points_label')
+                            if create_btn:
+                                create_btn.setEnabled(True)
+                            if finish_btn:
+                                finish_btn.setEnabled(False)
+                            if cancel_btn:
+                                cancel_btn.setEnabled(False)
+                            if line_name_widget:
+                                line_name_widget.clear()
+                            if line_points_label:
+                                line_points_label.setText("Points: 0")
+
+                            QTimer.singleShot(300, self._refresh_after_human_line_build)
+
+                        def start_line_creation_worker():
+                            nonlocal line_creation_timeout_timer
+                            fl_btn = current_player_tabs_dict.get('finish_line_btn')
+                            if fl_btn:
+                                fl_btn.setEnabled(False)
+                            # Run on the GUI thread: Operations/map state is not thread-safe and
+                            # background create_line_complete has caused process aborts.
+                            try:
+                                res = self.operations.create_line_complete(
+                                    line_name, grid_points, current_player, elevation_levels,
+                                    is_ferry_line=is_ferry_line, is_bus_line=is_bus_line,
+                                    cost_info=cost_info,
+                                )
+                                handle_line_creation_result(res, False, "")
+                            except Exception as e:
+                                import traceback
+                                logger.error("Error in line creation: %s", e)
+                                traceback.print_exc()
+                                handle_line_creation_result(None, True, str(e))
+
+                        QTimer.singleShot(0, start_line_creation_worker)
+                    except Exception as e:
+                        import traceback
+                        logger.error("Error processing line points: %s", e)
+                        traceback.print_exc()
+                        QMessageBox.warning(self, "Error", f"Failed to create line: {e}")
+                        _reenable_finish()
+
+                def handle_points(points_json):
+                    # Defer out of the WebEngine JS callback — modal dialogs there abort Qt.
+                    QTimer.singleShot(0, lambda pj=points_json: process_line_points(pj))
+
+                page.runJavaScript("JSON.stringify(window.finishLineCreation());", handle_points)
             
             finish_line_btn.clicked.connect(finish_line_creation)
         
@@ -8255,8 +9200,10 @@ class MainWindow(QMainWindow):
                 
                 page = self._safe_get_webview_page(web_view)
                 if page:
-                    js_code = f"window.startLineExtension('{selected_line}');"
+                    import json
+                    js_code = f"window.startLineExtension({json.dumps(selected_line)});"
                     page.runJavaScript(js_code)
+                    self._set_line_extension_active(current_player_tabs_dict, True)
                     
                     finish_extend_btn = current_player_tabs_dict.get('finish_extend_btn')
                     cancel_extend_btn = current_player_tabs_dict.get('cancel_extend_btn')
@@ -8268,6 +9215,11 @@ class MainWindow(QMainWindow):
                         finish_extend_btn.setEnabled(True)
                     if cancel_extend_btn:
                         cancel_extend_btn.setEnabled(True)
+                    extend_line_points_label = current_player_tabs_dict.get('extend_line_points_label')
+                    if extend_line_points_label:
+                        extend_line_points_label.setText(
+                            "Click 1: nearest line end → point. Click 2+: prior point → next."
+                        )
                 else:
                     QMessageBox.warning(self, "Error", "Map is not ready.")
             
@@ -8310,138 +9262,152 @@ class MainWindow(QMainWindow):
                     if not page:
                         QMessageBox.warning(self, "Error", "Map is not ready.")
                         return
-                    
-                    def handle_extend_points(points_json):
-                        import json
-                        if not points_json:
-                            QMessageBox.warning(self, "Error", "No points received from map.")
-                            return
-                        
-                        latlon_points = json.loads(points_json) if isinstance(points_json, str) else points_json
-                        if not latlon_points or len(latlon_points) < 1:
-                            QMessageBox.warning(self, "Error", "At least one point is required to extend a line.")
-                            return
-                        
-                        grid_points = self.operations.convert_latlon_points_to_grid(latlon_points)
-                        if not grid_points or len(grid_points) < 1:
-                            QMessageBox.warning(self, "Error", "Failed to convert coordinates.")
-                            return
-                        
-                        # Ask for elevation levels with dropdowns
-                        required_elevations = len(grid_points)
-                        elev_dlg = QDialog(self)
-                        elev_dlg.setWindowTitle("Select Elevation Levels")
-                        elev_dlg.setGeometry(300, 300, 400, min(600, 180 + required_elevations * 50))
-                        elev_layout = QVBoxLayout()
-                        elev_layout.addWidget(QLabel(f"Select elevation level for each of {required_elevations} points:"))
-                        elev_layout.addWidget(QLabel("Note: Cannot use 'street' on water"))
-                        all_seg_row3 = QHBoxLayout()
-                        all_seg_row3.addWidget(QLabel("Apply to all:"))
-                        all_combo_ext3 = QComboBox()
-                        all_combo_ext3.addItems(['street', 'above_ground', 'underground'])
-                        all_combo_ext3.setCurrentText('street')
-                        all_seg_row3.addWidget(all_combo_ext3)
-                        elevation_combos = []
-                        def apply_all_ext3():
-                            for c in elevation_combos:
-                                c.setCurrentText(all_combo_ext3.currentText())
-                        apply_btn_ext3 = QPushButton("Apply")
-                        apply_btn_ext3.clicked.connect(apply_all_ext3)
-                        all_seg_row3.addWidget(apply_btn_ext3)
-                        all_seg_row3.addStretch()
-                        elev_layout.addLayout(all_seg_row3)
-                        
-                        from PyQt6.QtWidgets import QScrollArea, QWidget as QWidget2
-                        elev_scroll = QScrollArea()
-                        elev_scroll.setWidgetResizable(True)
-                        elev_widget = QWidget2()
-                        elev_widget_layout = QVBoxLayout()
-                        elev_widget.setLayout(elev_widget_layout)
-                        elev_scroll.setWidget(elev_widget)
-                        elev_layout.addWidget(elev_scroll)
-                        
-                        for i in range(required_elevations):
-                            point_label = QLabel(f"Point {i+1} ({grid_points[i][0]:.1f}, {grid_points[i][1]:.1f}):")
-                            elev_widget_layout.addWidget(point_label)
-                            combo = QComboBox()
-                            combo.addItems(['street', 'above_ground', 'underground'])
-                            combo.setCurrentText('street')  # Default
-                            elev_widget_layout.addWidget(combo)
-                            elevation_combos.append(combo)
-                        
-                        elev_btn_layout = QHBoxLayout()
-                        elev_ok_btn = QPushButton("OK")
-                        elev_cancel_btn = QPushButton("Cancel")
-                        elev_ok_btn.clicked.connect(elev_dlg.accept)
-                        elev_cancel_btn.clicked.connect(elev_dlg.reject)
-                        elev_btn_layout.addWidget(elev_ok_btn)
-                        elev_btn_layout.addWidget(elev_cancel_btn)
-                        elev_layout.addLayout(elev_btn_layout)
-                        elev_dlg.setLayout(elev_layout)
-                        
-                        if elev_dlg.exec() != QDialog.DialogCode.Accepted:
-                            return
-                        
-                        # Get elevation levels from combo boxes
-                        elevation_levels = [combo.currentText() for combo in elevation_combos]
-                        
-                        extend_from_end = True
-                        try:
-                            cost_info = self.operations.calculate_extend_cost(selected_line, grid_points, extend_from_end, elevation_levels)
-                        except Exception as e:
-                            QMessageBox.warning(self, "Error", str(e))
-                            return
-                        
-                        if not cost_info:
-                            QMessageBox.warning(self, "Error", "Failed to calculate extension cost.")
-                            return
-                        
-                        reply = QMessageBox.question(self, "Confirm Line Extension",
-                                                     f"Extending this line will cost ${cost_info['cost']} (distance: {cost_info['length']:.2f} units). Proceed?",
-                                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                        if reply != QMessageBox.StandardButton.Yes:
-                            return
-                        
-                        result = self.operations.extend_line_complete(selected_line, current_player, grid_points, extend_from_end, elevation_levels)
-                        if not result:
-                            QMessageBox.warning(self, "Error", "Failed to extend line.")
-                            return
-                        
-                        self.add_message(f"Line '{selected_line}' extension started.")
-                        QMessageBox.information(self, "Line Extended", 
-                                                 f"Line '{selected_line}' extension is being built. Estimated completion: {result['build_time']} turns.")
-                        
-                        finish_web_view = current_player_tabs_dict.get(f'map_web_view_{current_player_id}')
-                        if not finish_web_view:
-                            finish_web_view = self.map_web_view
-                        
-                        finish_page = self._safe_get_webview_page(finish_web_view)
-                        if finish_page:
-                            finish_page.runJavaScript("window.cancelLineExtension();")
-                        
-                        extend_line_btn = current_player_tabs_dict.get('extend_line_btn')
-                        finish_extend_btn = current_player_tabs_dict.get('finish_extend_btn')
-                        cancel_extend_btn = current_player_tabs_dict.get('cancel_extend_btn')
-                        extend_line_points_label = current_player_tabs_dict.get('extend_line_points_label')
-                        
-                        if extend_line_btn:
-                            extend_line_btn.setEnabled(True)
-                        if finish_extend_btn:
-                            finish_extend_btn.setEnabled(False)
-                        if cancel_extend_btn:
-                            cancel_extend_btn.setEnabled(False)
-                        if extend_line_points_label:
-                            extend_line_points_label.setText("Points: 0")
-                        
-                        # OPTIMIZATION: Defer map refresh to prevent UI freeze
-                        QTimer.singleShot(200, self.DisplayMapInfo)
-                    
-                    extend_page = self._safe_get_webview_page(current_web_view)
-                    if extend_page:
-                        extend_page.runJavaScript("JSON.stringify(window.finishLineExtension());", handle_extend_points)
-                    else:
-                        QMessageBox.warning(self, "Error", "Map is not ready.")
+
+                    if current_player_tabs_dict.get('line_extension_finishing'):
                         return
+                    current_player_tabs_dict['line_extension_finishing'] = True
+                    feb = current_player_tabs_dict.get('finish_extend_btn')
+                    if feb:
+                        feb.setEnabled(False)
+
+                    def process_extend_points(points_json):
+                        import json
+
+                        def _reenable_finish_extend():
+                            current_player_tabs_dict['line_extension_finishing'] = False
+                            feb2 = current_player_tabs_dict.get('finish_extend_btn')
+                            if feb2:
+                                feb2.setEnabled(True)
+
+                        def _finish_extension_ui(result):
+                            if not result:
+                                QMessageBox.warning(self, "Error", "Failed to extend line.")
+                                _reenable_finish_extend()
+                                return
+
+                            self.add_message(f"Line '{selected_line}' extension started.")
+                            QMessageBox.information(
+                                self, "Line Extended",
+                                f"Line '{selected_line}' extension is being built. "
+                                f"Estimated completion: {result['build_time']} turns.",
+                            )
+
+                            finish_web_view = current_player_tabs_dict.get(f'map_web_view_{current_player_id}')
+                            if not finish_web_view:
+                                finish_web_view = self.map_web_view
+                            finish_page = self._safe_get_webview_page(finish_web_view)
+                            if finish_page:
+                                finish_page.runJavaScript("window.cancelLineExtension();")
+                            self._set_line_extension_active(current_player_tabs_dict, False)
+
+                            elb = current_player_tabs_dict.get('extend_line_btn')
+                            feb3 = current_player_tabs_dict.get('finish_extend_btn')
+                            ceb = current_player_tabs_dict.get('cancel_extend_btn')
+                            epl = current_player_tabs_dict.get('extend_line_points_label')
+                            if elb:
+                                elb.setEnabled(True)
+                            if feb3:
+                                feb3.setEnabled(False)
+                            if ceb:
+                                ceb.setEnabled(False)
+                            if epl:
+                                epl.setText("Points: 0")
+
+                            QTimer.singleShot(200, self._refresh_after_human_line_build)
+
+                        try:
+                            if not points_json:
+                                QMessageBox.warning(self, "Error", "No points received from map.")
+                                _reenable_finish_extend()
+                                return
+
+                            latlon_points = json.loads(points_json) if isinstance(points_json, str) else points_json
+                            extend_from_end = None
+                            if isinstance(latlon_points, dict):
+                                extend_from_end = latlon_points.get('extendFromEnd')
+                                latlon_points = latlon_points.get('points') or []
+                            if not latlon_points or len(latlon_points) < 1:
+                                QMessageBox.warning(self, "Error", "At least one point is required to extend a line.")
+                                _reenable_finish_extend()
+                                return
+
+                            try:
+                                grid_points = self.operations.convert_latlon_points_to_grid(latlon_points)
+                            except Exception as e:
+                                QMessageBox.warning(self, "Error", str(e))
+                                _reenable_finish_extend()
+                                return
+                            if not grid_points or len(grid_points) < 1:
+                                QMessageBox.warning(self, "Error", "Failed to convert coordinates.")
+                                _reenable_finish_extend()
+                                return
+                            if extend_from_end is None:
+                                extend_from_end = self.operations.extension_attach_from_closest_end(
+                                    selected_line, grid_points[0],
+                                )
+
+                            segment_specs = self.operations.get_extension_elevation_specs(
+                                selected_line, grid_points, extend_from_end,
+                            )
+                            is_ferry_line, is_bus_line = self.operations.get_line_build_type_flags(selected_line)
+                            if is_ferry_line:
+                                elevation_levels = ['water'] * len(segment_specs)
+                            else:
+                                elevation_levels = self._prompt_route_elevation_levels(
+                                    segment_specs, is_bus_line=is_bus_line,
+                                )
+                            if elevation_levels is None:
+                                _reenable_finish_extend()
+                                return
+
+                            try:
+                                cost_info = self.operations.calculate_extend_cost(
+                                    selected_line, grid_points, extend_from_end, elevation_levels,
+                                )
+                            except Exception as e:
+                                QMessageBox.warning(self, "Error", str(e))
+                                _reenable_finish_extend()
+                                return
+
+                            if not cost_info:
+                                QMessageBox.warning(self, "Error", "Failed to calculate extension cost.")
+                                _reenable_finish_extend()
+                                return
+
+                            reply = QMessageBox.question(
+                                self, "Confirm Line Extension",
+                                f"Extending this line will cost ${cost_info['cost']} "
+                                f"(distance: {cost_info['length']:.2f} units). Proceed?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            )
+                            if reply != QMessageBox.StandardButton.Yes:
+                                _reenable_finish_extend()
+                                return
+
+                            def start_extend_worker():
+                                try:
+                                    ext_result = self.operations.extend_line_complete(
+                                        selected_line, current_player, grid_points,
+                                        extend_from_end, elevation_levels,
+                                        cost_info=cost_info,
+                                    )
+                                    _finish_extension_ui(ext_result)
+                                except Exception as e:
+                                    QMessageBox.warning(self, "Error", str(e))
+                                    _reenable_finish_extend()
+
+                            QTimer.singleShot(0, start_extend_worker)
+                        except Exception as e:
+                            import traceback
+                            logger.error("Error processing extend points: %s", e)
+                            traceback.print_exc()
+                            QMessageBox.warning(self, "Error", f"Failed to extend line: {e}")
+                            _reenable_finish_extend()
+
+                    def handle_extend_points(points_json):
+                        QTimer.singleShot(0, lambda pj=points_json: process_extend_points(pj))
+
+                    page.runJavaScript("JSON.stringify(window.finishLineExtension());", handle_extend_points)
                 
                 finish_extend_btn.clicked.connect(finish_extend_line)
             
@@ -8467,6 +9433,8 @@ class MainWindow(QMainWindow):
                     page = self._safe_get_webview_page(web_view)
                     if page:
                         page.runJavaScript("window.cancelLineExtension();")
+                    self._set_line_extension_active(current_player_tabs_dict, False)
+                    current_player_tabs_dict['line_extension_finishing'] = False
                     
                     extend_line_btn = current_player_tabs_dict.get('extend_line_btn')
                     finish_extend_btn = current_player_tabs_dict.get('finish_extend_btn')
@@ -8579,119 +9547,9 @@ class MainWindow(QMainWindow):
         if page is None:
             return
         
-        create_line_btn = player_tabs_dict.get('create_line_btn')
-        finish_line_btn = player_tabs_dict.get('finish_line_btn')
-        cancel_line_btn = player_tabs_dict.get('cancel_line_btn')
-        line_points_label = player_tabs_dict.get('line_points_label')
-        
-        if create_line_btn:
-            receivers = create_line_btn.receivers(create_line_btn.clicked)
-            if receivers > 0:
-                create_line_btn.clicked.disconnect()
-            
-            def start_line_creation():
-                # Use the player_id for this specific button, not current_player_index
-                current_player_tabs_dict = self.player_tabs_dict.get(player_id)
-                if not current_player_tabs_dict:
-                    QMessageBox.warning(self, "Error", "Player tabs not found.")
-                    return
-                
-                # Get the player object for this player_id
-                players = self.operations.get_players()
-                current_player = None
-                for p in players:
-                    if self.operations.get_player_id(p) == player_id:
-                        current_player = p
-                        break
-                
-                if not current_player:
-                    QMessageBox.warning(self, "Error", "No active player.")
-                    return
-                
-                line_name_widget = current_player_tabs_dict.get('line_name_input')
-                if not line_name_widget:
-                    QMessageBox.warning(self, "Error", "Line name input not found.")
-                    return
-                
-                from PyQt6.QtWidgets import QLineEdit
-                if not isinstance(line_name_widget, QLineEdit):
-                    QMessageBox.warning(self, "Error", "Line name input is not a valid widget.")
-                    return
-                
-                line_name = line_name_widget.text()
-                if line_name is None:
-                    line_name = ""
-                line_name = line_name.strip()
-                
-                if not line_name:
-                    QMessageBox.warning(self, "Error", "Please enter a line name first.")
-                    return
-                
-                start_web_view = current_player_tabs_dict.get(f'map_web_view_{player_id}')
-                if not start_web_view:
-                    start_web_view = getattr(self, 'map_web_view', None)
-                
-                # Safety check to prevent segfault
-                if start_web_view:
-                    try:
-                        page = start_web_view.page()
-                        if page is not None:
-                            page.runJavaScript("window.startLineCreation();")
-                            logger.debug("Started line creation for: %s", line_name)
-                        else:
-                            QMessageBox.warning(self, "Error", "Map page is not ready. Please wait for map to load.")
-                    except (RuntimeError, AttributeError) as e:
-                        QMessageBox.warning(self, "Error", f"Map is not ready: {e}. Please wait for map to load.")
-                else:
-                    QMessageBox.warning(self, "Error", "Map is not ready. Please wait for map to load.")
-                    return
-                
-                if create_line_btn:
-                    create_line_btn.setEnabled(False)
-                if finish_line_btn:
-                    finish_line_btn.setEnabled(True)
-                if cancel_line_btn:
-                    cancel_line_btn.setEnabled(True)
-            
-            create_line_btn.clicked.connect(start_line_creation)
-            logger.debug("Connected Start New Line button for player %s", player_id)
-        
-        if cancel_line_btn:
-            receivers = cancel_line_btn.receivers(cancel_line_btn.clicked)
-            if receivers > 0:
-                cancel_line_btn.clicked.disconnect()
-                
-                def cancel_line_creation():
-                    current_player = self.operations.get_current_player(self.current_player_index)
-                    if current_player:
-                        current_player_id = self.operations.get_player_id(current_player)
-                        current_player_tabs_dict = self.player_tabs_dict.get(current_player_id)
-                        if current_player_tabs_dict:
-                            cancel_web_view = current_player_tabs_dict.get(f'map_web_view_{current_player_id}')
-                            if not cancel_web_view:
-                                cancel_web_view = self.map_web_view
-                            if cancel_web_view and cancel_web_view.page():
-                                cancel_page = self._safe_get_webview_page(cancel_web_view)
-                                if cancel_page:
-                                    cancel_page.runJavaScript("window.cancelLineCreation();")
-                            
-                            create_line_btn = current_player_tabs_dict.get('create_line_btn')
-                            finish_line_btn = current_player_tabs_dict.get('finish_line_btn')
-                            cancel_line_btn_local = current_player_tabs_dict.get('cancel_line_btn')
-                            line_points_label = current_player_tabs_dict.get('line_points_label')
-                            
-                            if create_line_btn:
-                                create_line_btn.setEnabled(True)
-                            if finish_line_btn:
-                                finish_line_btn.setEnabled(False)
-                            if cancel_line_btn_local:
-                                cancel_line_btn_local.setEnabled(False)
-                            if line_points_label:
-                                line_points_label.setText("Points: 0")
-                
-                cancel_line_btn.clicked.connect(cancel_line_creation)
-                            
         def check_extend_line_request():
+            if self._any_map_edit_in_progress():
+                return
             # Get the current player's web_view
             if self.operations is None:
                 return
@@ -8809,7 +9667,10 @@ class MainWindow(QMainWindow):
                         if clear_page:
                             clear_page.runJavaScript("window.pendingAddStation = null; window.pendingAddStationLat = null; window.pendingAddStationLon = null;")
                     return
-                station_name, ok = QInputDialog.getText(self, "Station Name", "Enter station name:", text=f"Station at ({int(grid_x)}, {int(grid_y)})")
+                default_station = f"Station at ({int(grid_x)}, {int(grid_y)})"
+                station_name, ok = QInputDialog.getText(
+                    self, "Station Name", "Enter station name:", text=default_station,
+                )
                 if not ok or not station_name.strip():
                     if web_view and web_view.page():
                         clear_page = self._safe_get_webview_page(web_view)
@@ -9006,7 +9867,7 @@ class MainWindow(QMainWindow):
             point_count_timer.timeout.connect(check_point_count)
             point_count_timer.start(200)
             self._point_count_timers[timer_key_point] = point_count_timer
-        
+
         timer_key_add_station = f'add_station_timer_{player_id}'
         if not hasattr(self, '_add_station_timers'):
             self._add_station_timers = {}
@@ -9024,58 +9885,6 @@ class MainWindow(QMainWindow):
             station_click_timer.timeout.connect(check_station_clicked)
             station_click_timer.start(200)
             self._station_click_timers[timer_key_station_click] = station_click_timer
-        
-        def check_edit_mode_click():
-            if not getattr(self, 'edit_mode_enabled', False):
-                return
-            if self.operations is None:
-                return
-            current_player = self.operations.get_current_player(self.current_player_index)
-            if not current_player:
-                return
-            current_player_id = self.operations.get_player_id(current_player)
-            current_player_tabs_dict = self.player_tabs_dict.get(current_player_id)
-            if not current_player_tabs_dict:
-                return
-            web_view = current_player_tabs_dict.get(f'map_web_view_{current_player_id}')
-            page = self._safe_get_webview_page(web_view)
-            if not page:
-                return
-            
-            def handle_edit_click(result):
-                if not result or result == "null" or result == "undefined" or result is None:
-                    return
-                try:
-                    import json
-                    if isinstance(result, str):
-                        edit_data = json.loads(result)
-                    else:
-                        edit_data = result
-                    
-                    if edit_data and isinstance(edit_data, dict) and 'x' in edit_data and 'y' in edit_data:
-                        x = int(edit_data['x'])
-                        y = int(edit_data['y'])
-                        self._toggle_population_point(x, y)
-                except Exception as e:
-                    logger.debug("Error handling edit mode click: %s", e)
-            
-            # Poll for edit mode click data. Use atomic read-and-clear so the same click
-            # is never processed twice (runJavaScript is async; separate clear would race with next poll).
-            edit_mode_page = self._safe_get_webview_page(web_view)
-            if edit_mode_page:
-                edit_mode_page.runJavaScript(
-                    "(function(){ var d = window.editModeClickData; window.editModeClickData = null; return JSON.stringify(d); })();",
-                    handle_edit_click
-                )
-        
-        timer_key_edit_mode = f'edit_mode_timer_{player_id}'
-        if not hasattr(self, '_edit_mode_timers'):
-            self._edit_mode_timers = {}
-        if timer_key_edit_mode not in self._edit_mode_timers:
-            edit_mode_timer = QTimer()
-            edit_mode_timer.timeout.connect(check_edit_mode_click)
-            edit_mode_timer.start(50)  # Poll every 50ms for immediate removal feedback
-            self._edit_mode_timers[timer_key_edit_mode] = edit_mode_timer
         
         def check_close_station():
             def handle_close(result):
@@ -9219,9 +10028,6 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         logger.debug("_generate_osm_map_html called (deadline in %.1fs)", max(0, deadline - time.time()))
         logger.debug("game_map: %s, type: %s", game_map, type(game_map))
         
-        # Check if edit mode is enabled
-        edit_mode_enabled = getattr(self, 'edit_mode_enabled', False)
-        
         # Use map's center coordinates and presets via map_preset_loader
         from map_preset_loader import get_map_bounds, get_map_zoom, get_default_center_lat, get_default_center_lon
         from map_presets_standard import STANDARD_BOUNDS, STANDARD_ZOOM
@@ -9306,12 +10112,9 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             max_zoom = 18
         
         # Get population data (all filtering done in operations.get_population_points_for_display)
-        # In edit mode, also returns non-included points (included=False) for teal display
         population_data = []
         if self.operations is not None:
-            population_data = self.operations.get_population_points_for_display(
-                game_map, edit_mode_enabled=edit_mode_enabled
-            )
+            population_data = self.operations.get_population_points_for_display(game_map)
         
         # Filter points to only those within the visible map bounds
         filtered_population_data = []
@@ -9577,6 +10380,8 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         
         # Historical roads rendering removed - no longer displaying grey lines on map
         # (NYC_HISTORICAL_ROADS processing code removed)
+        if len(roads_data) > MAP_DISPLAY_MAX_ROADS:
+            roads_data = roads_data[:MAP_DISPLAY_MAX_ROADS]
         
         # Ensure waterways display - OSM tiles automatically show waterways
         # No additional code needed as OSM tiles include water features
@@ -9623,7 +10428,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>Transit Game Map</title>
+    <title>Railroad Baron Map</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         {leaflet_css}
@@ -9633,13 +10438,16 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             width: 100%;
             height: 100%;
             overflow: hidden;
+            position: relative;
         }}
         #map {{ 
-            height: 100vh; 
-            width: 100vw; 
             position: absolute;
             top: 0;
             left: 0;
+            right: 0;
+            bottom: 0;
+            width: 100%;
+            height: 100%;
         }}
         .line-end-label {{ pointer-events: none; }}
     </style>
@@ -9651,6 +10459,17 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
     </script>
     <script>
         var mapInstance = null;
+        function ensureMapContainerSize() {{
+            var h = window.innerHeight || document.documentElement.clientHeight || 600;
+            var w = window.innerWidth || document.documentElement.clientWidth || 800;
+            document.documentElement.style.height = h + 'px';
+            document.body.style.height = h + 'px';
+            var mapEl = document.getElementById('map');
+            if (mapEl) {{
+                mapEl.style.height = h + 'px';
+                mapEl.style.width = w + 'px';
+            }}
+        }}
         function initMap() {{
             if (typeof L === 'undefined') {{
                 document.getElementById('map').innerHTML = '<div style="padding: 20px; color: red;">Error: Leaflet failed to load. Check internet or static files.</div>';
@@ -9658,12 +10477,18 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             }}
             if (window.mapInstance) return;
             try {{
+                ensureMapContainerSize();
                 mapInstance = L.map('map', {{
                     minZoom: {min_zoom},
-                    maxZoom: {max_zoom}
+                    maxZoom: {max_zoom},
+                    scrollWheelZoom: true,
+                    dragging: true,
+                    touchZoom: true,
+                    doubleClickZoom: true,
+                    boxZoom: true,
+                    keyboard: true
                 }}).setView([{center_lat}, {center_lon}], {zoom_level});
             
-            var editModeEnabled = {json.dumps(edit_mode_enabled)};
             // OpenStreetMap tiles (standard OSM display)
             L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
                 attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -9677,32 +10502,6 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             setTimeout(function() {{ mapInstance.invalidateSize(); }}, 100);
             setTimeout(function() {{ if (window.mapInstance) window.mapInstance.invalidateSize(); }}, 400);
             setTimeout(function() {{ if (window.mapInstance) window.mapInstance.invalidateSize(); }}, 500);
-            
-            // Add full grid lines if edit mode is enabled
-            if (editModeEnabled) {{
-                var editGridLayer = L.layerGroup();
-                var mapWidth = {map_width_val};
-                var mapHeight = {map_height_val};
-                // Create grid lines for every grid point
-                for (var x = 0; x <= mapWidth; x++) {{
-                    var lon1 = {min_lon} + (x / mapWidth) * ({max_lon} - {min_lon});
-                    L.polyline([[{min_lat}, lon1], [{max_lat}, lon1]], {{
-                        color: '#000000',
-                        weight: 1,
-                        opacity: 0.5
-                    }}).addTo(editGridLayer);
-                }}
-                for (var y = 0; y <= mapHeight; y++) {{
-                    var lat1 = {min_lat} + (y / mapHeight) * ({max_lat} - {min_lat});
-                    L.polyline([[lat1, {min_lon}], [lat1, {max_lon}]], {{
-                        color: '#000000',
-                        weight: 1,
-                        opacity: 0.5
-                    }}).addTo(editGridLayer);
-                }}
-                editGridLayer.addTo(mapInstance);
-                window.editGridLayer = editGridLayer;
-            }}
             
             mapInstance.setMaxBounds([[{min_lat}, {min_lon}], [{max_lat}, {max_lon}]]);
             
@@ -9724,7 +10523,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             }}
         
         var populationData = {population_json};
-        // Store population markers for edit mode removal
+        // Store population markers
         if (typeof window.populationMarkers === 'undefined') {{
             window.populationMarkers = [];
         }}
@@ -9737,7 +10536,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         populationData.forEach(function(item) {{
             var pop = item.pop || 0;
                 var radius = Math.max(2, Math.min(2.5, Math.sqrt(Math.max(1, pop) / 50)));
-                var color = (item.included === false) ? '#008080' : getPopulationColor(pop);  // Teal for non-included
+                var color = getPopulationColor(pop);
             var marker = L.circleMarker([item.lat, item.lon], {{
                 radius: radius,
                 fillColor: color,
@@ -9766,40 +10565,9 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 expansionLimit.addTo(mapInstance);
             }}
             
-            // In edit mode, clicking a population point removes it permanently from INCLUDED_POINTS
-            if (editModeEnabled) {{
-                // Add larger invisible hit area so marker reliably catches clicks (radius 2-2.5px is hard to hit)
-                var hitRadiusM = 15;  // ~15m - easy to click, won't overlap adjacent markers
-                var hitCircle = L.circle([item.lat, item.lon], {{ radius: hitRadiusM, fill: true, fillOpacity: 0, weight: 0, interactive: true }});
-                hitCircle._populationItem = item;
-                hitCircle.on('click', function(e) {{
-                    e.originalEvent.stopPropagation();
-                    var it = e.target._populationItem;
-                    var gX = it.grid_x !== undefined ? it.grid_x : Math.round(((e.latlng.lng - {min_lon}) / ({max_lon} - {min_lon})) * {map_width_val});
-                    var gY = it.grid_y !== undefined ? it.grid_y : Math.round(((e.latlng.lat - {min_lat}) / ({max_lat} - {min_lat})) * {map_height_val});
-                    window.editModeClickData = {{ x: gX, y: gY }};
-                    mapInstance.removeLayer(marker);
-                    mapInstance.removeLayer(hitCircle);
-                    var idx = window.populationMarkers.indexOf(marker);
-                    if (idx > -1) window.populationMarkers.splice(idx, 1);
-                }});
-                marker.on('click', function(e) {{
-                    e.originalEvent.stopPropagation();
-                    var gridX = item.grid_x !== undefined ? item.grid_x : Math.round(((e.latlng.lng - {min_lon}) / ({max_lon} - {min_lon})) * {map_width_val});
-                    var gridY = item.grid_y !== undefined ? item.grid_y : Math.round(((e.latlng.lat - {min_lat}) / ({max_lat} - {min_lat})) * {map_height_val});
-                    window.editModeClickData = {{ x: gridX, y: gridY }};
-                    mapInstance.removeLayer(marker);
-                    mapInstance.removeLayer(hitCircle);
-                    var index = window.populationMarkers.indexOf(marker);
-                    if (index > -1) window.populationMarkers.splice(index, 1);
-                }});
-                hitCircle.addTo(mapInstance);  // Add after marker so hit area is on top and catches clicks
-            }} else {{
-                // Normal mode: show population popup with coordinates
-                var gridX = item.grid_x !== undefined ? item.grid_x : 'N/A';
-                var gridY = item.grid_y !== undefined ? item.grid_y : 'N/A';
-                marker.bindPopup('Population: ' + pop + '<br/>Coordinates: (' + gridX + ', ' + gridY + ')');
-            }}
+            var gridX = item.grid_x !== undefined ? item.grid_x : 'N/A';
+            var gridY = item.grid_y !== undefined ? item.grid_y : 'N/A';
+            marker.bindPopup('Population: ' + pop + '<br/>Coordinates: (' + gridX + ', ' + gridY + ')');
             marker.addTo(mapInstance);
             // Store marker for potential removal
             window.populationMarkers.push(marker);
@@ -9809,7 +10577,8 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         var linesData = {lines_json};
             var playerColorsHex = {json.dumps(PLAYER_COLORS_HEX)};
             var lineLayers = [];
-        linesData.forEach(function(line) {{
+        function renderMapLinesOntoMap(linesToRender, layerBucket) {{
+        linesToRender.forEach(function(line) {{
                 var isUnderConstruction = line.under_construction || false;
                 var ownerId = line.owner_id !== undefined ? line.owner_id : -1;
                 var lineColor;
@@ -9871,7 +10640,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 }});
                 
                 lineLayer.addTo(mapInstance);
-                lineLayers.push(lineLayer);
+                layerBucket.push(lineLayer);
                 // Add line name at both ends (small labels) with type symbol: train, ferry, or bus
                 var lineLabelStyle = 'font-size:9px;font-weight:bold;color:' + lineColor + ';text-shadow:0 0 2px #fff,0 0 2px #fff;white-space:nowrap;pointer-events:none;';
                 var pts = line.points;
@@ -9883,9 +10652,22 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     var mk2 = L.marker([last[0], last[1]], {{ icon: L.divIcon({{ className: 'line-end-label', html: labelHtml, iconSize: null, iconAnchor: [0, 0] }}) }});
                     mk1.addTo(mapInstance);
                     mk2.addTo(mapInstance);
-                    lineLayers.push(mk1, mk2);
+                    layerBucket.push(mk1, mk2);
                 }}
             }});
+        }}
+        renderMapLinesOntoMap(linesData, lineLayers);
+        window._mapLineLayers = lineLayers;
+        window.refreshMapLines = function(newLinesData) {{
+            if (!mapInstance) return;
+            if (window._mapLineLayers) {{
+                window._mapLineLayers.forEach(function(layer) {{
+                    try {{ mapInstance.removeLayer(layer); }} catch (e) {{}}
+                }});
+            }}
+            window._mapLineLayers = [];
+            renderMapLinesOntoMap(newLinesData || [], window._mapLineLayers);
+        }};
         
         // Render roads (only roads that exist at current year)
         var roadsData = {json.dumps(roads_data if roads_data else [])};
@@ -9902,29 +10684,45 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             roadLayers.push(roadLayer);
         }});
             
-            var stationsData = {stations_json};
-            stationsData.forEach(function(station) {{
-                var color = (station.under_construction === true) ? '#888888' : '#00ff00';
-                var label = (station.under_construction === true) ? ' (under construction)' : '';
-                var lineNames = station.line_names || [];
-                var lineLabel = lineNames.length ? ' (' + lineNames.join(', ') + ')' : '';
-                var labelStyle = 'font-size:9px;font-weight:bold;color:#333;text-shadow:0 0 2px #fff,0 0 2px #fff;white-space:nowrap;pointer-events:none;';
-                var nameAndLine = (station.name || '');
-                var markerHtml = '<div style="display:inline-block;vertical-align:middle;"><div style="background-color: ' + color + '; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div><span style="' + labelStyle + '">' + (nameAndLine.replace(/</g, '&lt;')) + '</span></div>';
-                var stationMarker = L.marker([station.lat, station.lon], {{
-                    icon: L.divIcon({{
-                        className: 'station-marker',
-                        html: markerHtml,
-                        iconSize: null,
-                        iconAnchor: [0, 6]
-                    }})
+            function renderMapStationsOntoMap(stationsData, stationLayers) {{
+                (stationsData || []).forEach(function(station) {{
+                    var color = (station.under_construction === true) ? '#888888' : '#00ff00';
+                    var label = (station.under_construction === true) ? ' (under construction)' : '';
+                    var lineNames = station.line_names || [];
+                    var lineLabel = lineNames.length ? ' (' + lineNames.join(', ') + ')' : '';
+                    var labelStyle = 'font-size:9px;font-weight:bold;color:#333;text-shadow:0 0 2px #fff,0 0 2px #fff;white-space:nowrap;pointer-events:none;';
+                    var nameAndLine = (station.name || '');
+                    var markerHtml = '<div style="display:inline-block;vertical-align:middle;"><div style="background-color: ' + color + '; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div><span style="' + labelStyle + '">' + (nameAndLine.replace(/</g, '&lt;')) + '</span></div>';
+                    var stationMarker = L.marker([station.lat, station.lon], {{
+                        icon: L.divIcon({{
+                            className: 'station-marker',
+                            html: markerHtml,
+                            iconSize: null,
+                            iconAnchor: [0, 6]
+                        }})
+                    }});
+                    var encodedName = encodeURIComponent(station.name || '');
+                    var closeBtnHtml = (station.can_close !== false) ? '<button class="close-station-btn" data-station-name="' + encodedName + '">Close Station</button>' : '';
+                    var stationPopupContent = '<div><b>Station: ' + (station.name || '') + label + '</b>' + (lineLabel ? '<br/>Line(s): ' + (station.line_names || []).join(', ') : '') + '<br/>' + closeBtnHtml + '</div>';
+                    stationMarker.bindPopup(stationPopupContent);
+                    stationMarker.addTo(mapInstance);
+                    stationLayers.push(stationMarker);
                 }});
-                var encodedName = encodeURIComponent(station.name || '');
-                var closeBtnHtml = (station.can_close !== false) ? '<button class="close-station-btn" data-station-name="' + encodedName + '">Close Station</button>' : '';
-                var stationPopupContent = '<div><b>Station: ' + (station.name || '') + label + '</b>' + (lineLabel ? '<br/>Line(s): ' + (station.line_names || []).join(', ') : '') + '<br/>' + closeBtnHtml + '</div>';
-                stationMarker.bindPopup(stationPopupContent);
-                stationMarker.addTo(mapInstance);
-            }});
+            }}
+            var stationsData = {stations_json};
+            var stationLayers = [];
+            renderMapStationsOntoMap(stationsData, stationLayers);
+            window._mapStationLayers = stationLayers;
+            window.refreshMapStations = function(newStationsData) {{
+                if (!mapInstance) return;
+                if (window._mapStationLayers) {{
+                    window._mapStationLayers.forEach(function(layer) {{
+                        try {{ mapInstance.removeLayer(layer); }} catch (e) {{}}
+                    }});
+                }}
+                window._mapStationLayers = [];
+                renderMapStationsOntoMap(newStationsData || [], window._mapStationLayers);
+            }};
             
             window.extendLine = function(lineName) {{
                 var event = new CustomEvent('mapLineExtend', {{
@@ -9996,43 +10794,6 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             var isCreatingStation = false;
             
             mapInstance.on('click', function(e) {{
-                // Check if edit mode is enabled and handle population point editing
-                if (editModeEnabled && !isCreatingLine && !isExtendingLine && !isCreatingStation) {{
-                    var mapWidth = {map_width_val};
-                    var mapHeight = {map_height_val};
-                    var gridX = Math.round(((e.latlng.lng - {min_lon}) / ({max_lon} - {min_lon})) * mapWidth);
-                    var gridY = Math.round(((e.latlng.lat - {min_lat}) / ({max_lat} - {min_lat})) * mapHeight);
-                    // Only use a marker's coords when click is VERY close (on the marker). Otherwise we'd
-                    // wrongly remove a Staten Island point when user clicks on water/off-island (19,25).
-                    // Use ~15% of a cell - only matches when click is essentially on the marker.
-                    var clickLat = e.latlng.lat;
-                    var clickLon = e.latlng.lng;
-                    var tightLat = (({max_lat} - {min_lat}) / mapHeight) * 0.15;
-                    var tightLon = (({max_lon} - {min_lon}) / mapWidth) * 0.15;
-                    var closest = null;
-                    var minDist = Infinity;
-                    if (populationData && populationData.length > 0) {{
-                        for (var i = 0; i < populationData.length; i++) {{
-                            var item = populationData[i];
-                            var dLat = Math.abs(item.lat - clickLat);
-                            var dLon = Math.abs(item.lon - clickLon);
-                            if (dLat <= tightLat && dLon <= tightLon) {{
-                                var dist = dLat * dLat + dLon * dLon;
-                                if (dist < minDist) {{
-                                    minDist = dist;
-                                    closest = item;
-                                }}
-                            }}
-                        }}
-                    }}
-                    if (closest && closest.grid_x !== undefined && closest.grid_y !== undefined) {{
-                        gridX = closest.grid_x;
-                        gridY = closest.grid_y;
-                    }}
-                    window.editModeClickData = {{ x: gridX, y: gridY }};
-                    return;
-                }}
-                
                 if (isCreatingLine) {{
                     clickedPoints.push([e.latlng.lat, e.latlng.lng]);
                     var marker = L.marker(e.latlng, {{
@@ -10141,9 +10902,10 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 clickedPoints = [];
             }};
             
+            // Do not clear isCreatingLine here — Python cancels only after success or Cancel.
+            // Returning a copy keeps points if the user backs out of line-type / elevation dialogs.
             window.finishLineCreation = function() {{
-                isCreatingLine = false;
-                return clickedPoints;
+                return clickedPoints.slice();
             }};
             
             window.cancelLineCreation = function() {{
@@ -10216,17 +10978,9 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 updateExtendPreviewLine();
             }};
             
+            // Keep extension mode until Python confirms success or Cancel.
             window.finishLineExtension = function() {{
-                isExtendingLine = false;
-                var result = extendClickedPoints;
-                extendClickedPoints = [];
-                extendingLineName = null;
-                // Remove preview line
-                if (window.extendPreviewLine) {{
-                    mapInstance.removeLayer(window.extendPreviewLine);
-                    window.extendPreviewLine = null;
-                }}
-                return result;
+                return extendClickedPoints.slice();
             }};
             
             window.cancelLineExtension = function() {{
@@ -10311,7 +11065,15 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             document.addEventListener('visibilitychange', function() {{
                 var m = window.mapInstance;
                 if (m && !document.hidden) {{
+                    ensureMapContainerSize();
                     setTimeout(function() {{ m.invalidateSize(); }}, 100);
+                }}
+            }});
+            window.addEventListener('resize', function() {{
+                ensureMapContainerSize();
+                var m = window.mapInstance;
+                if (m) {{
+                    setTimeout(function() {{ m.invalidateSize(); }}, 50);
                 }}
             }});
         }}
@@ -10384,17 +11146,26 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         """Update AI Watch tab's finances section (all years money up/down)."""
         if not self.operations or not getattr(self, 'ai_watch_enabled', False):
             return
-        if not hasattr(self, 'ai_watch_finances_text') or not self.ai_watch_finances_text:
+        if not hasattr(self, 'ai_watch_finances_down_text') or not self.ai_watch_finances_down_text:
             return
         ai_summary = self.operations.get_ai_money_debug_summary()
-        ai_lines = []
+        down_lines = []
+        up_lines = []
         for e in ai_summary.get('downs', []):
-            ai_lines.append(f"  DOWN  Year {e['year']}  {e['player_name']}: -${e['amount']:,}  ({e['reason']})  Balance after: ${e['balance_after']:,}")
+            down_lines.append(
+                f"Year {e['year']}  {e['player_name']}: -${e['amount']:,}  ({e['reason']})  Balance: ${e['balance_after']:,}"
+            )
         for e in ai_summary.get('ups', []):
-            ai_lines.append(f"  UP    Year {e['year']}  {e['player_name']}: +${e['amount']:,}  ({e['reason']})  Balance after: ${e['balance_after']:,}")
-        if not ai_summary.get('downs') and not ai_summary.get('ups'):
-            ai_lines.append("  (No AI money changes recorded yet.)")
-        self.ai_watch_finances_text.setText("\n".join(ai_lines))
+            up_lines.append(
+                f"Year {e['year']}  {e['player_name']}: +${e['amount']:,}  ({e['reason']})  Balance: ${e['balance_after']:,}"
+            )
+        if not down_lines:
+            down_lines.append("(No money-down entries yet.)")
+        if not up_lines:
+            up_lines.append("(No money-up entries yet.)")
+        self.ai_watch_finances_down_text.setPlainText("\n".join(down_lines))
+        if hasattr(self, 'ai_watch_finances_up_text') and self.ai_watch_finances_up_text:
+            self.ai_watch_finances_up_text.setPlainText("\n".join(up_lines))
     
     def DisplayLinesControls(self, player=None):
         if player is None:
@@ -10501,25 +11272,34 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 
                 line_layout = QHBoxLayout()
                 line_layout.addWidget(QLabel(f"  {line_name}:"))
-                
+
+                from inflation_utils import FARE_QUARTER_DOLLARS, format_fare_display
+                min_fare_quarters = 8  # $2.00
+                _, max_nominal_fare = self.operations.get_nominal_fare_cap(self.operations.get_year())
+                max_fare_quarters = max(min_fare_quarters, int(round(float(max_nominal_fare) / FARE_QUARTER_DOLLARS)))
+
                 fare_slider = QSlider(Qt.Orientation.Horizontal)
-                fare_slider.setMinimum(1)
-                fare_slider.setMaximum(15)
-                fare_slider.setValue(self.operations.get_line_fare(line))
+                fare_slider.setMinimum(min_fare_quarters)
+                fare_slider.setMaximum(max_fare_quarters)
+                current_fare = self.operations.get_line_fare(line)
+                fare_slider.setValue(int(round(current_fare / FARE_QUARTER_DOLLARS)))
+                fare_slider.setSingleStep(1)
+                fare_slider.setPageStep(4)
                 fare_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-                fare_slider.setTickInterval(1)
+                fare_slider.setTickInterval(4)
                 fare_slider.setMinimumWidth(200)
-                
-                fare_label = QLabel(f"${self.operations.get_line_fare(line)}")
-                fare_label.setMinimumWidth(40)
-                
+
+                fare_label = QLabel(format_fare_display(current_fare))
+                fare_label.setMinimumWidth(48)
+
                 slider_key = (self.operations.get_player_id(player), line_name)
                 self.fare_sliders[slider_key] = (fare_slider, fare_label, line)
-                
+
                 def make_fare_updater(slider, label, line_obj):
-                    def update_fare(value):
-                        self.operations.set_line_fare(line_obj, value)
-                        label.setText(f"${value}")
+                    def update_fare(quarters):
+                        fare = quarters * FARE_QUARTER_DOLLARS
+                        self.operations.set_line_fare(line_obj, fare)
+                        label.setText(format_fare_display(fare))
                     return update_fare
                 
                 fare_slider.valueChanged.connect(make_fare_updater(fare_slider, fare_label, line))
@@ -11583,14 +12363,15 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                                                          f"Are you sure you want to sell line '{line_name}' to the marketplace?",
                                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                             if reply == QMessageBox.StandardButton.Yes:
-                                self.operations.add_line_to_marketplace(line)
-                                if line_name in current_player.get_line_names():
-                                    current_player.get_line_names().remove(line_name)
-                                game_map.lines.pop(line_name, None)
-                                QMessageBox.information(self, "Line Sold", f"Line '{line_name}' has been listed on the marketplace.")
+                                result = self.operations.sell_player_line_to_marketplace(current_player, line_name)
+                                if result.get('listed'):
+                                    QMessageBox.information(self, "Line Sold", f"Line '{line_name}' has been listed on the marketplace.")
+                                else:
+                                    QMessageBox.information(self, "Line Removed", f"Pending work on '{line_name}' was cancelled.")
                                 self.refresh_construction_tab()
                                 self.DisplayMapInfo()
                                 self.DisplayLinesControls(current_player)
+                                self.DisplayMarketplaceInfo()
                         sell_btn.clicked.connect(sell_line_to_marketplace)
                         job_layout.addWidget(sell_btn)
                     separator = QFrame()
@@ -11637,427 +12418,6 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 self.refresh_construction_tab()
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to cancel build: {str(e)}")
-
-
-    def _remove_population_point(self, x: int, y: int):
-        """Remove a population point at (x, y) from the INCLUDED_POINTS file.
-        Called when user clicks on a population point in edit mode.
-        If point is not in the file, does nothing (e.g. click on empty space)."""
-        if self.operations is None:
-            return
-        game_map = self.operations.get_map()
-        if not game_map:
-            return
-        from map_preset_utils import get_preset_file_info, read_included_points_from_file, write_included_points_to_file
-        import os
-
-        preset_info = get_preset_file_info(game_map)
-        if not preset_info:
-            QMessageBox.warning(self, "Edit Mode", "Could not detect map preset file. Edit mode is only available for maps with preset files.")
-            return
-        file_path, variable_name = preset_info
-        if not os.path.exists(file_path):
-            QMessageBox.warning(self, "Edit Mode", f"Preset file not found: {file_path}")
-            return
-        if not os.access(file_path, os.W_OK):
-            QMessageBox.warning(self, "Edit Mode", f"Preset file is not writable: {file_path}")
-            return
-
-        x, y = int(round(x)), int(round(y))
-        point = (x, y)
-
-        existing_points = read_included_points_from_file(file_path, variable_name)
-        if existing_points is None:
-            existing_points = set()
-        existing_points = set(((int(round(p[0])), int(round(p[1]))) for p in existing_points if isinstance(p, (tuple, list)) and len(p) >= 2))
-
-        # Resolve point - try exact match, then fuzzy match within 1 pixel
-        to_remove = None
-        if point in existing_points:
-            to_remove = point
-        else:
-            similar = [p for p in existing_points if abs(p[0] - x) <= 1 and abs(p[1] - y) <= 1]
-            if similar:
-                to_remove = min(similar, key=lambda p: abs(p[0] - x) + abs(p[1] - y))
-
-        if to_remove is None:
-            return  # Point not in file - no-op (e.g. clicked empty space)
-
-        previous_population = game_map.population.get(to_remove, 0)
-        existing_points.discard(to_remove)
-        success = write_included_points_to_file(
-            file_path, variable_name, existing_points, max_points_to_remove=1
-        )
-        if not success:
-            QMessageBox.warning(self, "Edit Mode", f"Failed to write changes to {file_path}")
-            return
-
-        # Immediately update game map so display refresh shows correct state
-        if to_remove in game_map.population:
-            del game_map.population[to_remove]
-        # File is source of truth - point is gone from file. Clear from deleted sets
-        # so get_population_points_for_display (which reads from file) never shows it.
-        if hasattr(game_map, '_deleted_population_points') and to_remove in game_map._deleted_population_points:
-            game_map._deleted_population_points.discard(to_remove)
-        if hasattr(self.operations, '_session_deleted_population_points') and to_remove in self.operations._session_deleted_population_points:
-            self.operations._session_deleted_population_points.discard(to_remove)
-
-        # Verify the file was actually updated - read back and confirm point is gone
-        import time
-        time.sleep(0.02)  # Allow filesystem to sync
-        verify_points = read_included_points_from_file(file_path, variable_name)
-        if verify_points is not None and to_remove in verify_points:
-            # Restore point in game_map since file write failed
-            game_map.population[to_remove] = previous_population
-            game_map._deleted_population_points.discard(to_remove)
-            if hasattr(self.operations, '_session_deleted_population_points'):
-                self.operations._session_deleted_population_points.discard(to_remove)
-            QMessageBox.warning(self, "Edit Mode", f"Failed to remove point {to_remove} from file. Please try again.")
-            return
-
-        # Reload map preset from disk so registry and all imports see updated INCLUDED_POINTS
-        from map_preset_loader import reload_map_preset_from_disk
-        if hasattr(game_map, 'map_preset_name') and game_map.map_preset_name:
-            reload_map_preset_from_disk(game_map.map_preset_name)
-        if hasattr(game_map, 'invalidate_buildable_area_cache'):
-            game_map.invalidate_buildable_area_cache()
-
-        # Edit history for undo
-        previous_state = {
-            'map_type': variable_name.replace('_INCLUDED_POINTS', '').lower(),
-            'point': to_remove,
-            'was_present': True,
-            'previous_population': previous_population
-        }
-        if not hasattr(self, 'edit_history'):
-            self.edit_history = []
-        self.edit_history.append({
-            'previous_state': previous_state,
-            'file_path': file_path,
-            'variable_name': variable_name,
-        })
-        for pid, ptd in self.player_tabs_dict.items():
-            undo_btn = ptd.get('undo_btn')
-            if undo_btn:
-                undo_btn.setEnabled(True)
-
-        # Refresh map so display stays in sync with file (file is source of truth)
-        self.DisplayMapInfo()
-        QApplication.processEvents()
-
-
-    def _toggle_population_point(self, x: int, y: int):
-        """Toggle a population point at (x, y) - add if missing, remove if present.
-        Updates the appropriate INCLUDED_POINTS list permanently.
-        Works generically with any map preset that follows the standard naming convention."""
-        if self.operations is None:
-            return
-        
-        # Debounce: ignore duplicate clicks on same point within 200ms (poll can fire before JS clear completes)
-        import time
-        now = time.time()
-        last_key = getattr(self, '_last_toggle_point', None)
-        last_time = getattr(self, '_last_toggle_time', 0)
-        if last_key == (x, y) and (now - last_time) < 0.2:
-            return
-        self._last_toggle_point = (x, y)
-        self._last_toggle_time = now
-        
-        game_map = self.operations.get_map()
-        if not game_map:
-            return
-        
-        # Use generic utility to detect preset file and variable name
-        from map_preset_utils import get_preset_file_info, read_included_points_from_file, write_included_points_to_file
-        
-        preset_info = get_preset_file_info(game_map)
-        if not preset_info:
-            QMessageBox.warning(self, "Edit Mode", "Could not detect map preset file. Edit mode is only available for maps with preset files.")
-            return
-        
-        file_path, variable_name = preset_info
-        
-        # Verify file exists and is writable
-        import os
-        if not os.path.exists(file_path):
-            QMessageBox.warning(self, "Edit Mode", f"Preset file not found: {file_path}")
-            return
-        if not os.access(file_path, os.W_OK):
-            QMessageBox.warning(self, "Edit Mode", f"Preset file is not writable: {file_path}")
-            return
-        
-        # Ensure coordinates are integers (points in file are stored as integers)
-        x = int(round(x))
-        y = int(round(y))
-        point = (x, y)
-        
-        logger.debug("Toggling point %s (x=%s, y=%s)", point, x, y)
-        logger.debug("Target file: %s", file_path)
-        logger.debug("Target variable: %s", variable_name)
-        
-        # Read current points from file (read_included_points_from_file reads file directly)
-        existing_points = None
-        for attempt in range(3):
-            existing_points = read_included_points_from_file(file_path, variable_name)
-            if existing_points is not None:
-                break
-            import time
-            time.sleep(0.01)
-        
-        if existing_points is None:
-            existing_points = set()
-            logger.debug("Failed to read points from file, using empty set")
-        
-        # Ensure all points are tuples of integers (normalize format)
-        normalized_points = set()
-        for p in existing_points:
-            if isinstance(p, (tuple, list)) and len(p) >= 2:
-                px, py = int(round(p[0])), int(round(p[1]))
-                normalized_points.add((px, py))
-        existing_points = normalized_points
-        
-        # Remove any duplicates (set already does this, but be explicit)
-        existing_points = set(existing_points)
-        
-        # Use DISPLAYED points (file - session_deleted) as source of truth for toggle.
-        # If point is in file but in session_deleted, it's NOT displayed - user sees empty cell.
-        # Clicking empty should ADD (un-delete), not REMOVE. Using raw file would wrongly REMOVE.
-        deleted_points = (getattr(game_map, '_deleted_population_points', set()) or set()) | (
-            getattr(self.operations, '_session_deleted_population_points', set()) or set()
-        )
-        displayed_points = existing_points - deleted_points
-        point_in_display = point in displayed_points
-        point_in_file = point in existing_points
-        
-        logger.debug("File has %d points before toggle (displayed: %d)", len(existing_points), len(displayed_points))
-        logger.debug("Point %s - in file: %s, in display: %s", point, point_in_file, point_in_display)
-        
-        if point_in_display:
-            point_exists = True
-            logger.debug("Point %s is displayed - will REMOVE it", point)
-        else:
-            # Point not displayed: ADD it. Do NOT use fuzzy match to remove a nearby point -
-            # clicking on empty space means the user wants to add, not remove a neighbor.
-            point_exists = False
-            logger.debug("Point %s not displayed - will ADD it", point)
-        
-        # Store previous state for undo
-        previous_state = {
-            'map_type': variable_name.replace('_INCLUDED_POINTS', '').lower(),
-            'point': point,
-            'was_present': point_exists,
-            'previous_population': game_map.population.get(point, 0)
-        }
-        
-        # Toggle the point based on whether it EXISTS (visible or in file)
-        if point_exists:
-            # Point exists - REMOVE it
-            # At this point, 'point' has been updated to the correct value (possibly via fuzzy matching)
-            if point in existing_points:
-                existing_points.remove(point)
-                logger.debug("Successfully removed %s from existing_points set", point)
-            else:
-                logger.error("Point %s not in existing_points! This should not happen.", point)
-                # Try one more time with the original coordinates
-                original_point = (x, y)
-                if original_point in existing_points:
-                    existing_points.remove(original_point)
-                    point = original_point
-                    logger.debug("Removed using original coordinates %s", point)
-                else:
-                    logger.error("CRITICAL ERROR - Cannot remove point %s or %s from file!", point, original_point)
-            
-            action = "removed"
-            logger.debug("REMOVING point %s from file (was present/visible). Set now has %d points.", point, len(existing_points))
-        else:
-            # Point doesn't exist - ADD it
-            existing_points.add(point)
-            action = "added"
-            logger.debug("ADDING point %s to file (was not present/visible). Set now has %d points.", point, len(existing_points))
-        
-        # Ensure no duplicates before writing
-        existing_points = set(existing_points)  # Deduplicate
-        logger.debug("After toggle, will write %d points to file", len(existing_points))
-        
-        # IMMEDIATELY write to file - this is the source of truth
-        # When removing, use safeguard to prevent mass deletion from read failure
-        max_remove = 1 if point_exists else None
-        success = write_included_points_to_file(file_path, variable_name, existing_points, max_points_to_remove=max_remove)
-        if not success:
-            QMessageBox.warning(self, "Edit Mode", f"Failed to write changes to {file_path}")
-            return
-        
-        logger.debug("Immediately wrote %s point %s to %s. File now has %d points.", action, point, file_path, len(existing_points))
-        
-        # VERIFY the write by reading back immediately
-        import time
-        time.sleep(0.02)  # Small delay for file system
-        verify_points = read_included_points_from_file(file_path, variable_name)
-        if verify_points is None:
-            verify_points = set()
-            logger.warning("Could not read file for verification!")
-        
-        # Normalize verification points
-        verify_points = set((int(round(p[0])), int(round(p[1]))) for p in verify_points if isinstance(p, (tuple, list)) and len(p) >= 2)
-        
-        logger.debug("Verification - File now contains %d points", len(verify_points))
-        logger.debug("Verification - Expected %d points after %s", len(existing_points), action)
-        if len(verify_points) != len(existing_points):
-            logger.warning("Point count mismatch! Expected %d, got %d", len(existing_points), len(verify_points))
-        
-        point_verified = point in verify_points
-        if action == "removed":
-            if point_verified:
-                logger.error("Point %s still in file after removal! Verification failed.", point)
-                logger.debug("File contents: %s", sorted(list(verify_points))[:10] if len(verify_points) > 10 else sorted(list(verify_points)))
-                QMessageBox.warning(self, "Edit Mode", f"Failed to remove point {point} from file. Please try again.")
-                return
-            else:
-                logger.debug("Verified removal - point %s not in file (file has %d points)", point, len(verify_points))
-        else:  # added
-            if not point_verified:
-                logger.error("Point %s not in file after addition! Verification failed.", point)
-                logger.debug("File contents: %s", sorted(list(verify_points))[:10] if len(verify_points) > 10 else sorted(list(verify_points)))
-                QMessageBox.warning(self, "Edit Mode", f"Failed to add point {point} to file. Please try again.")
-                return
-            else:
-                logger.debug("Verified addition - point %s is in file (file has %d points)", point, len(verify_points))
-        
-        # Check for duplicates in verification and clean them up
-        if len(verify_points) != len(set(verify_points)):
-            logger.warning("Found duplicates in file! Cleaning up...")
-            from map_preset_utils import remove_duplicates_from_file
-            remove_duplicates_from_file(file_path, variable_name)
-            verify_points = read_included_points_from_file(file_path, variable_name)
-            if verify_points is None:
-                verify_points = set()
-            verify_points = set((int(round(p[0])), int(round(p[1]))) for p in verify_points if isinstance(p, (tuple, list)) and len(p) >= 2)
-            logger.debug("After cleanup, file has %d unique points", len(verify_points))
-        
-        # IMMEDIATELY update the game map population to match the file
-        # CRITICAL: We must update the population dictionary to reflect the file state RIGHT NOW
-        if action == "removed":
-            # COMPLETELY REMOVE the point from the population dictionary IMMEDIATELY
-            # This ensures it disappears from the display right away
-            old_pop = game_map.population.get(point, 0)
-            if point in game_map.population:
-                del game_map.population[point]
-            # File is now source of truth - point is gone from file. Clear from deleted sets
-            # so get_population_points_for_display (which reads from file) never shows it.
-            if hasattr(game_map, '_deleted_population_points') and point in game_map._deleted_population_points:
-                game_map._deleted_population_points.discard(point)
-            if hasattr(self, 'operations') and self.operations and hasattr(self.operations, '_session_deleted_population_points') and point in self.operations._session_deleted_population_points:
-                self.operations._session_deleted_population_points.discard(point)
-            logger.debug("Immediately removed point %s from population dictionary (was %s)", point, old_pop)
-        else:
-            # ADD: remove from session_deleted/_deleted so point appears (un-delete if it was in file)
-            if hasattr(game_map, '_deleted_population_points') and point in game_map._deleted_population_points:
-                game_map._deleted_population_points.discard(point)
-            if hasattr(self.operations, '_session_deleted_population_points') and point in self.operations._session_deleted_population_points:
-                self.operations._session_deleted_population_points.discard(point)
-            # Set a default population if adding - use preset's get_population_at_location when available
-            x, y = point[0], point[1]
-            pop = 100  # fallback
-            if hasattr(game_map, 'map_preset_name') and game_map.map_preset_name:
-                from map_preset_loader import get_map_bounds, load_map_preset
-                bounds = get_map_bounds(game_map.map_preset_name)
-                if bounds:
-                    lat = bounds['min_lat'] + (y / game_map.height) * (bounds['max_lat'] - bounds['min_lat'])
-                    lon = bounds['min_lon'] + (x / game_map.width) * (bounds['max_lon'] - bounds['min_lon'])
-                    preset = load_map_preset(game_map.map_preset_name)
-                    if preset and hasattr(preset, 'get_population_at_location'):
-                        try:
-                            pop = preset.get_population_at_location(lat, lon, False)
-                        except TypeError:
-                            try:
-                                pop = preset.get_population_at_location(lat, lon, False, x, y, game_map.width, game_map.height)
-                            except Exception:
-                                pop = 100
-            game_map.population[point] = pop
-        
-        # Reload preset from disk so registry and all imports see updated INCLUDED_POINTS
-        from map_preset_loader import reload_map_preset_from_disk
-        if hasattr(game_map, 'map_preset_name') and game_map.map_preset_name:
-            reload_map_preset_from_disk(game_map.map_preset_name)
-        if hasattr(game_map, 'invalidate_buildable_area_cache'):
-            game_map.invalidate_buildable_area_cache()
-        
-        # Add to edit history for undo
-        if not hasattr(self, 'edit_history'):
-            self.edit_history = []
-        self.edit_history.append({
-            'previous_state': previous_state,
-            'file_path': file_path,
-            'variable_name': variable_name,
-            'points_list': sorted(existing_points)
-        })
-        
-        # Enable undo button
-        for player_id, player_tabs_dict in self.player_tabs_dict.items():
-            undo_btn = player_tabs_dict.get('undo_btn')
-            if undo_btn:
-                undo_btn.setEnabled(True)
-        
-        # Refresh map only when adding - removal already removes marker via JS, no full reload needed
-        if action == "added":
-            self.DisplayMapInfo()
-            logger.debug("Immediately refreshed map display after added point %s", point)
-    
-    def _undo_last_edit(self):
-        """Undo the last population point edit."""
-        if not hasattr(self, 'edit_history') or not self.edit_history:
-            QMessageBox.information(self, "Undo", "No edits to undo.")
-            return
-        
-        if self.operations is None:
-            return
-        
-        game_map = self.operations.get_map()
-        if not game_map:
-            return
-        
-        last_edit = self.edit_history.pop()
-        previous_state = last_edit['previous_state']
-        file_path = last_edit['file_path']
-        variable_name = last_edit.get('variable_name')
-        point = previous_state['point']
-        was_present = previous_state['was_present']
-        previous_population = previous_state['previous_population']
-
-        from map_preset_utils import read_included_points_from_file, write_included_points_to_file
-
-        if variable_name:
-            existing_points = read_included_points_from_file(file_path, variable_name)
-        else:
-            map_type = previous_state.get('map_type', 'nyc')
-            variable_name = f"{str(map_type).upper().replace('-', '_')}_INCLUDED_POINTS"
-            existing_points = read_included_points_from_file(file_path, variable_name)
-        if existing_points is None:
-            existing_points = set()
-        existing_points = set(((int(round(p[0])), int(round(p[1]))) for p in existing_points if isinstance(p, (tuple, list)) and len(p) >= 2))
-
-        if was_present:
-            existing_points.add(point)
-            game_map.population[point] = previous_population
-            if hasattr(game_map, '_deleted_population_points') and point in game_map._deleted_population_points:
-                game_map._deleted_population_points.discard(point)
-            if hasattr(self.operations, '_session_deleted_population_points') and point in self.operations._session_deleted_population_points:
-                self.operations._session_deleted_population_points.discard(point)
-        else:
-            existing_points.discard(point)
-            game_map.population[point] = 0
-
-        if not write_included_points_to_file(file_path, variable_name, existing_points):
-            QMessageBox.warning(self, "Undo", f"Failed to write changes to {file_path}")
-            return
-
-        for player_id, player_tabs_dict in self.player_tabs_dict.items():
-            undo_btn = player_tabs_dict.get('undo_btn')
-            if undo_btn:
-                undo_btn.setEnabled(len(self.edit_history) > 0)
-
-        self.DisplayMapInfo()
-
 
 
 # --- Networked extensions ---
@@ -12569,7 +12929,7 @@ class GameModeDialog(QDialog):
         super().__init__(parent)
         from ruleset_loader import ensure_rulesets_layout, get_active_ruleset
         ensure_rulesets_layout()
-        self.setWindowTitle("TransitGame - Choose Game Mode")
+        self.setWindowTitle("Railroad Baron - Choose Game Mode")
         apply_application_logo(self)
         self.setGeometry(300, 300, 520, 640)
         self.setModal(True)
@@ -12590,7 +12950,7 @@ class GameModeDialog(QDialog):
                 splash_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 layout.addWidget(splash_label)
         
-        title = QLabel("Welcome to TransitGame!")
+        title = QLabel("Welcome to Railroad Baron!")
         title.setStyleSheet("font-size: 18px; font-weight: bold;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
@@ -13039,6 +13399,9 @@ class NetworkedMainWindow(MainWindow):
                         return
 
                     result = self.operations.create_line_complete(line_name, points, current_player)
+                    if result and result.get('success') is False:
+                        QMessageBox.warning(self, "Cannot Create Line", result.get('error_message', 'Unknown error'))
+                        return
                     self.check_and_eliminate_player(current_player)
                     QMessageBox.information(self, "Line Construction Started", 
                         f"Line '{line_name}' construction started with {result['points_count']} points!\n"
@@ -13548,7 +13911,7 @@ class NetworkedMainWindow(MainWindow):
         # Create new gameplay window BEFORE closing old one (to keep references alive)
         try:
             new_window = MainWindow()
-            new_window.setWindowTitle("Transit Game - Networked")
+            new_window.setWindowTitle("Railroad Baron - Networked")
             new_window.setGeometry(100, 100, 800, 600)
             new_window.start_networked_game(
                 game=game,

@@ -29,6 +29,9 @@ def is_in_nyc_borough_approximate(lat: float, lon: float) -> bool:
         return True
     elif 40.49 <= lat <= 40.65 and -74.30 <= lon <= -74.02:
         return True
+    from map_presets_nyc import is_in_governors_island
+    if is_in_governors_island(lat, lon):
+        return True
     return False
 
 population_points = []

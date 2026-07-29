@@ -18,10 +18,9 @@ class WorkerType:
         return self.salary_multiplier
     
     def get_yearly_cost(self, current_year: int = 1830) -> int:
-        """Calculate yearly cost with inflation and salary multiplier"""
-        # Inflation factor: 1x in 1830, 10x by 2050
-        inflation_factor = 1.0 + (current_year - 1830) * (5.5 - 1.0) / (2050 - 1830)
-        inflation_factor = max(1.0, min(10.0, inflation_factor))
+        """Calculate yearly cost with inflation and salary multiplier (same 1×–10× calendar curve as marketplace)."""
+        from inflation_utils import get_inflation_factor
+        inflation_factor = get_inflation_factor(current_year, max_factor=10.0)
         return int(self.base_salary * inflation_factor * self.salary_multiplier)
 
 ENGINEER = WorkerType("Engineer", base_salary=500, description="Required to operate trainsets")

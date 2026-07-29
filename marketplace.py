@@ -149,10 +149,10 @@ class Marketplace:
         
         return all_items
     
-    def add_line(self, line: Line, price: int=None, current_year: int=1830):
+    def add_line(self, line: Line, price: int=None, current_year: int=1830, seller: str="Manufacturer"):
         if price is None:
             price = line.get_price(current_year=current_year)
-        sale_item = SaleItem(item=line, price=price, year_added=current_year)
+        sale_item = SaleItem(item=line, price=price, seller=seller, year_added=current_year)
         if sale_item not in self.available_lines:
             self.available_lines.append(sale_item)
         else:
@@ -607,15 +607,26 @@ class Marketplace:
                 MARKETPLACE_REPLENISHMENT_START_YEAR,
                 MARKETPLACE_REPLENISHMENT_END_YEAR,
                 MARKETPLACE_TARGET_MAX_MULTIPLIER,
+                MARKETPLACE_LOCOMOTIVE_REPLENISHMENT_START,
+                MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR,
+                MARKETPLACE_EARLY_REPLENISHMENT_FACTOR,
             )
             # Effective target increases over time (more replenishment per turn in later years)
             year_range = MARKETPLACE_REPLENISHMENT_END_YEAR - MARKETPLACE_REPLENISHMENT_START_YEAR
             progress = (current_year - MARKETPLACE_REPLENISHMENT_START_YEAR) / max(1, year_range)
             progress = max(0.0, min(1.0, progress))
             multiplier = 1.0 + progress * (MARKETPLACE_TARGET_MAX_MULTIPLIER - 1.0)
+            # Locomotive replenishment starts slow (0.15) and increases to 1.0 over time, like railcars
+            locomotive_replenishment_factor = MARKETPLACE_LOCOMOTIVE_REPLENISHMENT_START + progress * (1.0 - MARKETPLACE_LOCOMOTIVE_REPLENISHMENT_START)
             effective_target = int(self.target_total_items * multiplier)
             # Replenishment: bring total up to effective target
             items_needed = effective_target - current_total
+            if current_year <= MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR:
+                early_span = max(1, MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR - MARKETPLACE_REPLENISHMENT_START_YEAR)
+                early_progress = (current_year - MARKETPLACE_REPLENISHMENT_START_YEAR) / early_span
+                early_progress = max(0.0, min(1.0, early_progress))
+                early_scale = MARKETPLACE_EARLY_REPLENISHMENT_FACTOR + early_progress * (1.0 - MARKETPLACE_EARLY_REPLENISHMENT_FACTOR)
+                items_needed = max(0, int(items_needed * early_scale))
 
             if items_needed > 0:
                 # Get vehicles organized by category
@@ -667,6 +678,9 @@ class Marketplace:
                         # Match standalone locomotives, ferries, or buses
                         if is_standalone_vehicle and isinstance(existing_vehicle, (Locomotive, Ferry, Bus)) and not isinstance(existing_vehicle, Trainset):
                             if hasattr(existing_vehicle, 'name') and hasattr(vehicle, 'name') and existing_vehicle.name == vehicle.name:
+                                # Locomotives replenish slower at game start; ferries/buses at full rate
+                                if is_locomotive and random.random() >= locomotive_replenishment_factor:
+                                    break
                                 existing_item.add_quantity()
                                 items_added += 1
                                 break
@@ -674,6 +688,8 @@ class Marketplace:
                         elif isinstance(existing_vehicle, Trainset) and is_locomotive:
                             if hasattr(existing_vehicle, 'locomotive') and existing_vehicle.locomotive:
                                 if hasattr(existing_vehicle.locomotive, 'name') and hasattr(vehicle, 'name') and existing_vehicle.locomotive.name == vehicle.name:
+                                    if random.random() >= locomotive_replenishment_factor:
+                                        break
                                     existing_item.add_quantity()
                                     items_added += 1
                                     break
@@ -737,6 +753,9 @@ class Marketplace:
                         if vehicle_key in vehicle_counts:
                             if vehicle_counts[vehicle_key] >= 2:  # Already have 2 of this type
                                 continue
+                        # Locomotives (and their trainsets) replenish slower at game start - skip with probability
+                        if is_locomotive and random.random() >= locomotive_replenishment_factor:
+                            continue
                         if is_locomotive or is_ferry or is_bus:
                             can_have_cars = getattr(vehicle, 'can_have_railcars', True) if is_locomotive else False
                             

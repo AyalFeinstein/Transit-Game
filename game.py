@@ -16,7 +16,28 @@ class Game:
                  marketplace: Marketplace,
                  is_playing: bool = False,
                  worker_replenishment_rate: float = 1.0,
-                 natural_disaster_frequency: float = 1.0
+                 natural_disaster_frequency: float = 1.0,
+                 random_ai_spawn_enabled: bool = True,
+                 merge_enabled: bool = True,
+                 merge_ai_ai_enabled: bool = True,
+                 merge_ai_human_enabled: bool = True,
+                 merge_human_human_enabled: bool = True,
+                 inflation_rate: float = 1.0,
+                 profit_margin: float = 1.0,
+                 random_ai_spawn_interval_years: int = 30,
+                 default_ai_difficulty_for_spawns: str = 'hard',
+                 ai_min_population: int = 100,
+                 game_seed: int = None,
+                 merge_ai_healthy_profit_threshold_pct: float = 25.0,
+                 merge_ai_reject_chance_pct: float = 90.0,
+                 merge_ai_min_turns_to_live_for_accept: int = None,
+                 merge_ai_min_years_before_consider: int = None,
+                 merge_ai_auto_fail_first_n_years: int = None,
+                 war_start_chance_per_year: float = None,
+                 war_end_chance_per_year: float = None,
+                 war_worker_draft_chance_per_year: float = None,
+                 war_new_worker_cost_multiplier: float = None,
+                 ai_debug_notifications_enabled: bool = True,
                  ):
         self.timeline = timeline
         self.marketplace = marketplace
@@ -40,9 +61,65 @@ class Game:
                 self.event_system.add_event(event)
         self.build_queue = []
         self.worker_replenishment_rate = worker_replenishment_rate
+        self.random_ai_spawn_enabled = random_ai_spawn_enabled
+        self.merge_enabled = merge_enabled
+        self.merge_ai_ai_enabled = merge_ai_ai_enabled
+        self.merge_ai_human_enabled = merge_ai_human_enabled
+        self.merge_human_human_enabled = merge_human_human_enabled
+        self.inflation_rate = max(0.1, min(5.0, inflation_rate))
+        self.profit_margin = max(0.25, min(5.0, profit_margin))
+        self.random_ai_spawn_interval_years = max(5, min(200, random_ai_spawn_interval_years))
+        self.default_ai_difficulty_for_spawns = default_ai_difficulty_for_spawns if default_ai_difficulty_for_spawns in ('easy', 'medium', 'hard') else 'hard'
+        self.ai_min_population = max(0, ai_min_population)
+        self.ai_debug_notifications_enabled = bool(ai_debug_notifications_enabled)
+        self.merge_ai_healthy_profit_threshold_pct = max(0, min(100, merge_ai_healthy_profit_threshold_pct))
+        self.merge_ai_reject_chance_pct = max(0, min(100, merge_ai_reject_chance_pct))
+        from game_presets import (
+            AI_MERGE_MIN_TURNS_TO_LIVE_FOR_ACCEPT,
+            AI_MERGE_MIN_YEARS_BEFORE_CONSIDER,
+            AI_MERGE_AUTO_FAIL_FIRST_N_YEARS,
+        )
+        _turns_live_default = AI_MERGE_MIN_TURNS_TO_LIVE_FOR_ACCEPT
+        self.merge_ai_min_turns_to_live_for_accept = max(
+            0, min(200, int(_turns_live_default if merge_ai_min_turns_to_live_for_accept is None else merge_ai_min_turns_to_live_for_accept))
+        )
+        self.merge_ai_min_years_before_consider = max(
+            0, min(50, int(AI_MERGE_MIN_YEARS_BEFORE_CONSIDER if merge_ai_min_years_before_consider is None else merge_ai_min_years_before_consider))
+        )
+        self.merge_ai_auto_fail_first_n_years = max(
+            0, min(50, int(AI_MERGE_AUTO_FAIL_FIRST_N_YEARS if merge_ai_auto_fail_first_n_years is None else merge_ai_auto_fail_first_n_years))
+        )
+        from game_presets import (
+            WAR_END_CHANCE_PER_YEAR,
+            WAR_NEW_WORKER_COST_MULTIPLIER,
+            WAR_START_CHANCE_PER_YEAR,
+            WAR_WORKER_DRAFT_CHANCE_PER_YEAR,
+        )
+        self.war_active = False
+        self.war_start_chance_per_year = max(0.0, min(1.0, float(
+            WAR_START_CHANCE_PER_YEAR if war_start_chance_per_year is None else war_start_chance_per_year)))
+        self.war_end_chance_per_year = max(0.0, min(1.0, float(
+            WAR_END_CHANCE_PER_YEAR if war_end_chance_per_year is None else war_end_chance_per_year)))
+        self.war_worker_draft_chance_per_year = max(0.0, min(1.0, float(
+            WAR_WORKER_DRAFT_CHANCE_PER_YEAR if war_worker_draft_chance_per_year is None else war_worker_draft_chance_per_year)))
+        self.war_new_worker_cost_multiplier = max(1.0, min(3.0, float(
+            WAR_NEW_WORKER_COST_MULTIPLIER if war_new_worker_cost_multiplier is None else war_new_worker_cost_multiplier)))
+        # Pacifism law: calendar year through which war *start* chance is reduced (inclusive).
+        self._pacifism_until_year = None
         from government import Government
+        import random
+        import time
+        # Use provided seed for reproducibility, else different seed every game
+        if game_seed is not None:
+            self._ai_rng_seed = int(game_seed) & 0xFFFFFFFF
+        else:
+            self._ai_rng_seed = (random.getrandbits(32) ^ int(time.time() * 1000)) & 0xFFFFFFFF
         start_year = getattr(timeline, 'initial_year', 1830)
         self.government = Government(start_year, len(players))
+        # Next random AI spawn. Only used if random_ai_spawn_enabled.
+        spawn_interval = self.random_ai_spawn_interval_years
+        half = max(5, spawn_interval // 2)
+        self._next_random_ai_spawn_year = start_year + random.randint(spawn_interval - half, spawn_interval + half) if random_ai_spawn_enabled else None
         # Law drafting: lawyers draft laws; occupied lawyers cannot fight lawsuits
         self._law_drafts = []  # list of (player_id, law_type, year_started)
         self._law_drafts_ready = []  # list of (player_id, law_type, target_player_id or None)
@@ -74,6 +151,14 @@ class Game:
                 self.map.delete_line(line)
         player.line_names.clear()
         player.trainsets.clear()
+
+    def add_player(self, player: Player):
+        """Add a new player to the game (e.g. from random AI spawn)."""
+        self.players.append(player)
+        self.players_by_name[player.name] = player
+        gov = self.get_government()
+        if gov and hasattr(gov, 'add_player'):
+            gov.add_player(player.get_player_id())
 
     def calc_players_by_name(self):
         players_by_name = dict()
@@ -208,7 +293,13 @@ class Game:
         self.is_playing = False
 
     def create_line(self, name, player, points):
-        the_line = Line(name=name, object_id=None, route=points, owner=player, vehicles=[])
+        cy = int(self.get_year())
+        tl = self.timeline
+        sy = int(getattr(tl, 'initial_year', None) or 1830)
+        ey = int(getattr(tl, 'end_year', None) or 2050)
+        from inflation_utils import get_timeline_fare_target
+        fare = get_timeline_fare_target(cy, start_year=sy, end_year=max(sy + 1, ey))
+        the_line = Line(name=name, object_id=None, route=points, owner=player, vehicles=[], fare=fare)
         return the_line
 
     def buy_line(self, name, player, route):
@@ -218,31 +309,24 @@ class Game:
     def __bool__(self):
         return self.is_playing
     
-    def calc_profit_by_player(self, player: Player):
-        """Calculate profit for a player - now handled by ui.py with new ridership system"""
-        # This method is kept for compatibility but ui.py should use calc_player_profit instead
-        total_profit = 0
-        current_year = self.get_year()
-        for line_name in player.line_names:
-            line = self.map.get_lines_by_name().get(line_name)
-            if line:
-                total_profit += line.calc_profit(current_year=current_year)
-        return total_profit
-    
     def calc_maitnance_by_player(self, player: Player):
+        from operations import calc_line_maintenance_with_off_street_surcharge
         total_maitnance = 0
         current_year = self.get_year()
         for line_name in player.line_names:
             line = self.map.get_lines_by_name().get(line_name)
             if line:
-                total_maitnance += line.calc_maitnance(current_year)
+                total_maitnance += calc_line_maintenance_with_off_street_surcharge(
+                    self.map, line, current_year,
+                )
         return total_maitnance
     
     def calc_trainset_maintenance(self, player: Player):
         """Calculate total trainset maintenance costs for a player"""
         total = 0
+        current_year = self.get_year()
         for trainset in player.get_trainsets():
-            maint_cost = trainset.get_maitnance_costs()
+            maint_cost = trainset.get_maitnance_costs(current_year)
             if maint_cost is not None:
                 total += maint_cost
         return int(total) if total else 0
@@ -334,12 +418,14 @@ class Game:
                 pass
         return int(total) if total else 0
     
-    def calc_taxes(self, player: Player, current_year: int):
-        """Calculate taxes for a player. Government composition affects tax multiplier."""
+    def calc_taxes(self, player: Player, current_year: int, player_profit: int = 0):
+        """Calculate taxes for a player. Government composition affects tax multiplier.
+        player_profit: optional pre-calculated profit for income tax (taxed on positive profit only)."""
         from inflation_utils import get_inflation_factor
         BASE_POLL_TAX = 100
         BASE_PROPERTY_TAX_PER_LINE = 100
         BASE_PROPERTY_TAX_PER_TRAINSET = 20
+        INCOME_TAX_RATE = 0.10  # 10% on profits
 
         inflation_factor = get_inflation_factor(current_year, max_factor=5.5)
         poll_tax = int(BASE_POLL_TAX * inflation_factor)
@@ -362,23 +448,46 @@ class Game:
             poll_tax = int(poll_tax * mod)
             property_tax = int(property_tax * mod)
 
+        # Income tax on profits (10%, only on positive profit) - same modifiers as other taxes
+        income_tax = max(0, int(player_profit * INCOME_TAX_RATE))
+        if gov:
+            income_tax = int(income_tax * gov.get_tax_multiplier(player_id))
+        if player_id in tax_modifiers:
+            income_tax = int(income_tax * tax_modifiers[player_id])
+
         # Lobby tax break: one-time half taxes for this player this year
         if getattr(self, '_lobby_tax_break_year', None) == current_year and getattr(self, '_lobby_tax_break_player', None) == player:
             poll_tax = poll_tax // 2
             property_tax = property_tax // 2
+            income_tax = income_tax // 2
             setattr(self, '_lobby_tax_break_player', None)
             setattr(self, '_lobby_tax_break_year', None)
-        # Lobby audit: one-time double taxes for targeted player this year
-        if getattr(self, '_lobby_audit_year', None) == current_year and getattr(self, '_lobby_audit_target', None) == player:
+        # Lobby audit: one-time double taxes for targeted player(s) this year (cleared in apply_lobby_effects)
+        audit_targets = getattr(self, '_lobby_audit_targets', None) or (
+            [getattr(self, '_lobby_audit_target', None)] if getattr(self, '_lobby_audit_target', None) is not None else [])
+        if getattr(self, '_lobby_audit_year', None) == current_year and player in audit_targets:
             poll_tax = poll_tax * 2
             property_tax = property_tax * 2
-            setattr(self, '_lobby_audit_target', None)
-            setattr(self, '_lobby_audit_year', None)
-        return poll_tax, property_tax
+            income_tax = income_tax * 2
+
+        # Permanent laws: reduce property tax by 15% (lasts forever)
+        permanent_reduction = getattr(self, '_permanent_property_tax_reduction', set())
+        if player_id in permanent_reduction:
+            property_tax = int(property_tax * 0.85)
+
+        # Permanent laws: increase property tax by 15% (lasts forever)
+        permanent_increase = getattr(self, '_permanent_property_tax_increase', set())
+        if player_id in permanent_increase:
+            property_tax = int(property_tax * 1.15)
+
+        return poll_tax, property_tax, income_tax
     
     def calc_worker_costs(self, player: Player, current_year: int):
-        """Calculate worker costs and advance worker rentals. Returns (cost, is_on_strike)"""
+        """Calculate worker costs and advance worker rentals. Returns (cost, is_on_strike)
+        Eliminated players: return (0, False) and do not advance strike state."""
         from worker import ENGINEER, CONSTRUCTION_WORKER
+        if player.is_player_eliminated():
+            return 0, False
         worker_costs = 0
         is_on_strike = False
         engineer_rental = player.get_worker_rental(ENGINEER.name)
@@ -394,55 +503,6 @@ class Game:
             worker_costs += construction_rental.get_yearly_cost(current_year)
         
         return worker_costs, is_on_strike
-    
-    def process_player_finances(self, player: Player, current_year: int):
-        """Process all financial calculations and apply them to a player.
-        Returns a dict with financial breakdown."""
-        player_profit = self.calc_profit_by_player(player) or 0
-        trainset_maintenance = self.calc_trainset_maintenance(player)
-        resource_charge = self.calc_resource_costs(player)
-        line_maintenance = self.calc_maitnance_by_player(player) or 0
-
-        # Annual laws: maintenance relief for favored agencies
-        laws = getattr(self, '_government_laws', {})
-        maintenance_relief = laws.get('maintenance_relief', {})
-        player_id = player.get_player_id()
-        if player_id in maintenance_relief:
-            factor = maintenance_relief[player_id]
-            trainset_maintenance = int(trainset_maintenance * factor)
-            line_maintenance = int(line_maintenance * factor)
-
-        poll_tax, property_tax = self.calc_taxes(player, current_year)
-        worker_costs, is_on_strike = self.calc_worker_costs(player, current_year)
-
-        # Annual laws: grants to favored agencies
-        grants = laws.get('grants', {})
-        government_grant = grants.get(player_id, 0)
-
-        total_deductions = trainset_maintenance + resource_charge + line_maintenance + poll_tax + property_tax + worker_costs
-        net = player_profit - total_deductions + government_grant
-
-        # Apply changes to player's money
-        if not player.is_player_eliminated():
-            if player_profit:
-                player.add_money(player_profit)
-            if government_grant:
-                player.add_money(government_grant)
-            if total_deductions:
-                player.deduct_money(total_deductions)
-
-        return {
-            'profit': player_profit,
-            'trainset_maintenance': trainset_maintenance,
-            'resource_charge': resource_charge,
-            'line_maintenance': line_maintenance,
-            'poll_tax': poll_tax,
-            'property_tax': property_tax,
-            'worker_costs': worker_costs,
-            'government_grant': government_grant,
-            'net': net,
-            'is_on_strike': is_on_strike
-        }
     
     def get_strike_warnings(self, current_year: int):
         """Get strike warnings for all players before advancing the year"""
@@ -529,8 +589,8 @@ class Game:
                 ts.assign_to_line(None)
     
     def check_and_eliminate_player(self, player: Player):
-        """Check if player should be eliminated (out of money) and eliminate them"""
-        if player.get_money() <= 0 and not player.is_player_eliminated():
+        """Eliminate only when cash is strictly negative (bankrupt). Exactly $0 is still solvent."""
+        if player.get_money() < 0 and not player.is_player_eliminated():
             self.eliminate_player(player)
             return True
         return False
@@ -549,79 +609,98 @@ class Game:
         
         return newly_available
     
-    def check_agency_lawsuits(self, current_year: int):
-        """Check for agency lawsuits (NIMBYs after 1890, EPA after 1970)"""
-        from agency import AGENCIES
-        setattr(self, '_last_lawsuit_loser_player_id', None)
-
-        skip_player = None
+    def _lawsuit_protection_skip_player_id(self, current_year: int):
+        """Player id exempt from agency lawsuits this year (lobby pass-law / area protection)."""
         until = getattr(self, '_lobby_pass_law_until_year', None)
-        if until is not None and current_year <= until:
-            skip_player = getattr(self, '_lobby_pass_law_player', None)
         if until is not None and current_year > until:
             setattr(self, '_lobby_pass_law_player', None)
             setattr(self, '_lobby_pass_law_until_year', None)
+            return None
+        if until is not None and current_year <= until:
+            skip_player = getattr(self, '_lobby_pass_law_player', None)
+            if skip_player is not None:
+                return skip_player.get_player_id()
+        return None
 
-        # Annual laws: lawsuit protection (favored agencies skip check)
+    def prosecute_excuse_with_agency(self, agency, player, excuse, current_year: int):
+        """Resolve one agency lawsuit for a specific excuse. Returns result dict."""
+        player_id = player.get_player_id()
+        laws = getattr(self, '_government_laws', {})
+        lawsuit_target = laws.get('lawsuit_target', [])
+        agency_lawyers = agency.get_lawyers()
+        player_lawyers = self._get_player_available_lawyer_count(player)
+        if player_id in lawsuit_target:
+            agency_lawyers += 2
+        if agency_lawyers > player_lawyers:
+            penalty = 1000 * (current_year - 1830) // 100
+            player.deduct_money(penalty)
+            player.remove_lawsuit_excuse(excuse)
+            agency.reset_lawyers()
+            setattr(self, '_last_lawsuit_loser_player_id', player_id)
+            return {
+                'agency': agency.name,
+                'player': player.get_name(),
+                'excuse': excuse.cause,
+                'penalty': penalty,
+                'agency_won': True,
+            }
+        player.remove_lawsuit_excuse(excuse)
+        agency.reset_lawyers()
+        setattr(self, '_last_lawsuit_loser_player_id', None)
+        return {
+            'agency': agency.name,
+            'player': player.get_name(),
+            'excuse': excuse.cause,
+            'agency_won': False,
+        }
+
+    def check_agency_lawsuits(self, current_year: int):
+        """Check for agency lawsuits (ruleset-defined agencies, e.g. NIMBYs, EPA)."""
+        from agency import get_agencies
+        agencies = get_agencies()
+        setattr(self, '_last_lawsuit_loser_player_id', None)
+
+        skip_player_id = self._lawsuit_protection_skip_player_id(current_year)
+
         laws = getattr(self, '_government_laws', {})
         lawsuit_protection = laws.get('lawsuit_protection', [])
-        lawsuit_target = laws.get('lawsuit_target', [])
 
-        for agency in AGENCIES:
+        for agency in agencies:
             if not agency.is_active(current_year):
                 continue
-            
+
             for player in self.get_active_players():
-                if player == skip_player:
+                if skip_player_id is not None and player.get_player_id() == skip_player_id:
                     continue
                 player_id = player.get_player_id()
                 if player_id in lawsuit_protection:
                     continue
                 excuses = player.get_lawsuit_excuses()
                 available_excuses = agency.get_available_excuses(current_year)
-                
+
                 for excuse in excuses:
                     if excuse in available_excuses:
-                        agency_lawyers = agency.get_lawyers()
-                        player_lawyers = self._get_player_available_lawyer_count(player)
-                        if player_id in lawsuit_target:
-                            agency_lawyers += 2
-                        if agency_lawyers > player_lawyers:
-                            penalty = 1000 * (current_year - 1830) // 100  # Scale with time
-                            player.deduct_money(penalty)
-                            player.remove_lawsuit_excuse(excuse)
-                            agency.reset_lawyers()
-                            setattr(self, '_last_lawsuit_loser_player_id', player_id)
-                            return {
-                                'agency': agency.name,
-                                'player': player.get_name(),
-                                'excuse': excuse.cause,
-                                'penalty': penalty,
-                                'agency_won': True
-                            }
-                        else:
-                            # Player wins - remove excuse
-                            player.remove_lawsuit_excuse(excuse)
-                            agency.reset_lawyers()
-                            setattr(self, '_last_lawsuit_loser_player_id', None)
-                            return {
-                                'agency': agency.name,
-                                'player': player.get_name(),
-                                'excuse': excuse.cause,
-                                'agency_won': False
-                            }
+                        return self.prosecute_excuse_with_agency(agency, player, excuse, current_year)
         return None
 
     def apply_lobby_effects(self, current_year: int) -> None:
         """Apply multi-year lobby effects (e.g. government attack penalty)."""
         if getattr(self, '_lobby_gov_attack_year', None) == current_year:
-            target = getattr(self, '_lobby_gov_attack_target', None)
+            targets = getattr(self, '_lobby_gov_attack_targets', None) or (
+                [getattr(self, '_lobby_gov_attack_target', None)] if getattr(self, '_lobby_gov_attack_target', None) is not None else [])
             penalty = getattr(self, '_lobby_gov_attack_penalty', 0)
-            if target is not None and penalty and not target.is_player_eliminated():
-                target.deduct_money(penalty)
+            for target in targets:
+                if target is not None and penalty and not target.is_player_eliminated():
+                    target.deduct_money(penalty)
+            setattr(self, '_lobby_gov_attack_targets', None)
             setattr(self, '_lobby_gov_attack_target', None)
             setattr(self, '_lobby_gov_attack_penalty', None)
             setattr(self, '_lobby_gov_attack_year', None)
+        # Clear lobby audit after taxes applied (one-time effect for this year)
+        if getattr(self, '_lobby_audit_year', None) == current_year:
+            setattr(self, '_lobby_audit_targets', None)
+            setattr(self, '_lobby_audit_target', None)
+            setattr(self, '_lobby_audit_year', None)
     
     def __repr__(self):
         return f"Game(year={self.get_year()}, players={len(self.players)}, is_playing={self.is_playing})"

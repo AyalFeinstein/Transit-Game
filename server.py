@@ -28,7 +28,7 @@ game_settings = {
     'map_height': 75,
     'player_count': 2,
     'player_names': ['Player1', 'Player2'],
-    'starting_money': 20000,
+    'starting_money': 50000,
     'worker_replenishment_rate': 1.0
 }
 
@@ -116,7 +116,7 @@ async def create_game(sid, data):
         player_names = data.get('player_names', [])
         map_width = data.get('map_width', 100)
         map_height = data.get('map_height', 75)
-        starting_money = data.get('starting_money', 20000)
+        starting_money = data.get('starting_money', 50000)
         worker_replenishment_rate = data.get('worker_replenishment_rate', 1.0)
         
         if len(player_names) < 2:
@@ -133,7 +133,8 @@ async def create_game(sid, data):
             return
         
         # Create game via Operations (single source of truth)
-        ui = Operations(player_names, map_width, map_height, starting_money, worker_replenishment_rate)
+        ai_player_indices = data.get('ai_player_indices') or []
+        ui = Operations(player_names, map_width, map_height, starting_money, worker_replenishment_rate, ai_player_indices=ai_player_indices)
         game = ui.get_game()
         
         import uuid
@@ -149,7 +150,8 @@ async def create_game(sid, data):
             'players': players_dict,
             'current_turn': 0,  
             'player_names': player_names,
-            'end_year_ready': set()  
+            'end_year_ready': set(),
+            'creator_sid': sid,
         }
         
         for client_sid, player_id in players_dict.items():
@@ -632,7 +634,10 @@ async def handle_rent_workers(ui, player, action_data, game):
             return {'success': False, 'message': f'Cannot afford to rent {quantity} {worker_type_name}. Cost: ${cost}, have: ${ui.get_player_money(player)}'}
         
         # Rent the workers using UI method
-        ui.rent_workers_for_player(player, worker_type, quantity, current_year)
+        try:
+            ui.rent_workers_for_player(player, worker_type, quantity, current_year)
+        except ValueError as e:
+            return {'success': False, 'message': str(e)}
         
         # Deduct marketplace supply
         marketplace.deduct_worker_supply(worker_type_name, quantity)
@@ -661,11 +666,47 @@ async def handle_rent_workers(ui, player, action_data, game):
 
 
 async def handle_advance_year(ui, game):
-    """Handle advance year action using ui.py's advance_year_complete method"""
+    """Handle advance year action: run AI turns, then advance_year_complete. Newly spawned AIs also get a turn."""
     try:
         old_year = game.get_year()
+        from ai import (
+            run_ai_turn,
+            AIIdleTurnError,
+            validate_ai_turn_results,
+            run_pending_ai_in_year_turns,
+            AI_TURN_TIME_BUDGET_SEC,
+        )
+        for p in ui.get_active_players():
+            if not getattr(p, 'is_ai', False):
+                ui.mark_human_ready_for_year_end(p)
+        pending = ui.get_ai_players_needing_in_year_turn()
+        run_pending_ai_in_year_turns(
+            ui, players=pending, deadline_sec=AI_TURN_TIME_BUDGET_SEC
+        )
+        if not ui.all_players_completed_year_actions():
+            return {
+                'success': False,
+                'message': 'Cannot advance year until every player has finished (waiting on AI turns).',
+            }
         # Use the proper advance_year_complete method which handles all year-end logic
         result = ui.advance_year_complete(old_year)
+        # AIs that spawn after turn 1 get to take actions in the same round
+        if result and result.get('new_ai_spawned'):
+            new_info = result['new_ai_spawned']
+            new_player = new_info.get('player') if isinstance(new_info, dict) else None
+            if new_player is not None:
+                try:
+                    acts = run_ai_turn(ui, new_player)
+                    validate_ai_turn_results(ui, new_player, acts)
+                    ui.mark_ai_in_year_turn_completed(new_player)
+                except AIIdleTurnError as e:
+                    print(f"AI turn idle for newly spawned {new_player.get_name()}: {e}")
+                    ui.mark_ai_in_year_turn_completed(new_player)
+                except Exception as e:
+                    print(f"AI turn failed for newly spawned {new_player.get_name()}: {e}")
+                    ui.mark_ai_in_year_turn_completed(new_player)
+                    import traceback
+                    traceback.print_exc()
         new_year = result.get('new_year', old_year + 1)
         return {
             'success': True, 
@@ -697,6 +738,75 @@ async def list_games(sid, data):
 
 
 @sio.event
+async def chat(sid, data):
+    """Handle chat messages. Server controller (game creator) can use /commands."""
+    try:
+        session_id = data.get('session_id')
+        message = (data.get('message') or '').strip()
+        if not message:
+            return
+        if session_id not in game_sessions:
+            await sio.emit('error', {'message': 'Not in a game session'}, room=sid)
+            return
+        session = game_sessions[session_id]
+        game = session['game']
+        player_names = session['player_names']
+        player_id = session['players'].get(sid)
+        sender_name = player_names[player_id] if player_id is not None and 0 <= player_id < len(player_names) else 'Unknown'
+        creator_sid = session.get('creator_sid')
+        # Commands: only game creator can use
+        if message.startswith('/') and sid == creator_sid:
+            parts = message[1:].split(maxsplit=2)
+            cmd = (parts[0] or '').lower()
+            if cmd == 'save':
+                import os
+                save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'savegames')
+                os.makedirs(save_dir, exist_ok=True)
+                import time
+                save_name = f"server_save_{int(time.time())}"
+                save_path = os.path.join(save_dir, f"{save_name}.pkl")
+                try:
+                    save_data = {'game': game, 'current_player_index': 0}
+                    with open(save_path, 'wb') as f:
+                        pickle.dump(save_data, f)
+                    msg = f"Server: Game saved as {save_name}"
+                    await sio.emit('chat_message', {'message': msg, 'sender': 'Server'}, room=session_id)
+                except Exception as e:
+                    await sio.emit('chat_message', {'message': f"Server: Save failed: {e}", 'sender': 'Server'}, room=sid)
+            elif cmd == 'chat':
+                # /chat [player] [message] or /chat [message]
+                if len(parts) >= 2:
+                    arg = parts[1]
+                    if len(parts) >= 3:
+                        target_name, rest = arg, parts[2]
+                        target_id = next((i for i, n in enumerate(player_names) if n.lower() == target_name.lower()), None)
+                        if target_id is not None:
+                            target_sid = next((s for s, pid in session['players'].items() if pid == target_id), None)
+                            if target_sid:
+                                await sio.emit('chat_message', {'message': f"Server: {rest}", 'sender': 'Server'}, room=target_sid)
+                            else:
+                                await sio.emit('chat_message', {'message': f"Server: Player {target_name} not connected", 'sender': 'Server'}, room=sid)
+                        else:
+                            await sio.emit('chat_message', {'message': f"Server: Unknown player {target_name}", 'sender': 'Server'}, room=sid)
+                    else:
+                        await sio.emit('chat_message', {'message': f"Server: {arg}", 'sender': 'Server'}, room=session_id)
+                else:
+                    await sio.emit('error', {'message': 'Usage: /chat [player] [message] or /chat [message]'}, room=sid)
+            else:
+                await sio.emit('chat_message', {'message': f"Server: Unknown command. Use /save or /chat [player] [message]", 'sender': 'Server'}, room=sid)
+        else:
+            if message.startswith('/') and sid != creator_sid:
+                await sio.emit('chat_message', {'message': 'Only the game creator can use /commands', 'sender': 'Server'}, room=sid)
+            else:
+                await sio.emit('chat_message', {'message': message, 'sender': sender_name}, room=session_id)
+    except Exception as e:
+        print(f"Error in chat: {e}")
+        import traceback
+        traceback.print_exc()
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+
+@sio.event
 async def update_setting(sid, data):
     """Handle setting change from client and broadcast to all"""
     setting_name = data.get('setting')
@@ -717,7 +827,7 @@ async def start_game(sid, data):
         player_names = game_settings.get('player_names', ['Player1', 'Player2'])
         map_width = game_settings.get('map_width', 100)
         map_height = game_settings.get('map_height', 75)
-        starting_money = game_settings.get('starting_money', 20000)
+        starting_money = game_settings.get('starting_money', 50000)
         worker_replenishment_rate = game_settings.get('worker_replenishment_rate', 1.0)
         
         # Get all currently connected clients
@@ -733,7 +843,8 @@ async def start_game(sid, data):
             actual_player_names.append(f"Player{len(actual_player_names) + 1}")
         
         # Create game via Operations (single source of truth)
-        ui = Operations(actual_player_names, map_width, map_height, starting_money, worker_replenishment_rate)
+        ai_player_indices = (data or {}).get('ai_player_indices') or []
+        ui = Operations(actual_player_names, map_width, map_height, starting_money, worker_replenishment_rate, ai_player_indices=ai_player_indices)
         game = ui.get_game()
         
         # Generate session ID
@@ -751,7 +862,8 @@ async def start_game(sid, data):
             'players': players_dict,
             'current_turn': 0,  # Keep for compatibility, but not used
             'player_names': actual_player_names,
-            'end_year_ready': set()  # Track which players have pressed "end year"
+            'end_year_ready': set(),  # Track which players have pressed "end year"
+            'creator_sid': sid,
         }
         
         # Serialize game state once for all clients

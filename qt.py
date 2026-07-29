@@ -96,7 +96,7 @@ class LineCreationWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Transit Game")
+        self.setWindowTitle("Railroad Baron")
         self.setGeometry(100, 100, 800, 600)
         central_widget = QWidget()
         central_layout = QVBoxLayout()
@@ -6553,7 +6553,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>Transit Game Map</title>
+    <title>Railroad Baron Map</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
