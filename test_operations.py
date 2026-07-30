@@ -2282,6 +2282,109 @@ class TestExtensionClosestEnd(unittest.TestCase):
         self.assertTrue(ui.extension_attach_from_closest_end("Main", (19.0, 0.0)))
         self.assertFalse(ui.extension_attach_from_closest_end("Main", (1.0, 0.0)))
 
+    def test_train_extension_attach_uses_pending_extension_tip(self):
+        """After a pending end extension, attach end is the extension tip (combined route)."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        combined = ui.get_line_route_including_extensions("Main")
+        self.assertEqual(combined[-1], (25.0, 0.0))
+        self.assertTrue(ui.extension_attach_from_closest_end("Main", (24.0, 0.0)))
+        self.assertFalse(ui.extension_attach_from_closest_end("Main", (1.0, 0.0)))
+
+    def test_calculate_extend_cost_uses_combined_route(self):
+        """Second extension cost should connect from pending extension tip, not original end."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        elev = ["street", "street"]
+        cost_from_tip = ui.calculate_extend_cost(
+            "Main", [(26.0, 0.0), (28.0, 0.0)], extend_from_end=True, elevation_levels=elev,
+        )
+        # Connection from (25,0) to (26,0) is length 1; two extension segments add 2 more.
+        self.assertAlmostEqual(cost_from_tip['length'], 3.0, places=5)
+        cost_from_original_end = ui.calculate_extend_cost(
+            "Main", [(26.0, 0.0), (28.0, 0.0)], extend_from_end=False, elevation_levels=elev,
+        )
+        self.assertGreater(cost_from_original_end['length'], cost_from_tip['length'])
+
+    def test_chained_pending_extensions_merge_in_order(self):
+        """Two pending end extensions merge to the latest tip on the combined route."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(27.0, 0.0), (30.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 1,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        combined = ui.get_line_route_including_extensions("Main")
+        self.assertEqual(combined[-1], (30.0, 0.0))
+        self.assertTrue(ui.extension_attach_from_closest_end("Main", (29.0, 0.0)))
+
     def test_ai_merged_line_route_includes_all_extension_points(self):
         from operations import _ai_merged_line_route
 
@@ -3287,6 +3390,30 @@ class TestLineExtension(unittest.TestCase):
             )
         self.assertGreater(cost['cost'], 0)
         self.assertEqual(cost['points_count'], 1)
+
+    def test_calculate_extend_cost_train_uses_preset_only_water(self):
+        """Train extension cost preview must not query OSM tiles."""
+        import time
+        from unittest.mock import Mock, patch
+
+        line_name = "Test Line"
+        points = [(10.0, 10.0), (20.0, 20.0)]
+        self.ui.create_line_complete(line_name, points, self.player, ['street'])
+        self.ui.process_build_queue()
+        game_map = self.ui.game.get_map()
+        mock_ts = Mock()
+        mock_ts._preset_only_water = False
+        mock_ts.is_point_in_water = Mock(return_value=False)
+        game_map.tile_system = mock_ts
+        t0 = time.time()
+        cost = self.ui.calculate_extend_cost(
+            line_name, [(30.0, 30.0), (31.0, 31.0)], True, ['street', 'street'],
+        )
+        elapsed = time.time() - t0
+        self.assertGreater(cost['cost'], 0)
+        mock_ts.pre_cache_route_tiles.assert_called_once()
+        self.assertEqual(mock_ts.pre_cache_route_tiles.call_args.kwargs.get('max_osm_queries'), 0)
+        self.assertLess(elapsed, 2.0)
 
     def test_get_line_build_type_flags(self):
         self.assertEqual(self.ui.get_line_build_type_flags("missing"), (False, False))

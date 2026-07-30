@@ -63,6 +63,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QAbstractItemView,
 )
 from PyQt6.QtGui import QColor, QPalette, QPainter, QPen, QBrush, QFont, QAction, QPixmap, QIcon
 from PyQt6.QtCore import Qt, QRectF, QPointF, QObject, QEvent
@@ -74,6 +75,7 @@ from vehicle import Locomotive, Railcar, Trainset, Ferry, Bus
 
 # Maximum time (ms) for line creation and map refresh - prevents long freezes
 LINE_CREATION_MAX_MS = 15000
+LINE_EXTENSION_MAX_MS_PER_SEGMENT = 5000
 MAP_REFRESH_MAX_MS = 15000
 MAP_DISPLAY_MAX_ROADS = 400
 
@@ -175,6 +177,13 @@ else:
 
 # Keep Leaflet in sync when the QWebEngineView is resized (pan/zoom/size).
 _MAP_INVALIDATE_JS = "if(window.mapInstance){window.mapInstance.invalidateSize();}"
+_MAP_ENSURE_VISIBLE_JS = (
+    "(function(){"
+    "if(typeof ensureMapContainerSize==='function'){ensureMapContainerSize();}"
+    "if(window.mapInstance){window.mapInstance.invalidateSize(true);}"
+    "else if(typeof initMap==='function'){initMap();}"
+    "})();"
+)
 
 
 class _MapWebViewResizeFilter(QObject):
@@ -2185,7 +2194,10 @@ class MainWindow(QMainWindow):
             if self.status_year_label:
                 self.status_year_label.setText(f"Year: {current_year}")
         self._sync_missing_competitor_tabs_from_operations()
-        self.refresh_all_displays()
+        self.refresh_all_displays(at_turn_start=True)
+        player_id = getattr(self, '_our_player_id', None) or getattr(self, 'current_player_index', None)
+        if player_id is not None:
+            QTimer.singleShot(50, lambda pid=player_id: self._ensure_map_web_view_ready(pid))
         QMessageBox.information(self, "Year Advanced", message)
 
     def _on_network_end_year_status(self, data):
@@ -2502,8 +2514,12 @@ class MainWindow(QMainWindow):
                 try:
                     tabs.setTabVisible(mi, True)
                     tabs.setCurrentIndex(mi)
+                    matched = True
                 except Exception:
                     pass
+        if matched and want == 'Map':
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(50, lambda pid=player_id: self._ensure_map_web_view_ready(pid))
         # Ensure we're actually viewing the selected player's top-level tab.
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
@@ -2979,7 +2995,7 @@ class MainWindow(QMainWindow):
         # Create sidebar for map controls (scrollable so labels never overlap)
         map_sidebar_scroll = QScrollArea()
         map_sidebar_scroll.setFixedWidth(250)
-        map_sidebar_scroll.setWidgetResizable(False)
+        map_sidebar_scroll.setWidgetResizable(True)
         map_sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         map_sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         map_sidebar_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -3065,8 +3081,6 @@ class MainWindow(QMainWindow):
         
         # Edit mode section (only shown when edit mode is enabled)
         map_sidebar_layout.addStretch()  # Push everything to top
-        map_sidebar.adjustSize()
-        map_sidebar.setMinimumHeight(map_sidebar.sizeHint().height())
         map_sidebar_scroll.setWidget(map_sidebar)
 
         # Add sidebar to main layout (fixed width, no stretch)
@@ -3074,11 +3088,17 @@ class MainWindow(QMainWindow):
         map_main_layout.addWidget(map_sidebar_scroll, 0)  # Stretch factor 0 - fixed width
         logger.debug("Sidebar added, map_main_layout count: %d", map_main_layout.count())
         
-        # Create map layout for the actual map display
+        # Map pane: QWidget container so QWebEngineView gets a stable geometry when the tab is shown.
+        map_container = QWidget()
+        map_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        map_container.setMinimumSize(400, 300)
         map_layout = QVBoxLayout()
+        map_layout.setContentsMargins(5, 5, 5, 5)
+        map_layout.setSpacing(5)
+        map_container.setLayout(map_layout)
         logger.debug("map_layout created: %s", map_layout)
-        map_main_layout.addLayout(map_layout, 1)  # Stretch factor 1 for map - takes remaining space
-        logger.debug("map_layout added to map_main_layout, count: %d", map_main_layout.count())
+        map_main_layout.addWidget(map_container, 1)
+        logger.debug("map_container added to map_main_layout, count: %d", map_main_layout.count())
         
         logger.debug("Adding map_tab to player_tabs")
         map_tab_index = player_tabs.addTab(map_tab, "Map") if not for_other_player else -1
@@ -3087,24 +3107,21 @@ class MainWindow(QMainWindow):
         
         # Add tab change handler to create QWebEngineView when map tab becomes visible
         def on_player_tab_changed(index):
-            """Handle tab changes - create QWebEngineView when map tab becomes visible"""
+            """Handle tab changes - ensure map web view is ready when Map tab becomes visible."""
             from PyQt6.QtCore import QTimer
             try:
                 if index == map_tab_index:
-                    QTimer.singleShot(100, self._invalidate_all_map_web_views)
-                    web_view = player_tabs_dict.get(f'map_web_view_{player_id}')
-                    if web_view is not None:
-                        QTimer.singleShot(150, web_view.setFocus)
-                    if f'map_web_view_{player_id}' not in player_tabs_dict or player_tabs_dict.get(f'map_web_view_{player_id}') is None:
-                        def create_webview_delayed():
-                            try:
-                                if getattr(self, 'operations', None) and getattr(self, 'player_tabs_dict', None):
-                                    self.DisplayMapInfo()
-                            except Exception as e:
-                                import traceback
-                                logger.debug("Error creating webview on tab change: %s", e)
-                                traceback.print_exc()
-                        QTimer.singleShot(100, create_webview_delayed)
+                    def on_map_tab_shown():
+                        try:
+                            self._ensure_map_web_view_ready(player_id)
+                            web_view = player_tabs_dict.get(f'map_web_view_{player_id}')
+                            if web_view is not None:
+                                web_view.setFocus()
+                        except Exception as e:
+                            import traceback
+                            logger.debug("Error preparing map on tab change: %s", e)
+                            traceback.print_exc()
+                    QTimer.singleShot(50, on_map_tab_shown)
             except Exception as e:
                 import traceback
                 logger.debug("Error in tab change handler: %s", e)
@@ -3122,6 +3139,7 @@ class MainWindow(QMainWindow):
         player_tabs_dict['line_points_label'] = line_points_label
         player_tabs_dict['map_main_layout'] = map_main_layout
         player_tabs_dict['map_tab'] = map_tab
+        player_tabs_dict['map_container'] = map_container
         player_tabs_dict['map_layout'] = map_layout
         logger.debug("References stored. player_tabs_dict keys: %s", list(player_tabs_dict.keys()))
         logger.debug("map_layout stored: %s", player_tabs_dict.get('map_layout'))
@@ -3254,6 +3272,7 @@ class MainWindow(QMainWindow):
         player_tabs_dict['marketplace_workers_tab'] = marketplace_workers_tab
         player_tabs_dict['marketplace_workers_layout'] = marketplace_workers_layout
         player_tabs_dict['map_tab'] = map_tab
+        player_tabs_dict['map_container'] = map_container
         player_tabs_dict['map_layout'] = map_layout
         player_tabs_dict['construction_tab'] = construction_tab
         player_tabs_dict['construction_layout'] = construction_layout
@@ -4600,14 +4619,14 @@ class MainWindow(QMainWindow):
             return None
         return [combo.currentText() for combo in elevation_combos]
 
-    def refresh_all_displays(self):
+    def refresh_all_displays(self, at_turn_start: bool = False):
         """Refresh all UI displays. Uses assigned_player for government when in network mode."""
         if not self.operations:
             return
         if hasattr(self, '_update_propose_merge_action'):
             self._update_propose_merge_action()
         if hasattr(self, 'DisplayMapInfo'):
-            self.DisplayMapInfo()
+            self.DisplayMapInfo(at_turn_start=at_turn_start)
         if hasattr(self, 'DisplayMarketplaceInfo'):
             self.DisplayMarketplaceInfo()
         if hasattr(self, 'refresh_construction_tab'):
@@ -5065,7 +5084,10 @@ class MainWindow(QMainWindow):
     def _deferred_refresh_after_advance_year(self):
         """Run refresh_all_displays in next event loop tick so End Year button re-enables first."""
         self._sync_missing_competitor_tabs_from_operations()
-        self.refresh_all_displays()
+        self.refresh_all_displays(at_turn_start=True)
+        player_id = getattr(self, '_our_player_id', None) or getattr(self, 'current_player_index', None)
+        if player_id is not None:
+            QTimer.singleShot(50, lambda pid=player_id: self._ensure_map_web_view_ready(pid))
     
     def _deferred_auto_save(self, current_year: int):
         """Wrapper for auto-save when deferred via QTimer (captures current_year in closure)."""
@@ -8225,6 +8247,10 @@ class MainWindow(QMainWindow):
                 if not hasattr(line, 'get_route'):
                     continue
                 route = line.get_route()
+                if self.operations is not None:
+                    combined = self.operations.get_line_route_including_extensions(line_name)
+                    if combined and len(combined) >= 2:
+                        route = combined
                 if not route:
                     continue
                 line_points = []
@@ -8413,13 +8439,112 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.error("Error in _refresh_after_human_line_build: %s", e)
 
-    def DisplayMapInfo(self, force_reload: bool = False):
+    def _is_map_tab_visible_for_player(self, player_id) -> bool:
+        """True when the player's Map subtab is the active, visible tab."""
+        if not getattr(self, 'player_tabs_dict', None):
+            return False
+        player_tabs_dict = self.player_tabs_dict.get(player_id)
+        if not isinstance(player_tabs_dict, dict):
+            return False
+        player_tabs = player_tabs_dict.get('player_tabs')
+        map_tab_index = player_tabs_dict.get('map_tab_index')
+        if player_tabs is None or not isinstance(map_tab_index, int) or map_tab_index < 0:
+            return False
+        try:
+            if not player_tabs.isTabVisible(map_tab_index):
+                return False
+            if player_tabs.currentIndex() != map_tab_index:
+                return False
+        except Exception:
+            return False
+        if hasattr(self, 'tabs') and self.tabs is not None:
+            our_id = getattr(self, '_our_player_id', None)
+            player_tab_widget = player_tabs_dict.get('player_tabs')
+            if player_id == our_id and player_tab_widget is not None:
+                for i in range(self.tabs.count()):
+                    if self.tabs.widget(i) is player_tab_widget:
+                        return self.tabs.currentIndex() == i
+                return False
+            other_container = getattr(self, '_other_players_container', None)
+            if other_container is not None and player_tab_widget is not None:
+                for i in range(self.tabs.count()):
+                    if self.tabs.widget(i) is other_container:
+                        if self.tabs.currentIndex() != i:
+                            return False
+                        break
+        return True
+
+    def _schedule_map_visible_js(self, web_view, delays=(0, 100, 400, 800)) -> None:
+        """Ask Leaflet to re-measure the map container after the tab becomes visible."""
+        if web_view is None:
+            return
+        for delay_ms in delays:
+            def _run(wv=web_view):
+                page = self._safe_get_webview_page(wv)
+                if page and wv.parent() is not None:
+                    page.runJavaScript(_MAP_ENSURE_VISIBLE_JS)
+            QTimer.singleShot(delay_ms, _run)
+
+    def _ensure_map_web_view_ready(self, player_id=None, force_invalidate: bool = True) -> None:
+        """Ensure the OSM map web view exists, is visible, and Leaflet has valid dimensions."""
+        if not getattr(self, 'operations', None) or not getattr(self, 'player_tabs_dict', None):
+            return
+        if player_id is None:
+            player_id = getattr(self, 'current_player_index', None)
+        if player_id is None:
+            return
+        player_tabs_dict = self.player_tabs_dict.get(player_id)
+        if not isinstance(player_tabs_dict, dict) or player_tabs_dict.get('for_other_player'):
+            return
+
+        web_view_key = f'map_web_view_{player_id}'
+        web_view = player_tabs_dict.get(web_view_key)
+        page_ok = False
+        parent_ok = False
+        if web_view is not None:
+            try:
+                parent_ok = web_view.parent() is not None
+            except Exception:
+                parent_ok = False
+            page_ok = self._safe_get_webview_page(web_view) is not None
+
+        pending = player_tabs_dict.get('map_load_pending', False)
+        loaded = player_tabs_dict.get('map_html_loaded', False)
+        needs_initial_load = (
+            web_view is None or not loaded or not parent_ok or not page_ok
+        )
+        if needs_initial_load or pending:
+            if hasattr(self, 'DisplayMapInfo'):
+                self.DisplayMapInfo(force_reload=False)
+            web_view = player_tabs_dict.get(web_view_key)
+            player_tabs_dict['map_load_pending'] = False
+
+        map_container = player_tabs_dict.get('map_container')
+        map_tab = player_tabs_dict.get('map_tab')
+        if map_container is not None:
+            map_container.setVisible(True)
+            map_container.show()
+        if map_tab is not None:
+            map_tab.setVisible(True)
+
+        if web_view is None:
+            return
+
+        web_view.setVisible(True)
+        web_view.show()
+        web_view.raise_()
+        _install_map_web_view_resize_filter(web_view)
+
+        if force_invalidate:
+            self._schedule_map_visible_js(web_view)
+
+    def DisplayMapInfo(self, force_reload: bool = False, at_turn_start: bool = False):
         import time
 
         t0 = time.perf_counter()
         refresh_kind = "skipped"
         preset_name = None
-        logger.debug("Map refresh started (force_reload=%s)", force_reload)
+        logger.debug("Map refresh started (force_reload=%s, at_turn_start=%s)", force_reload, at_turn_start)
         try:
             if not hasattr(self, 'player_tabs_dict'):
                 return
@@ -8509,6 +8634,7 @@ class MainWindow(QMainWindow):
                 html_reload_players = 0
                 for player_id, player_tabs_dict in self.player_tabs_dict.items():
                     map_layout = player_tabs_dict.get('map_layout')
+                    map_container = player_tabs_dict.get('map_container')
                     map_info_text_widget = player_tabs_dict.get('map_info_text')
                     
                     if map_layout is None:
@@ -8605,10 +8731,51 @@ class MainWindow(QMainWindow):
                         except Exception:
                             existing_web_view = None
 
+                    map_tab_visible = self._is_map_tab_visible_for_player(player_id)
+
+                    # Defer WebEngine/Leaflet init until the Map tab is visible. Loading while
+                    # hidden (e.g. game start on Assets tab) leaves a blank map that overlay
+                    # refresh cannot fix.
+                    if not map_tab_visible and not force_reload:
+                        if not (existing_web_view and player_tabs_dict.get('map_html_loaded')):
+                            player_tabs_dict['map_load_pending'] = True
+                        if existing_web_view and player_tabs_dict.get('map_html_loaded'):
+                            _install_map_web_view_resize_filter(existing_web_view)
+                            overlay_refresh_needed = True
+                        continue
+
+                    player_tabs_dict['map_load_pending'] = False
+
+                    # Turn start: lightweight overlay refresh (includes under-construction lines).
+                    if (
+                        at_turn_start
+                        and not self._any_map_edit_in_progress()
+                        and existing_web_view
+                        and player_tabs_dict.get('map_html_loaded')
+                        and not force_reload
+                    ):
+                        _install_map_web_view_resize_filter(existing_web_view)
+                        map_container = player_tabs_dict.get('map_container')
+                        if map_container is not None:
+                            map_container.setVisible(True)
+                        existing_web_view.setVisible(True)
+                        existing_web_view.show()
+                        overlay_refresh_needed = True
+                        continue
+
                     # Reuse loaded map HTML — only refresh line overlays (avoids WebEngine OOM
                     # and preserves in-progress line creation / extension point placement).
-                    if existing_web_view and not force_reload:
+                    if (
+                        existing_web_view
+                        and not force_reload
+                        and player_tabs_dict.get('map_html_loaded')
+                    ):
                         _install_map_web_view_resize_filter(existing_web_view)
+                        map_container = player_tabs_dict.get('map_container')
+                        if map_container is not None:
+                            map_container.setVisible(True)
+                        existing_web_view.setVisible(True)
+                        existing_web_view.show()
                         overlay_refresh_needed = True
                         continue
 
@@ -8663,7 +8830,7 @@ class MainWindow(QMainWindow):
                             else:
                                 logger.debug("Creating new web_view")
                                 logger.debug("Creating QWebEngineView...")
-                                web_view = QWebEngineView(map_tab)
+                                web_view = QWebEngineView(map_container or map_tab)
                             try:
                                 settings = web_view.settings()
                                 settings.setAttribute(
@@ -8705,16 +8872,15 @@ class MainWindow(QMainWindow):
                             def setup_after_load(success):
                                 if success:
                                     try:
+                                        player_tabs_dict['map_html_loaded'] = True
+                                        player_tabs_dict['map_load_pending'] = False
                                         self._setup_map_event_handlers(web_view, player_id, player_tabs_dict)
-                                        def delayed_invalidate():
-                                            page = self._safe_get_webview_page(web_view)
-                                            if page and web_view.parent() is not None:
-                                                page.runJavaScript(
-                                                    "if(window.mapInstance){window.mapInstance.invalidateSize();}"
-                                                )
-                                        QTimer.singleShot(200, delayed_invalidate)
+                                        self._schedule_map_visible_js(web_view)
                                     except Exception as e:
                                         logger.debug("Error in setup_after_load: %s", e)
+                                else:
+                                    player_tabs_dict['map_html_loaded'] = False
+                                    player_tabs_dict['map_load_pending'] = True
                             
                             try:
                                 if web_view.receivers(web_view.loadFinished) > 0:
@@ -8741,7 +8907,7 @@ class MainWindow(QMainWindow):
                         if should_use_osm:
                             try:
                                 fallback_html = self._generate_simple_map_html_no_webengine(game_map)
-                                fallback_browser = QTextBrowser(map_tab)
+                                fallback_browser = QTextBrowser(map_container or map_tab)
                                 fallback_browser.setOpenExternalLinks(True)
                                 fallback_browser.setHtml(fallback_html)
                                 fallback_browser.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -8785,9 +8951,10 @@ class MainWindow(QMainWindow):
             logger.debug(traceback.format_exc())
         finally:
             logger.debug(
-                "Map refresh finished (%s, force_reload=%s, preset=%s) in %.3fs",
+                "Map refresh finished (%s, force_reload=%s, at_turn_start=%s, preset=%s) in %.3fs",
                 refresh_kind,
                 force_reload,
+                at_turn_start,
                 preset_name or "standard",
                 time.perf_counter() - t0,
             )
@@ -9361,9 +9528,14 @@ class MainWindow(QMainWindow):
                                 return
 
                             try:
+                                app = QApplication.instance()
+                                if app:
+                                    app.processEvents()
                                 cost_info = self.operations.calculate_extend_cost(
                                     selected_line, grid_points, extend_from_end, elevation_levels,
                                 )
+                                if app:
+                                    app.processEvents()
                             except Exception as e:
                                 QMessageBox.warning(self, "Error", str(e))
                                 _reenable_finish_extend()
@@ -9384,18 +9556,53 @@ class MainWindow(QMainWindow):
                                 _reenable_finish_extend()
                                 return
 
+                            num_segments = max(1, len(grid_points))
+                            extension_timeout_timer = None
+                            epl = current_player_tabs_dict.get('extend_line_points_label')
+                            if epl:
+                                epl.setText("Processing extension…")
+
+                            def _clear_extension_timeout():
+                                nonlocal extension_timeout_timer
+                                if extension_timeout_timer is not None:
+                                    extension_timeout_timer.stop()
+                                    extension_timeout_timer = None
+
                             def start_extend_worker():
+                                app = QApplication.instance()
+                                if app:
+                                    app.processEvents()
                                 try:
                                     ext_result = self.operations.extend_line_complete(
                                         selected_line, current_player, grid_points,
                                         extend_from_end, elevation_levels,
                                         cost_info=cost_info,
                                     )
+                                    _clear_extension_timeout()
+                                    if app:
+                                        app.processEvents()
                                     _finish_extension_ui(ext_result)
                                 except Exception as e:
+                                    _clear_extension_timeout()
                                     QMessageBox.warning(self, "Error", str(e))
                                     _reenable_finish_extend()
 
+                            def _on_extension_timeout():
+                                nonlocal extension_timeout_timer
+                                extension_timeout_timer = None
+                                QMessageBox.information(
+                                    self, "Still Working",
+                                    "Line extension is taking longer than expected "
+                                    f"(max {num_segments * 5} seconds). You can continue using the app; "
+                                    "you'll be notified when it finishes.",
+                                )
+
+                            extension_timeout_timer = QTimer(self)
+                            extension_timeout_timer.setSingleShot(True)
+                            extension_timeout_timer.timeout.connect(_on_extension_timeout)
+                            extension_timeout_timer.start(
+                                LINE_EXTENSION_MAX_MS_PER_SEGMENT * num_segments,
+                            )
                             QTimer.singleShot(0, start_extend_worker)
                         except Exception as e:
                             import traceback
@@ -10157,6 +10364,10 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             for line_idx, (line_name, line) in enumerate(line_items):
                 if hasattr(line, 'get_route'):
                     route = line.get_route()
+                    if self.operations is not None:
+                        combined = self.operations.get_line_route_including_extensions(line_name)
+                        if combined and len(combined) >= 2:
+                            route = combined
                     if route:
                         line_points = []
                         for point in route:
@@ -10498,10 +10709,16 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 zoomOffset: 0
             }}).addTo(mapInstance);
             window.mapInstance = mapInstance;
+            window.ensureMapVisible = function() {{
+                ensureMapContainerSize();
+                if (window.mapInstance) {{
+                    window.mapInstance.invalidateSize(true);
+                }}
+            }};
             // Fix tiles not loading when map container had zero size at init (e.g. tab not yet shown)
-            setTimeout(function() {{ mapInstance.invalidateSize(); }}, 100);
-            setTimeout(function() {{ if (window.mapInstance) window.mapInstance.invalidateSize(); }}, 400);
-            setTimeout(function() {{ if (window.mapInstance) window.mapInstance.invalidateSize(); }}, 500);
+            setTimeout(function() {{ window.ensureMapVisible(); }}, 100);
+            setTimeout(function() {{ window.ensureMapVisible(); }}, 400);
+            setTimeout(function() {{ window.ensureMapVisible(); }}, 500);
             
             mapInstance.setMaxBounds([[{min_lat}, {min_lon}], [{max_lat}, {max_lon}]]);
             
@@ -10949,12 +11166,24 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     return;
                 }}
                 
-                // Build preview points: last point of existing line + all extend points
+                var existingPts = lineToExtend.points;
+                var startExisting = existingPts[0];
+                var endExisting = existingPts[existingPts.length - 1];
+                var attachFromEnd = true;
+                if (extendClickedPoints.length > 0) {{
+                    var click = extendClickedPoints[0];
+                    var dStart = Math.hypot(click[0] - startExisting[0], click[1] - startExisting[1]);
+                    var dEnd = Math.hypot(click[0] - endExisting[0], click[1] - endExisting[1]);
+                    attachFromEnd = dEnd <= dStart;
+                }}
+                
+                // Build preview points: attach end of combined line + all extend points
                 var previewPoints = [];
-                // Start from last point of existing line
-                var lastExistingPoint = lineToExtend.points[lineToExtend.points.length - 1];
-                previewPoints.push([lastExistingPoint[0], lastExistingPoint[1]]);
-                // Add all clicked extension points
+                if (attachFromEnd) {{
+                    previewPoints.push([endExisting[0], endExisting[1]]);
+                }} else {{
+                    previewPoints.push([startExisting[0], startExisting[1]]);
+                }}
                 extendClickedPoints.forEach(function(point) {{
                     previewPoints.push([point[0], point[1]]);
                 }});
@@ -11065,15 +11294,23 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             document.addEventListener('visibilitychange', function() {{
                 var m = window.mapInstance;
                 if (m && !document.hidden) {{
-                    ensureMapContainerSize();
-                    setTimeout(function() {{ m.invalidateSize(); }}, 100);
+                    if (typeof window.ensureMapVisible === 'function') {{
+                        window.ensureMapVisible();
+                    }} else {{
+                        ensureMapContainerSize();
+                        setTimeout(function() {{ m.invalidateSize(true); }}, 100);
+                    }}
                 }}
             }});
             window.addEventListener('resize', function() {{
-                ensureMapContainerSize();
-                var m = window.mapInstance;
-                if (m) {{
-                    setTimeout(function() {{ m.invalidateSize(); }}, 50);
+                if (typeof window.ensureMapVisible === 'function') {{
+                    window.ensureMapVisible();
+                }} else {{
+                    ensureMapContainerSize();
+                    var m = window.mapInstance;
+                    if (m) {{
+                        setTimeout(function() {{ m.invalidateSize(true); }}, 50);
+                    }}
                 }}
             }});
         }}
@@ -12501,9 +12738,13 @@ class RulesetEditorDialog(QDialog):
             self.vehicles_json_edit,
             self.events_json_edit,
             self.news_json_edit,
-            self.agencies_table,
             self.transit_companies_edit,
             self.default_line_names_edit,
+        )
+        self._agency_edit_triggers = (
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.AnyKeyPressed
         )
         self._tab_save_buttons = []
         self._regen_vehicles_btn = None
@@ -14139,9 +14380,9 @@ class NetworkedMainWindow(MainWindow):
         finally:
             self._updating_from_server = False
     
-    def refresh_all_displays(self):
+    def refresh_all_displays(self, at_turn_start: bool = False):
         """Refresh all UI displays after game state update. Uses same logic as PC version."""
-        super().refresh_all_displays()  # DisplayMapInfo, marketplace, construction, status bar, government, lines, etc.
+        super().refresh_all_displays(at_turn_start=at_turn_start)
         self.update_players_tab()  # Networked-specific: sync player names with server
 
 

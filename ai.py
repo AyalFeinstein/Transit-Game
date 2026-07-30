@@ -5449,10 +5449,10 @@ def _route_dominant_street_names(
             max_distance_m=max_distance_m, min_route_fraction=min_route_fraction,
         )
         if streets:
-            return streets
+            return list(streets)
     except Exception:
         pass
-        return []
+    return []
 
 
 def _line_name_from_street_base(
@@ -7469,7 +7469,10 @@ def _try_extend_line(
             continue
         if _line_is_ferry(line):
             continue  # Ferries are short water crossings only — never extend along streets.
-        route = ops.get_line_route(line) if line else []
+        if _line_is_bus(line):
+            route = list(ops.get_line_route(line) or []) if line else []
+        else:
+            route = list(ops.get_line_route_including_extensions(line_name) or [])
         if not route or len(route) < 2:
             continue
 

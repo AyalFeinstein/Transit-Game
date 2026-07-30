@@ -1125,10 +1125,11 @@ def _validate_land_line_route_for_build(
         return {'success': True}
 
     if game_map.tile_system and not is_bus_line:
+        num_segments = max(1, len(route_points) - 1)
         if human_cost_previewed:
             game_map.tile_system._preset_only_water = True
         elif hasattr(game_map.tile_system, 'set_water_check_deadline'):
-            game_map.tile_system.set_water_check_deadline(5.0)
+            game_map.tile_system.set_water_check_deadline(5.0 * num_segments)
     try:
         if (
             game_map.tile_system
@@ -1239,11 +1240,11 @@ def _validate_route_streets_on_land(
             }
             continue
         if not _route_land_segment_follows_street(
-            game_map, x1, y1, x2, y2, int(current_year),
+            game_map, x1, y1, x2, y2, int(current_year), skip_osm=skip_osm,
         ):
             if (
                 _straight_connector_valid_at_route_index(
-                    game_map, points, i, int(current_year),
+                    game_map, points, i, int(current_year), skip_osm=skip_osm,
                 )
             ):
                 continue
@@ -7190,35 +7191,7 @@ class Operations:
         if len(elevation_levels) < required_elevations:
             raise ValueError(f"Not enough elevation levels provided. Need {required_elevations} levels for {len(additional_points)} points, got {len(elevation_levels)}")
         
-        line = self.get_map_lines().get(line_name)
-        existing_route = None
-        
-        if line:
-            existing_route = self.get_line_route(line)
-        else:
-            build_queue = self.get_build_queue()
-            all_segments = []
-            for build in build_queue:
-                if build.get('type') == 'line' and build.get('data', {}).get('name') == line_name:
-                    segment_points = build.get('data', {}).get('points', [])
-                    if segment_points and len(segment_points) >= 2:
-                        segment_idx = build.get('data', {}).get('segment_index', 0)
-                        all_segments.append((segment_idx, segment_points))
-            
-            if all_segments:
-                all_segments.sort(key=lambda x: x[0])
-                route_points = []
-                for segment_idx, segment_points in all_segments:
-                    if not route_points:
-                        route_points.extend(segment_points)
-                    else:
-                        if segment_points[0] == route_points[-1]:
-                            route_points.extend(segment_points[1:])
-                        else:
-                            route_points.extend(segment_points)
-                if route_points:
-                    existing_route = route_points
-        
+        existing_route = self.get_line_route_including_extensions(line_name)
         if not existing_route:
             raise ValueError(f"Line '{line_name}' not found or has no route")
         
@@ -7258,124 +7231,77 @@ class Operations:
                 'points_count': len(additional_points),
                 'elevation_levels': elevation_levels,
             }
-        
-        # OPTIMIZATION: Reuse shared water checking method instead of duplicating logic
-        water_cache = {}
-        def is_point_in_water(x, y):
-            return self._is_point_in_water_cached(x, y, game_map, water_cache)
-        
-        def is_point_on_road(x, y):
-            preset_name = getattr(game_map, 'map_preset_name', None)
-            if preset_name:
-                from map_preset_loader import preset_has_road_support, get_preset_is_point_on_road
-                if preset_has_road_support(preset_name):
-                    return get_preset_is_point_on_road(preset_name, x, y, current_year, game_map)
-            if game_map.use_osm and game_map.osm_integration:
-                if hasattr(game_map, '_osm_rights_of_way') and game_map._osm_rights_of_way:
-                    nearest = game_map.find_nearest_right_of_way(x, y)
-                    return nearest is not None
-            return False
-        
-        def is_point_on_bridge(x, y):
-            preset_name = getattr(game_map, 'map_preset_name', None)
-            if not preset_name:
-                return False
-            from map_preset_loader import get_preset_is_point_on_bridge
-            return get_preset_is_point_on_bridge(preset_name, x, y, current_year, game_map)
-        
-        def has_buildings(x, y):
-            grid_x, grid_y = int(round(x)), int(round(y))
-            pop = game_map.get_population(grid_x, grid_y)
-            return pop > 0
-        
-        # Calculate cost
-        total_cost = 0
-        
-        # Cost for connection segment (if any)
-        if extend_from_end and len(existing_route) > 0 and len(additional_points) > 0:
-            last_x, last_y = existing_route[-1]
-            first_x, first_y = additional_points[0]
-            conn_length = math.hypot(first_x - last_x, first_y - last_y)
-            mid_x, mid_y = (last_x + first_x) / 2, (last_y + first_y) / 2
-            conn_in_water = is_point_in_water(last_x, last_y) or is_point_in_water(first_x, first_y)
-            conn_on_road = is_point_on_road(mid_x, mid_y)
-            conn_on_bridge = is_point_on_bridge(mid_x, mid_y)
-            conn_on_bridge_or_tunnel = conn_on_bridge or _segment_on_bridge_or_tunnel(
-                game_map, last_x, last_y, first_x, first_y, current_year,
-            )
-            conn_has_buildings = has_buildings(mid_x, mid_y)
-            
-            if conn_on_road:
-                base_cost_per_unit = road_cost_per_unit
-            elif conn_in_water and not conn_on_bridge_or_tunnel:
-                base_cost_per_unit = water_cost_per_unit
-            elif conn_has_buildings:
-                base_cost_per_unit = land_with_buildings_cost_per_unit
-            else:
-                base_cost_per_unit = land_without_buildings_cost_per_unit
-            
-            conn_cost = base_cost_per_unit * conn_length
-            elevation = elevation_levels[0] if elevation_levels else 'street'
-            if conn_in_water and not conn_on_bridge_or_tunnel and elevation == 'street':
-                raise ValueError(f"Cannot build at street level on water. Connection segment from ({last_x:.1f}, {last_y:.1f}) to ({first_x:.1f}, {first_y:.1f}) is in water. Use 'above_ground' or 'underground' instead.")
-            conn_cost *= elevation_multipliers.get(elevation, 1.0)
-            conn_cost *= event_cost_multiplier
-            _, is_bus_ext = self.get_line_build_type_flags(line_name)
-            conn_cost *= _off_street_segment_cost_multiplier(
-                game_map, last_x, last_y, first_x, first_y, current_year,
-                is_bus_line=is_bus_ext,
-            )
-            total_cost += int(conn_cost)
-        elif not extend_from_end and len(existing_route) > 0 and len(additional_points) > 0:
-            first_x, first_y = existing_route[0]
-            last_new_x, last_new_y = additional_points[-1]
-            conn_length = math.hypot(first_x - last_new_x, first_y - last_new_y)
-            mid_x, mid_y = (first_x + last_new_x) / 2, (first_y + last_new_y) / 2
-            conn_in_water = is_point_in_water(first_x, first_y) or is_point_in_water(last_new_x, last_new_y)
-            conn_on_road = is_point_on_road(mid_x, mid_y)
-            conn_on_bridge = is_point_on_bridge(mid_x, mid_y)
-            conn_on_bridge_or_tunnel = conn_on_bridge or _segment_on_bridge_or_tunnel(
-                game_map, last_new_x, last_new_y, first_x, first_y, current_year,
-            )
-            conn_has_buildings = has_buildings(mid_x, mid_y)
-            
-            if conn_on_road:
-                base_cost_per_unit = road_cost_per_unit
-            elif conn_in_water and not conn_on_bridge_or_tunnel:
-                base_cost_per_unit = water_cost_per_unit
-            elif conn_has_buildings:
-                base_cost_per_unit = land_with_buildings_cost_per_unit
-            else:
-                base_cost_per_unit = land_without_buildings_cost_per_unit
-            
-            conn_cost = base_cost_per_unit * conn_length
-            elevation = elevation_levels[-1] if elevation_levels else 'street'
-            if conn_in_water and not conn_on_bridge_or_tunnel and elevation == 'street':
-                raise ValueError(f"Cannot build at street level on water. Connection segment from ({last_new_x:.1f}, {last_new_y:.1f}) to ({first_x:.1f}, {first_y:.1f}) is in water. Use 'above_ground' or 'underground' instead.")
-            conn_cost *= elevation_multipliers.get(elevation, 1.0)
-            conn_cost *= event_cost_multiplier
-            _, is_bus_ext = self.get_line_build_type_flags(line_name)
-            conn_cost *= _off_street_segment_cost_multiplier(
-                game_map, last_new_x, last_new_y, first_x, first_y, current_year,
-                is_bus_line=is_bus_ext,
-            )
-            total_cost += int(conn_cost)
-        
-        # Cost for extension segments
-        if len(additional_points) > 1:
-            for i in range(len(additional_points) - 1):
-                x1, y1 = additional_points[i]
-                x2, y2 = additional_points[i+1]
+
+        # Fast cost preview — preset-only water, no OSM tile queries (matches calculate_line_cost).
+        # Full OSM validation runs in extend_line_complete when the user confirms.
+        merged_preview_pts = list(existing_route)
+        if extend_from_end:
+            merged_preview_pts.extend(additional_points)
+        else:
+            merged_preview_pts = list(additional_points) + merged_preview_pts
+
+        if game_map.tile_system:
+            game_map.tile_system._preset_only_water = True
+        try:
+            if game_map.tile_system:
+                game_map.tile_system.pre_cache_route_tiles(
+                    merged_preview_pts, proximity_buffer_m=0.0, max_osm_queries=0,
+                )
+
+            road_cache = {}
+            bridge_cache = {}
+            water_cache = {}
+
+            def is_point_in_water(x, y):
+                return self._is_point_in_water_cached(x, y, game_map, water_cache)
+
+            def is_point_on_road(x, y):
+                cache_key = (int(round(x)), int(round(y)))
+                if cache_key in road_cache:
+                    return road_cache[cache_key]
+                result = False
+                preset_name = getattr(game_map, 'map_preset_name', None)
+                if preset_name:
+                    from map_preset_loader import preset_has_road_support, get_preset_is_point_on_road
+                    if preset_has_road_support(preset_name):
+                        result = get_preset_is_point_on_road(preset_name, x, y, current_year, game_map)
+                road_cache[cache_key] = result
+                return result
+
+            def is_point_on_bridge(x, y):
+                preset_name = getattr(game_map, 'map_preset_name', None)
+                if not preset_name:
+                    return False
+                cache_key = (int(round(x)), int(round(y)))
+                if cache_key in bridge_cache:
+                    return bridge_cache[cache_key]
+                from map_preset_loader import get_preset_is_point_on_bridge
+                result = get_preset_is_point_on_bridge(preset_name, x, y, current_year, game_map)
+                bridge_cache[cache_key] = result
+                return result
+
+            def has_buildings(x, y):
+                grid_x, grid_y = int(round(x)), int(round(y))
+                pop = game_map.get_population(grid_x, grid_y)
+                return pop > 0
+
+            def _segment_cost(x1, y1, x2, y2, elevation: str) -> int:
                 seg_length = math.hypot(x2 - x1, y2 - y1)
                 mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
-                seg_in_water = is_point_in_water(x1, y1) or is_point_in_water(x2, y2)
+                seg_in_water = False
+                if game_map.tile_system:
+                    seg_in_water = (
+                        game_map.tile_system.is_point_in_water(x1, y1)
+                        or game_map.tile_system.is_point_in_water(x2, y2)
+                    )
+                else:
+                    seg_in_water = is_point_in_water(x1, y1) or is_point_in_water(x2, y2)
                 seg_on_road = is_point_on_road(mid_x, mid_y)
                 seg_on_bridge = is_point_on_bridge(mid_x, mid_y)
                 seg_on_bridge_or_tunnel = seg_on_bridge or _segment_on_bridge_or_tunnel(
                     game_map, x1, y1, x2, y2, current_year,
                 )
                 seg_has_buildings = has_buildings(mid_x, mid_y)
-                
                 if seg_on_road:
                     base_cost_per_unit = road_cost_per_unit
                 elif seg_in_water and not seg_on_bridge_or_tunnel:
@@ -7384,32 +7310,52 @@ class Operations:
                     base_cost_per_unit = land_with_buildings_cost_per_unit
                 else:
                     base_cost_per_unit = land_without_buildings_cost_per_unit
-                
-                seg_cost = base_cost_per_unit * seg_length
-                if extend_from_end:
-                    elevation = elevation_levels[i + 1] if (i + 1) < len(elevation_levels) else 'street'
-                else:
-                    elevation = elevation_levels[i] if i < len(elevation_levels) else 'street'
                 if seg_in_water and not seg_on_bridge_or_tunnel and elevation == 'street':
-                    raise ValueError(f"Cannot build at street level on water. Extension segment from ({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is in water. Use 'above_ground' or 'underground' instead.")
+                    raise ValueError(
+                        f"Cannot build at street level on water. Segment from "
+                        f"({x1:.1f}, {y1:.1f}) to ({x2:.1f}, {y2:.1f}) is in water. "
+                        "Use 'above_ground' or 'underground' instead."
+                    )
+                seg_cost = base_cost_per_unit * seg_length
                 seg_cost *= elevation_multipliers.get(elevation, 1.0)
                 seg_cost *= event_cost_multiplier
-                _, is_bus_ext = self.get_line_build_type_flags(line_name)
                 seg_cost *= _off_street_segment_cost_multiplier(
-                    game_map, x1, y1, x2, y2, current_year,
-                    is_bus_line=is_bus_ext,
+                    game_map, x1, y1, x2, y2, current_year, is_bus_line=False,
                 )
-                total_cost += int(seg_cost)
-        
-        if total_cost < 15:
-            total_cost = 15
-        
-        return {
-            'cost': total_cost,
-            'length': total_length,
-            'points_count': len(additional_points),
-            'elevation_levels': elevation_levels
-        }
+                return int(seg_cost)
+
+            total_cost = 0
+            if extend_from_end and existing_route and additional_points:
+                last_x, last_y = existing_route[-1]
+                first_x, first_y = additional_points[0]
+                elevation = elevation_levels[0] if elevation_levels else 'street'
+                total_cost += _segment_cost(last_x, last_y, first_x, first_y, elevation)
+            elif not extend_from_end and existing_route and additional_points:
+                first_x, first_y = existing_route[0]
+                last_new_x, last_new_y = additional_points[-1]
+                elevation = elevation_levels[-1] if elevation_levels else 'street'
+                total_cost += _segment_cost(last_new_x, last_new_y, first_x, first_y, elevation)
+
+            if len(additional_points) > 1:
+                for i in range(len(additional_points) - 1):
+                    x1, y1 = additional_points[i]
+                    x2, y2 = additional_points[i + 1]
+                    if extend_from_end:
+                        elevation = elevation_levels[i + 1] if (i + 1) < len(elevation_levels) else 'street'
+                    else:
+                        elevation = elevation_levels[i] if i < len(elevation_levels) else 'street'
+                    total_cost += _segment_cost(x1, y1, x2, y2, elevation)
+
+            total_cost = max(15, total_cost)
+            return {
+                'cost': total_cost,
+                'length': total_length,
+                'points_count': len(additional_points),
+                'elevation_levels': elevation_levels,
+            }
+        finally:
+            if game_map.tile_system:
+                game_map.tile_system._preset_only_water = False
     
     def extend_line_complete(self, line_name: str, player: Player, additional_points: list, extend_from_end: bool, elevation_levels: list = None, cost_info: dict = None, use_fast_path: bool = False) -> dict:
         """Complete line extension operation. Adds extension to build queue instead of extending immediately.
@@ -7512,6 +7458,7 @@ class Operations:
         estimated_turns = max(1, int(base_turns * work_rate + 0.999))  # Round up to integer
         
         # Split extension into batched segments for progressive building
+        extension_order = self._next_pending_line_extension_order(line_name)
         batches = _batch_polyline_segments_for_build(additional_points, elevation_levels)
         for batch in batches:
             batch_elev = batch.get('elevation_levels')
@@ -7526,6 +7473,7 @@ class Operations:
                 'line_name': line_name,
                 'points': batch['points'],
                 'extend_from_end': extend_from_end,
+                'extension_order': extension_order,
                 'segment_index': batch['segment_index'],
                 'total_segments': batch['total_segments'],
                 'elevation_levels': batch_elev if batch_elev else [segment_elevation],
@@ -7539,7 +7487,7 @@ class Operations:
                 ext_elevations = list(elevation_levels[1:len(additional_points)])
             else:
                 ext_elevations = list(elevation_levels[: len(additional_points) - 1])
-        route = list(self.get_line_route(line)) if line else []
+        route = list(self.get_line_route_including_extensions(line_name) or [])
         ext_route = list(additional_points)
         if extend_from_end and route:
             ext_route = [route[-1]] + ext_route if route else ext_route
@@ -7600,16 +7548,23 @@ class Operations:
                 route = route_points
 
         ext_builds = []
-        for build in build_queue:
+        for qi, build in enumerate(build_queue):
             if build.get('type') != 'line_extension':
                 continue
             data = build.get('data', {})
             if data.get('line_name') != line_name:
                 continue
-            ext_builds.append((data.get('segment_index', 0), data.get('points', []), data.get('extend_from_end', True)))
-        ext_builds.sort(key=lambda x: x[0])
+            ext_order = int(data.get('extension_order', qi))
+            seg_idx = int(data.get('segment_index', 0) or 0)
+            ext_builds.append((
+                ext_order,
+                seg_idx,
+                data.get('points', []),
+                data.get('extend_from_end', True),
+            ))
+        ext_builds.sort(key=lambda x: (x[0], x[1]))
 
-        for _seg_idx, ext_pts, extend_from_end in ext_builds:
+        for _ext_order, _seg_idx, ext_pts, extend_from_end in ext_builds:
             if not ext_pts:
                 continue
             ext_pts = [_pt(p) for p in ext_pts]
@@ -7631,8 +7586,25 @@ class Operations:
                 route = route + ext_pts
         return route
 
+    def _next_pending_line_extension_order(self, line_name: str) -> int:
+        """Monotonic order index for queued extensions on one line (stable merge ordering)."""
+        max_order = -1
+        for qi, build in enumerate(self.get_build_queue()):
+            if build.get('type') != 'line_extension':
+                continue
+            data = build.get('data') or {}
+            if data.get('line_name') != line_name:
+                continue
+            max_order = max(max_order, int(data.get('extension_order', qi)))
+        return max_order + 1
+
     def extension_attach_from_closest_end(self, line_name: str, click_point: tuple) -> bool:
-        """Pick route end vs start by proximity to the first extension click."""
+        """Pick route end vs start by proximity to the first extension click.
+
+        Uses the combined route (built line + pending extensions) so train-line
+        extensions attach from the nearest end, including the tip of the most
+        recent pending extension when one exists.
+        """
         route = self.get_line_route_including_extensions(line_name)
         return _extension_attach_from_closest_end(route, click_point)
 
@@ -8368,7 +8340,11 @@ class Operations:
     
     def get_build_queue(self) -> list:
         """Get the current build queue"""
-        return self.game.build_queue
+        bq = getattr(self.game, 'build_queue', None)
+        if not isinstance(bq, list):
+            bq = []
+            self.game.build_queue = bq
+        return bq
     
     def process_build_queue(self):
         """Process the build queue, completing builds that are ready
