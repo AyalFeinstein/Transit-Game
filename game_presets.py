@@ -8,6 +8,8 @@ UNOWNED_LINE_BASE_FEE = 500
 MARKETPLACE_BULK_DISCOUNT_PERCENT = 0.25
 MARKETPLACE_BULK_DISCOUNT_THRESHOLD = 10
 MARKETPLACE_TARGET_TOTAL_ITEMS = 60
+# Standalone marketplace railcars at start and replenishment base: num_players * factor
+MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR = 2
 # Replenishment target scales with year (e.g. 1.0 at 1830, MARKETPLACE_TARGET_MAX_MULTIPLIER at 2050)
 MARKETPLACE_REPLENISHMENT_START_YEAR = 1830
 MARKETPLACE_REPLENISHMENT_END_YEAR = 2050
@@ -16,6 +18,9 @@ MARKETPLACE_TARGET_MAX_MULTIPLIER = 2.0
 # At 1830: LOCOMOTIVE_REPLENISHMENT_START, at 2050: 1.0
 # Early-game locomotive restock probability scales from this (1830) to 1.0 (2050).
 MARKETPLACE_LOCOMOTIVE_REPLENISHMENT_START = 0.05
+# Guaranteed standalone copies when a vehicle type is first invented
+MARKETPLACE_NEW_LOCOMOTIVE_COPIES = 3  # legacy floor for locomotives
+MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER = 1  # min copies = num_players * this (at least 1 per player)
 # Through this calendar year, only this fraction of replenishment shortfall is filled per turn.
 MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR = 1845
 MARKETPLACE_EARLY_REPLENISHMENT_FACTOR = 0.35
@@ -121,6 +126,14 @@ AI_STATION_STREET_NAME_MAX_DISTANCE_M = 10.0
 AI_STATION_STREET_NAME_MAX_DISTANCE_GRID = AI_STATION_STREET_NAME_MAX_DISTANCE_M / 1000.0
 # When a new stop is this close to a station on another line, reuse that station's name (transfer hub).
 AI_STATION_TRANSFER_NAME_MAX_DISTANCE_M = 20.0
+# Same owner + same name within this distance merges into one station (add line to existing stop).
+STATION_MERGE_MAX_DISTANCE_M = 20.0
+# Same player may reuse a station name when the existing stop with that name is within this distance (m).
+STATION_DUPLICATE_NAME_MAX_DISTANCE_M = STATION_MERGE_MAX_DISTANCE_M
+# Construction cost fraction when extending a same-name station within merge distance (vs full new stop).
+STATION_MERGE_CONSTRUCTION_COST_FRACTION = 0.5
+# Annual line-maintenance savings per multi-line merged station hub (nominal; inflation applied in ops).
+STATION_MERGE_MAINTENANCE_SAVINGS = 50
 AI_LINE_NAME_MAX_DISTANCE_M = 10.0
 # A line is named after a street only when that street's polyline covers at least this fraction of route length.
 AI_LINE_NAME_MIN_ROUTE_FRACTION = 0.5
@@ -140,6 +153,9 @@ AI_SECOND_LINE_MONEY_DEFAULT_WITH_PROFIT = 15000
 # Small annual operating cost per train-hour of scheduled service (nominal; inflation applied in calc_maitnance).
 SCHEDULE_OPERATING_COST_PER_TRAIN_HOUR = 0.004
 
+# Applied to all construction costs (line creation, extension, stations, upgrades, ferries).
+CONSTRUCTION_COST_MULTIPLIER = 2.0
+
 # Schedule / traversal physics (hours added per station stop; terminal turnaround per round trip).
 STATION_DWELL_MINUTES_PER_STOP = 1.5
 TERMINAL_TURNAROUND_MINUTES = 10.0
@@ -157,6 +173,8 @@ ROUTE_TURN_CHECK_MIN_SEGMENT_GRID = 0.025
 
 # Stations placed in water must be within this distance of land (meters).
 STATION_MAX_WATER_DISTANCE_TO_LAND_M = 30.0
+# Ferry routes and terminals may be on land but must stay within this distance of water (meters).
+FERRY_MAX_DISTANCE_FROM_WATER_M = 100.0
 
 MAJOR_TERMINAL_STATION_NAMES = (
     "Union Station",
@@ -183,8 +201,9 @@ def pick_major_terminal_station_name(seed_mix: int, existing_names: set) -> str 
     for base in pool:
         if base not in existing_names:
             return base
-        for k in range(2, 10):
-            cand = f"{base} ({k})"
+    for base in pool:
+        for dis in (" North", " South", " East", " West", " Central"):
+            cand = f"{base}{dis}"
             if cand not in existing_names:
                 return cand
     return None

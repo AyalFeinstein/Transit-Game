@@ -52,6 +52,146 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
             self.assertTrue(tab_widget.widgetResizable())
         w.close()
 
+    def test_assets_subtabs_are_scrollable(self):
+        """Assets tab sub-tabs (Lines, Workers, Rolling Stock) scroll when content overflows."""
+        from PyQt6.QtWidgets import QScrollArea, QTabWidget
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(
+            ["Human"],
+            map_width=30,
+            map_height=30,
+            starting_money=200000,
+            map_preset_name="standard",
+            random_ai_spawn_enabled=False,
+        )
+        player = ops.get_players()[0]
+        w = MainWindow()
+        w.operations = ops
+        w.player_tabs_dict = {}
+        try:
+            w._create_player_tabs(player, for_other_player=False)
+            player_id = ops.get_player_id(player)
+            tabs = w.player_tabs_dict[player_id]
+
+            def _assert_tab_has_scroll(tab_widget, label):
+                layout = tab_widget.layout()
+                self.assertIsNotNone(layout, msg=f"{label} has no layout")
+                scrolls = [
+                    layout.itemAt(i).widget()
+                    for i in range(layout.count())
+                    if layout.itemAt(i).widget() is not None
+                    and isinstance(layout.itemAt(i).widget(), QScrollArea)
+                ]
+                self.assertTrue(scrolls, msg=f"{label} should contain a QScrollArea")
+                self.assertTrue(scrolls[0].widgetResizable())
+
+            _assert_tab_has_scroll(tabs['lines_tab'], "Lines")
+            _assert_tab_has_scroll(tabs['workers_tab'], "Workers")
+
+            rolling_stock_tabs = tabs['rolling_stock_tabs']
+            self.assertIsInstance(rolling_stock_tabs, QTabWidget)
+            for i in range(rolling_stock_tabs.count()):
+                sub_name = rolling_stock_tabs.tabText(i)
+                _assert_tab_has_scroll(rolling_stock_tabs.widget(i), f"Rolling Stock/{sub_name}")
+
+            self.assertIsNotNone(tabs.get('lines_scroll_layout'))
+            self.assertIsNotNone(tabs.get('workers_scroll_layout'))
+            self.assertIsNotNone(tabs.get('rolling_stock_trainsets_content_layout'))
+            self.assertIsNotNone(tabs.get('rolling_stock_locomotives_content_layout'))
+            self.assertIsNotNone(tabs.get('rolling_stock_railcars_content_layout'))
+        finally:
+            w.close()
+
+    def test_rolling_stock_only_refresh_button(self):
+        """Rolling stock tab keeps only the Refresh Rolling Stock action button."""
+        from PyQt6.QtWidgets import QPushButton
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(
+            ["Human"],
+            map_width=30,
+            map_height=30,
+            starting_money=200000,
+            map_preset_name="standard",
+            random_ai_spawn_enabled=False,
+        )
+        player = ops.get_players()[0]
+        w = MainWindow()
+        w.operations = ops
+        w.player_tabs_dict = {}
+        try:
+            w._create_player_tabs(player, for_other_player=False)
+            player_id = ops.get_player_id(player)
+            tabs = w.player_tabs_dict[player_id]
+            w.DisplayRollingStockInfo(player)
+            trainsets_layout = tabs['rolling_stock_trainsets_layout']
+            buttons = [
+                trainsets_layout.itemAt(i).widget()
+                for i in range(trainsets_layout.count())
+                if trainsets_layout.itemAt(i).widget() is not None
+                and isinstance(trainsets_layout.itemAt(i).widget(), QPushButton)
+            ]
+            self.assertEqual(len(buttons), 1)
+            self.assertEqual(buttons[0].text(), "Refresh Rolling Stock")
+        finally:
+            w.close()
+
+    def test_map_sidebar_has_sell_segment_controls(self):
+        """Map sidebar exposes sell-segment mode controls."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(
+            ["Human"],
+            map_width=30,
+            map_height=30,
+            starting_money=200000,
+            map_preset_name="standard",
+            random_ai_spawn_enabled=False,
+        )
+        player = ops.get_players()[0]
+        w = MainWindow()
+        w.operations = ops
+        w.player_tabs_dict = {}
+        try:
+            w._create_player_tabs(player, for_other_player=False)
+            player_id = ops.get_player_id(player)
+            tabs = w.player_tabs_dict[player_id]
+            self.assertIsNotNone(tabs.get('sell_segment_btn'))
+            self.assertEqual(tabs['sell_segment_btn'].text(), "Sell Segment")
+            self.assertIsNotNone(tabs.get('sell_segment_combo'))
+            self.assertIsNotNone(tabs.get('cancel_sell_segment_btn'))
+        finally:
+            w.close()
+
+    def test_map_html_includes_segment_sell_js(self):
+        """Generated map HTML includes line segment sell click-mode helpers."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(
+            ["Human"],
+            map_width=30,
+            map_height=30,
+            starting_money=200000,
+            map_preset_name="standard",
+            random_ai_spawn_enabled=False,
+        )
+        w = MainWindow()
+        w.operations = ops
+        try:
+            game_map = ops.get_map()
+            html = w._generate_osm_map_html(game_map)
+            self.assertIn("startLineSegmentSell", html)
+            self.assertIn("cancelLineSegmentSell", html)
+            self.assertIn("isSellingLineSegment", html)
+            self.assertIn("pendingSegmentSell", html)
+        finally:
+            w.close()
+
     def test_display_map_info_logs_refresh_start_and_finish(self):
         """DisplayMapInfo emits debug logs when a map refresh begins and completes."""
         from unittest.mock import patch, MagicMock
@@ -89,11 +229,11 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
         w.close()
 
     def test_map_web_view_resize_filter_runs_invalidate_js(self):
-        """Resizing the map web view triggers Leaflet invalidateSize."""
+        """Resizing the map web view triggers ensureMapVisible JS."""
         import time
         from PyQt6.QtCore import QEvent
         from PyQt6.QtWidgets import QWidget
-        from qt_networked import _MapWebViewResizeFilter, _MAP_INVALIDATE_JS
+        from qt_networked import _MapWebViewResizeFilter, _MAP_ENSURE_VISIBLE_JS
 
         class FakeWebView(QWidget):
             def __init__(self, parent=None):
@@ -110,11 +250,49 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
         for _ in range(20):
             _ensure_app().processEvents()
             time.sleep(0.01)
-        web_view._page.runJavaScript.assert_called_with(_MAP_INVALIDATE_JS)
+        web_view._page.runJavaScript.assert_called_with(_MAP_ENSURE_VISIBLE_JS)
+
+    def test_map_container_resize_filter_runs_ensure_visible_js(self):
+        """Resizing map_container also triggers ensureMapVisible on the web view."""
+        import time
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtWidgets import QWidget
+        from qt_networked import _install_map_web_view_resize_filter, _MAP_ENSURE_VISIBLE_JS
+
+        class FakeWebView(QWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self._page = Mock()
+
+            def page(self):
+                return self._page
+
+        parent = QWidget()
+        map_container = QWidget(parent)
+        web_view = FakeWebView(map_container)
+        _install_map_web_view_resize_filter(web_view, map_container)
+        filt = web_view._transit_resize_filter
+        filt.eventFilter(map_container, QEvent(QEvent.Type.Resize))
+        for _ in range(20):
+            _ensure_app().processEvents()
+            time.sleep(0.01)
+        web_view._page.runJavaScript.assert_called_with(_MAP_ENSURE_VISIBLE_JS)
+
+    def test_map_web_view_focus_filter_sets_focus_on_enter(self):
+        """Hovering the map web view gives it focus so wheel zoom reaches Leaflet."""
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtWidgets import QWidget
+        from qt_networked import _MapWebViewFocusFilter
+
+        web_view = QWidget()
+        web_view.setFocus = Mock()
+        filt = _MapWebViewFocusFilter(web_view)
+        filt.eventFilter(web_view, QEvent(QEvent.Type.Enter))
+        web_view.setFocus.assert_called_once()
 
     def test_invalidate_all_map_web_views_runs_js(self):
-        """Window resize path tells each map web view to invalidate Leaflet size."""
-        from qt_networked import MainWindow, _MAP_INVALIDATE_JS
+        """Window resize path tells each map web view to run ensureMapVisible."""
+        from qt_networked import MainWindow, _MAP_ENSURE_VISIBLE_JS
 
         w = MainWindow()
         mock_page = Mock()
@@ -124,7 +302,7 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
             0: {f'map_web_view_0': mock_web_view},
         }
         w._invalidate_all_map_web_views()
-        mock_page.runJavaScript.assert_called_with(_MAP_INVALIDATE_JS)
+        mock_page.runJavaScript.assert_called_with(_MAP_ENSURE_VISIBLE_JS)
         w.close()
 
     def test_osm_map_html_uses_percent_sizing_not_viewport_units(self):
@@ -159,8 +337,32 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
 
         self.assertIn('#map', html)
         self.assertIn('height: 100%', html)
+        self.assertIn('scrollWheelZoom: true', html)
+        self.assertIn('dragging: true', html)
+        self.assertIn('window.ensureMapVisible', html)
         self.assertNotRegex(html, r'#map\s*\{[^}]*100vh')
         self.assertNotRegex(html, r'#map\s*\{[^}]*100vw')
+        w.close()
+
+    def test_build_map_stations_overlay_includes_merge_fields(self):
+        """Station overlay data should expose merged-hub flags for map rendering."""
+        from qt_networked import MainWindow
+
+        w = MainWindow()
+        game_map = Mock()
+        w.operations = Mock()
+        w.operations.get_current_player = Mock(return_value=Mock())
+        w.operations.get_stations_for_map_display = Mock(return_value=[
+            {
+                'lat': 40.7, 'lon': -74.0, 'name': 'Hub',
+                'under_construction': False, 'can_close': True,
+                'line_names': ['A', 'B'], 'is_merged': True, 'num_lines': 2,
+            },
+        ])
+        rows = w._build_map_stations_overlay_data(game_map)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]['is_merged'])
+        self.assertEqual(rows[0]['num_lines'], 2)
         w.close()
 
     def test_assigned_player_main_tab_cannot_be_closed(self):
@@ -1975,6 +2177,44 @@ class TestQTFunctions(unittest.TestCase):
         w._refresh_map_overlays.assert_called_once()
         w._generate_osm_map_html.assert_not_called()
 
+    def test_build_map_lines_overlay_separates_pending_extensions(self):
+        """Built line route stays solid; pending extensions render as separate dashed polylines."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(["P1"], 50, 50, 50000, map_preset_name="standard")
+        player = ops.get_players()[0]
+        line = ops.game.create_line("Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)])
+        player.acquire_line(line)
+        ops.game.get_map().add_line(line)
+        ops.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+
+        w = MainWindow.__new__(MainWindow)
+        w.operations = ops
+        lines_data = w._build_map_lines_overlay_data(ops.get_map())
+        main_entries = [entry for entry in lines_data if entry.get('name') == 'Main']
+        self.assertEqual(len(main_entries), 2)
+        built = [entry for entry in main_entries if not entry.get('under_construction')]
+        pending = [entry for entry in main_entries if entry.get('under_construction')]
+        self.assertEqual(len(built), 1)
+        self.assertEqual(len(pending), 1)
+        self.assertGreaterEqual(len(built[0]['points']), 2)
+        self.assertGreaterEqual(len(pending[0]['points']), 2)
+        self.assertNotEqual(built[0]['points'], pending[0]['points'])
+
     def test_ai_progress_schedules_map_refresh_during_end_year(self):
         """AI line builds schedule debounced map refresh even during end-year sequence."""
         from qt_networked import MainWindow
@@ -2019,6 +2259,30 @@ class TestHumanLineCreationUI(unittest.TestCase):
             w._update_map_sidebars.assert_called_once()
             w._refresh_map_overlays.assert_called_once()
             w._generate_osm_map_html.assert_not_called()
+        finally:
+            w.close()
+
+    def test_map_html_line_creation_click_toggles_points(self):
+        """Map JS removes construction points on marker click; map click always adds."""
+        from qt_networked import MainWindow
+
+        w = MainWindow()
+        try:
+            ops = self._make_ops("standard")
+            game_map = ops.get_map()
+            html = w._generate_osm_map_html(game_map)
+            self.assertIn("removeLinePointAtIndex", html)
+            self.assertIn("removeExtendPointAtIndex", html)
+            click_block = html.split("mapInstance.on('click', function(e)")[1]
+            self.assertIn("addLinePoint(e.latlng.lat, e.latlng.lng)", click_block)
+            self.assertIn("addExtendPoint(e.latlng.lat, e.latlng.lng)", click_block)
+            self.assertNotIn("removeLinePointAtIndex(existingIndex)", click_block)
+            self.assertNotIn("removeExtendPointAtIndex(existingExtendIndex)", click_block)
+            self.assertIn("marker.on('click', function(ev)", html)
+            self.assertIn("removeLinePointAtIndex(marker._linePointIndex)", html)
+            self.assertIn("removeExtendPointAtIndex(marker._extendPointIndex)", html)
+            # Middle-click still supports proximity removal on the map.
+            self.assertIn("findNearestRoutePointIndex", html)
         finally:
             w.close()
 
@@ -2073,6 +2337,7 @@ class TestHumanLineCreationUI(unittest.TestCase):
                     'map_info_text': MagicMock(),
                     'map_sidebar': MagicMock(),
                     f'map_web_view_{pid}': mock_web_view,
+                    'map_html_loaded': True,
                     'station_line_combo': None,
                     'extend_line_combo': None,
                 }
@@ -2083,6 +2348,170 @@ class TestHumanLineCreationUI(unittest.TestCase):
             w.DisplayMapInfo()
             w._generate_osm_map_html.assert_not_called()
             w._refresh_map_overlays.assert_called_once()
+        finally:
+            w.close()
+
+    def test_display_map_info_defers_webengine_when_map_tab_hidden(self):
+        """Map HTML must not load while the Map tab is hidden (avoids zero-size Leaflet init)."""
+        from qt_networked import MainWindow
+
+        w = MainWindow()
+        try:
+            ops = self._make_ops("standard")
+            w.operations = ops
+            player = ops.get_players()[0]
+            pid = ops.get_player_id(player)
+            player_tabs = MagicMock()
+            player_tabs.currentIndex.return_value = 0  # Assets tab, not Map
+            player_tabs.isTabVisible.return_value = True
+            w.player_tabs_dict = {
+                pid: {
+                    'map_layout': MagicMock(),
+                    'map_tab': MagicMock(),
+                    'map_info_text': MagicMock(),
+                    'map_sidebar': MagicMock(),
+                    'map_tab_index': 1,
+                    'player_tabs': player_tabs,
+                    'station_line_combo': None,
+                    'extend_line_combo': None,
+                }
+            }
+            w._is_map_tab_visible_for_player = MainWindow._is_map_tab_visible_for_player.__get__(w)
+            w._generate_osm_map_html = Mock(return_value="<html></html>")
+            w.DisplayMapInfo()
+            self.assertTrue(w.player_tabs_dict[pid].get('map_load_pending'))
+            w._generate_osm_map_html.assert_not_called()
+        finally:
+            w.close()
+
+    def test_ensure_map_web_view_ready_schedules_visible_js(self):
+        """When the map tab is shown, Leaflet gets ensureMapContainerSize + invalidateSize."""
+        from qt_networked import MainWindow, _MAP_ENSURE_VISIBLE_JS
+
+        w = MainWindow()
+        try:
+            mock_page = Mock()
+            mock_web_view = MagicMock()
+            mock_web_view.parent.return_value = MagicMock()
+            mock_web_view.page.return_value = mock_page
+            w.player_tabs_dict = {
+                0: {
+                    'map_web_view_0': mock_web_view,
+                    'map_html_loaded': True,
+                    'map_container': MagicMock(),
+                    'map_tab': MagicMock(),
+                }
+            }
+            w.operations = MagicMock()
+            w._is_map_tab_visible_for_player = Mock(return_value=True)
+            w.DisplayMapInfo = Mock()
+            w._ensure_map_web_view_ready(0)
+            import time
+            for _ in range(30):
+                _ensure_app().processEvents()
+                time.sleep(0.05)
+            mock_page.runJavaScript.assert_any_call(_MAP_ENSURE_VISIBLE_JS)
+        finally:
+            w.close()
+
+    def test_display_map_info_overlay_refresh_schedules_visible_js(self):
+        """Reusing loaded map HTML schedules ensureMapVisible after overlay refresh."""
+        from qt_networked import MainWindow, _MAP_ENSURE_VISIBLE_JS
+
+        w = MainWindow()
+        try:
+            ops = self._make_ops("standard")
+            w.operations = ops
+            player = ops.get_players()[0]
+            pid = ops.get_player_id(player)
+            mock_web_view = MagicMock()
+            mock_web_view.parent.return_value = MagicMock()
+            mock_page = MagicMock()
+            mock_web_view.page.return_value = mock_page
+            w.player_tabs_dict = {
+                pid: {
+                    'map_layout': MagicMock(),
+                    'map_tab': MagicMock(),
+                    'map_container': MagicMock(),
+                    'map_info_text': MagicMock(),
+                    'map_sidebar': MagicMock(),
+                    f'map_web_view_{pid}': mock_web_view,
+                    'map_html_loaded': True,
+                    'station_line_combo': None,
+                    'extend_line_combo': None,
+                }
+            }
+            w._is_map_tab_visible_for_player = Mock(return_value=True)
+            w._build_map_overview_text = Mock(return_value="overview")
+            w._refresh_map_overlays = Mock()
+            w._generate_osm_map_html = Mock(return_value="<html></html>")
+            w.DisplayMapInfo()
+            import time
+            for _ in range(30):
+                _ensure_app().processEvents()
+                time.sleep(0.05)
+            mock_page.runJavaScript.assert_any_call(_MAP_ENSURE_VISIBLE_JS)
+        finally:
+            w.close()
+
+    def test_refresh_map_button_uses_display_map_info_like_game_start(self):
+        """Refresh Map uses DisplayMapInfo(), same as game-start map load."""
+        import inspect
+        from qt_networked import MainWindow
+
+        display_source = inspect.getsource(MainWindow.DisplayMapInfo)
+        connect_idx = display_source.index('refresh_btn.clicked.connect')
+        refresh_connect = display_source[connect_idx:connect_idx + 120]
+        self.assertIn('self.DisplayMapInfo', refresh_connect)
+        self.assertNotIn('_ensure_map_web_view_ready', refresh_connect)
+        self.assertNotIn('force_reload=True', refresh_connect)
+
+        setup_source = inspect.getsource(MainWindow._setup_game_tabs)
+        self.assertIn('self.DisplayMapInfo()', setup_source)
+        self.assertNotIn('_ensure_map_web_view_ready', setup_source)
+
+        w = MainWindow()
+        try:
+            w.DisplayMapInfo = Mock()
+            from PyQt6.QtWidgets import QPushButton
+            btn = QPushButton("Refresh Map")
+            btn.clicked.connect(w.DisplayMapInfo)
+            btn.click()
+            w.DisplayMapInfo.assert_called_once()
+            args, kwargs = w.DisplayMapInfo.call_args
+            force_reload = args[0] if args else kwargs.get('force_reload', False)
+            self.assertFalse(force_reload)
+        finally:
+            w.close()
+
+    def test_map_tab_show_uses_ensure_map_web_view_ready(self):
+        """Map tab visibility uses deferred _ensure_map_web_view_ready (not Refresh Map)."""
+        import inspect
+        from qt_networked import MainWindow
+
+        source = inspect.getsource(MainWindow._create_player_tabs)
+        self.assertIn('_ensure_map_web_view_ready', source)
+        self.assertNotIn('_initiate_map_visual_display', source)
+
+    def test_ensure_map_web_view_ready_calls_display_map_info_when_pending(self):
+        """Visual map init loads map content when web view is missing or load is pending."""
+        from qt_networked import MainWindow
+
+        w = MainWindow()
+        try:
+            w.current_player_index = 0
+            w.DisplayMapInfo = Mock()
+            w.player_tabs_dict = {
+                0: {
+                    'map_load_pending': True,
+                    'map_html_loaded': False,
+                    'map_container': MagicMock(),
+                    'map_tab': MagicMock(),
+                }
+            }
+            w.operations = MagicMock()
+            w._ensure_map_web_view_ready(0)
+            w.DisplayMapInfo.assert_called_once_with(force_reload=False)
         finally:
             w.close()
 
@@ -2263,7 +2692,7 @@ class TestHumanLineCreationUI(unittest.TestCase):
         else:
             segment_specs = ops.get_line_creation_elevation_specs(grid_points)
             self.assertEqual(len(segment_specs), len(grid_points) - 1)
-            # Match elevation dialog defaults (street on land, underground over water).
+            # Match elevation dialog defaults (street on land, above-ground over water).
             elevation_levels = []
             for spec in segment_specs:
                 choices, default = ops.get_segment_elevation_options(
@@ -2409,6 +2838,119 @@ class TestHumanLineCreationUI(unittest.TestCase):
             self.assertGreaterEqual(y, 0)
             self.assertLessEqual(x, ops.get_map().width)
             self.assertLessEqual(y, ops.get_map().height)
+
+
+class TestRulesetEditorDialog(unittest.TestCase):
+    """Ruleset editor dialog opens without crashing on default ruleset."""
+
+    def setUp(self):
+        _ensure_app()
+
+    def test_ruleset_editor_dialog_opens_for_default_ruleset(self):
+        from PyQt6.QtWidgets import QAbstractItemView
+        from qt_networked import RulesetEditorDialog
+        from ruleset_loader import DEFAULT_RULESET_NAME, is_default_ruleset
+
+        dlg = RulesetEditorDialog()
+        try:
+            self.assertEqual(dlg._ruleset_name, DEFAULT_RULESET_NAME)
+            self.assertTrue(is_default_ruleset(dlg._ruleset_name))
+            self.assertTrue(dlg.rules_edit.isReadOnly())
+            self.assertTrue(dlg.description_edit.isReadOnly())
+            self.assertEqual(
+                dlg.agencies_table.editTriggers(),
+                QAbstractItemView.EditTrigger.NoEditTriggers,
+            )
+            self.assertFalse(dlg._add_agency_btn.isEnabled())
+            self.assertFalse(dlg._remove_agency_btn.isEnabled())
+        finally:
+            dlg.close()
+
+
+class TestLineFareAndRailcarUI(unittest.TestCase):
+    def setUp(self):
+        _ensure_app()
+        from operations import Operations
+        from qt_networked import MainWindow
+        self.ops = Operations(
+            ["Alice"], map_width=30, map_height=30, starting_money=100000, map_preset_name="standard",
+        )
+        self.window = MainWindow()
+        self.window.operations = self.ops
+        self.player = self.ops.get_players()[0]
+
+    def tearDown(self):
+        self.window.close()
+
+    def test_fare_slider_bounds_allow_full_timeline_range(self):
+        min_q, max_q = self.window._fare_slider_quarter_bounds()
+        self.assertEqual(min_q, 8)
+        self.assertEqual(max_q, 60)
+
+    def test_display_railcars_info_uses_inner_layout_when_present(self):
+        from PyQt6.QtWidgets import QVBoxLayout
+        player_id = self.ops.get_player_id(self.player)
+        layout = QVBoxLayout()
+        self.window.player_tabs_dict = {
+            player_id: {
+                'rolling_stock_railcars_layout': layout,
+                'railcars_inner_layout': layout,
+            }
+        }
+        self.player.railcars = []
+        with patch.object(self.window, 'DisplayRollingStockInfo', Mock()) as full_refresh:
+            self.window.DisplayRailcarsInfo(self.player)
+            full_refresh.assert_not_called()
+
+    def test_locomotive_is_self_contained_helper(self):
+        from qt_networked import _locomotive_is_self_contained
+        from vehicle import Locomotive
+        from game_resource import Wood
+
+        loco_plus_cars = Locomotive("Steam", 1830, 30, 100, Wood(), 50, 100)
+        self_contained = Locomotive("Subway Car", 1900, 35, 120, Wood(), 80, 100)
+        self_contained.can_have_railcars = False
+        self.assertFalse(_locomotive_is_self_contained(loco_plus_cars))
+        self.assertTrue(_locomotive_is_self_contained(self_contained))
+
+    def test_schedule_operating_cost_per_train_year_helper(self):
+        schedule = {'peak': 2, 'off_peak': 1, 'night': 0}
+        annual = self.ops.get_schedule_operating_cost_per_train_year(1830, schedule=schedule)
+        hourly = self.ops.get_schedule_operating_cost_per_train_hour(1830)
+        trips_per_hour = 2 * 0.4 + 1 * 0.4
+        self.assertAlmostEqual(annual, hourly * trips_per_hour * 8760.0, places=4)
+
+    def test_government_chamber_left_click_lobbies_seat(self):
+        from qt_networked import GovernmentChamberWidget
+        from PyQt6.QtCore import Qt, QPointF
+        from PyQt6.QtGui import QMouseEvent
+        from PyQt6.QtWidgets import QApplication
+
+        lobbied = []
+
+        widget = GovernmentChamberWidget(
+            [(False, False)] * 50 + [(False, True)],
+            on_lobby_seat=lambda idx: lobbied.append(('seat', idx)),
+            on_lobby_leader=lambda: lobbied.append(('leader',)),
+            seats_with_allegiance=[(None, 0.0, False)] * 51,
+        )
+        widget.resize(520, 360)
+        widget.show()
+        QApplication.processEvents()
+        widget._compute_layout()
+        rect, _is_leader, idx = widget._seat_rects[5]
+        center = rect.center()
+        global_center = widget.mapToGlobal(center.toPoint())
+        event = QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress,
+            center,
+            QPointF(global_center),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        widget.mousePressEvent(event)
+        self.assertEqual(lobbied, [('seat', 5)])
 
 
 if __name__ == '__main__':

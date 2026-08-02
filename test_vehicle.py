@@ -151,6 +151,8 @@ class TestUIVehicleUsage(unittest.TestCase):
         
         available_vehicles = marketplace.get_available_vehicles()
         self.assertGreater(len(available_vehicles), 0)
+        self.assertEqual(marketplace.target_railcar_total, 4)
+        self.assertGreaterEqual(marketplace._count_standalone_railcar_quantity(), 4)
         
         earliest_loco = registry.get_earliest_locomotive()
         found_loco = False
@@ -190,19 +192,84 @@ class TestMarketplaceVehicleUsage(unittest.TestCase):
         """Test that add_trainsets_for_new_technology uses registry"""
         from marketplace import Marketplace
         from vehicle_presets import get_vehicle_registry
+        from vehicle import Locomotive, Trainset
+        from game_presets import (
+            MARKETPLACE_NEW_LOCOMOTIVE_COPIES,
+            MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER,
+        )
         
         registry = get_vehicle_registry()
         marketplace = Marketplace()
+        num_players = 2
+        marketplace.num_players = num_players
+        marketplace.generate_trainsets_based_on_discoveries(1849)
         
-        all_locomotives = registry.get_locomotives_by_year()
-        if all_locomotives:
-            first_loco, first_year = all_locomotives[0]
-            newly_researched = [(first_loco.name, first_year)]
-            
-            marketplace.add_trainsets_for_new_technology(first_year, newly_researched)
-            
-            available_vehicles = marketplace.get_available_vehicles()
-            self.assertGreaterEqual(len(available_vehicles), 0)
+        target_name = "0-6-0 Tank Coal"
+        target_year = 1850
+        newly_researched = [(target_name, target_year)]
+        min_copies = max(
+            MARKETPLACE_NEW_LOCOMOTIVE_COPIES,
+            num_players * MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER,
+        )
+        
+        marketplace.add_trainsets_for_new_technology(target_year, newly_researched)
+        
+        loco_qty = 0
+        for sale_item in marketplace.get_available_vehicles():
+            item = sale_item.get_item()
+            if isinstance(item, Locomotive) and not isinstance(item, Trainset):
+                if getattr(item, 'name', None) == target_name:
+                    loco_qty += sale_item.get_quantity_available()
+        self.assertGreaterEqual(loco_qty, min_copies)
+
+    def test_new_bus_spawns_on_invention(self):
+        """Newly invented bus types get guaranteed marketplace stock."""
+        from marketplace import Marketplace
+        from vehicle import Bus
+        from game_presets import MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER
+
+        marketplace = Marketplace()
+        num_players = 3
+        marketplace.num_players = num_players
+        marketplace.generate_trainsets_based_on_discoveries(1894)
+
+        target_name = "Early Motor Bus"
+        target_year = 1895
+        min_copies = num_players * MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER
+
+        marketplace.add_trainsets_for_new_technology(target_year, [(target_name, target_year)])
+
+        bus_qty = 0
+        for sale_item in marketplace.get_available_vehicles():
+            item = sale_item.get_item()
+            if isinstance(item, Bus) and getattr(item, 'name', None) == target_name:
+                bus_qty += sale_item.get_quantity_available()
+        self.assertGreaterEqual(bus_qty, min_copies)
+
+    def test_new_vehicle_copies_scale_with_player_count(self):
+        """More players means more guaranteed copies on invention."""
+        from marketplace import Marketplace
+        from vehicle import Locomotive, Trainset
+        from game_presets import MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER
+
+        marketplace = Marketplace()
+        num_players = 4
+        marketplace.num_players = num_players
+        marketplace.generate_trainsets_based_on_discoveries(1849)
+
+        target_name = "0-6-0 Tank Coal"
+        target_year = 1850
+        min_copies = num_players * MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER
+
+        marketplace.add_trainsets_for_new_technology(target_year, [(target_name, target_year)])
+
+        loco_qty = 0
+        for sale_item in marketplace.get_available_vehicles():
+            item = sale_item.get_item()
+            if isinstance(item, Locomotive) and not isinstance(item, Trainset):
+                if getattr(item, 'name', None) == target_name:
+                    loco_qty += sale_item.get_quantity_available()
+        self.assertGreaterEqual(loco_qty, min_copies)
 
 
 class TestGameVehicleUsage(unittest.TestCase):

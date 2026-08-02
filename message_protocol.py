@@ -4,9 +4,49 @@ Message protocol definitions for TransitGame networking
 Defines the structure of messages sent between client and server
 """
 
+import re
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
+
+_DEFAULT_SERVER_PORT = 8080
+_HOST_WITH_PORT_RE = re.compile(
+    r'^(?:(?P<scheme>https?)://)?(?P<host>[^:/\s]+)(?::(?P<port>\d+))?(?:/.*)?$'
+)
+
+
+def parse_server_address(host_or_url: str, port: Optional[int] = None) -> str:
+    """Normalize host, IP, or URL into a Socket.IO server URL.
+
+    Examples:
+        "192.168.1.5" -> "http://192.168.1.5:8080"
+        "192.168.1.5:9090" -> "http://192.168.1.5:9090"
+        "http://example.com:3000" -> "http://example.com:3000"
+        "localhost" with port=3000 -> "http://localhost:3000"
+    """
+    raw = (host_or_url or "").strip()
+    if not raw:
+        raise ValueError("Server address cannot be empty")
+
+    match = _HOST_WITH_PORT_RE.match(raw)
+    if not match:
+        raise ValueError(f"Invalid server address: {host_or_url!r}")
+
+    scheme = match.group("scheme") or "http"
+    host = match.group("host")
+    parsed_port = match.group("port")
+
+    if parsed_port is not None:
+        resolved_port = int(parsed_port)
+    elif port is not None:
+        resolved_port = int(port)
+    else:
+        resolved_port = _DEFAULT_SERVER_PORT
+
+    if resolved_port < 1 or resolved_port > 65535:
+        raise ValueError(f"Invalid port: {resolved_port}")
+
+    return f"{scheme}://{host}:{resolved_port}"
 
 
 class ActionType(Enum):

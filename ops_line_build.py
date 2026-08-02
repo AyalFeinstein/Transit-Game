@@ -18,6 +18,7 @@ from game_presets import (
     LINE_NIMBY_LAWSUIT_BASE_CHANCE,
     STARTING_MONEY,
     STATION_MAX_WATER_DISTANCE_TO_LAND_M,
+    FERRY_MAX_DISTANCE_FROM_WATER_M,
 )
 
 # NIMBY line-build excuses (noise / property / environment).
@@ -405,8 +406,9 @@ class LineBuildMixin:
         return _ferry_segment_crosses_open_water(game_map, x1, y1, x2, y2)
 
     def _validate_ferry_route(self, points: list) -> dict:
-        """Validate ferry route: endpoints near water; segment interior mostly open water."""
+        """Validate ferry route: all points and segments within FERRY_MAX_DISTANCE_FROM_WATER_M of water."""
         game_map = self.game.get_map()
+        max_m = int(FERRY_MAX_DISTANCE_FROM_WATER_M)
 
         if not points:
             raise ValueError("Ferry route must have at least one point")
@@ -416,30 +418,36 @@ class LineBuildMixin:
         for i, (x, y) in enumerate(points):
             if not _ferry_point_near_water(game_map, float(x), float(y)):
                 raise ValueError(
-                    f"Ferry routes must be within 60m of water. Point {i + 1} at ({float(x):.1f}, {float(y):.1f}) "
+                    f"Ferry routes must be within {max_m}m of water. Point {i + 1} at ({float(x):.1f}, {float(y):.1f}) "
                     f"is too far from water (on land)."
                 )
 
         for i in range(len(points) - 1):
             x1, y1 = float(points[i][0]), float(points[i][1])
             x2, y2 = float(points[i + 1][0]), float(points[i + 1][1])
-            if not _ferry_segment_crosses_open_water(game_map, x1, y1, x2, y2):
+            if not _ferry_segment_near_water(game_map, x1, y1, x2, y2):
                 raise ValueError(
-                    f"Ferry routes must cross open water. Segment {i + 1} from ({x1:.1f}, {y1:.1f}) to "
-                    f"({x2:.1f}, {y2:.1f}) is not a valid water crossing."
+                    f"Ferry routes must stay within {max_m}m of water. Segment {i + 1} from ({x1:.1f}, {y1:.1f}) to "
+                    f"({x2:.1f}, {y2:.1f}) is too far from water."
                 )
 
         return {'success': True}
 
     def _require_ferry_terminal_near_coast(self, game_map, grid_x: float, grid_y: float) -> None:
-        """Ferry stations must be within 60 m of water (same rule as ferry line geometry)."""
+        """Ferry stations must be within FERRY_MAX_DISTANCE_FROM_WATER_M of water."""
         ts = getattr(game_map, "tile_system", None)
         if not ts or not hasattr(ts, "is_point_near_water"):
+            if not _ferry_point_near_water(game_map, float(grid_x), float(grid_y)):
+                max_m = int(FERRY_MAX_DISTANCE_FROM_WATER_M)
+                raise ValueError(
+                    f"Ferry terminals must be within {max_m} m of the coast or navigable water."
+                )
             return
         gx, gy = float(grid_x), float(grid_y)
-        if not ts.is_point_near_water(gx, gy, 60.0, skip_osm=False):
+        if not ts.is_point_near_water(gx, gy, FERRY_MAX_DISTANCE_FROM_WATER_M, skip_osm=False):
+            max_m = int(FERRY_MAX_DISTANCE_FROM_WATER_M)
             raise ValueError(
-                "Ferry terminals must be within 60 m of the coast or navigable water."
+                f"Ferry terminals must be within {max_m} m of the coast or navigable water."
             )
 
     def _require_station_not_in_deep_water(self, game_map, grid_x: float, grid_y: float) -> None:
@@ -2663,7 +2671,11 @@ class LineBuildMixin:
     
     def get_build_queue(self) -> list:
         """Get the current build queue"""
-        return self.game.build_queue
+        bq = getattr(self.game, 'build_queue', None)
+        if not isinstance(bq, list):
+            bq = []
+            self.game.build_queue = bq
+        return bq
     
     def process_build_queue(self):
         """Process the build queue, completing builds that are ready

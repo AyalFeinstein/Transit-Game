@@ -588,9 +588,17 @@ class Game:
             for ts in assigned_trainsets:
                 ts.assign_to_line(None)
     
-    def check_and_eliminate_player(self, player: Player):
-        """Eliminate only when cash is strictly negative (bankrupt). Exactly $0 is still solvent."""
-        if player.get_money() < 0 and not player.is_player_eliminated():
+    def check_and_eliminate_player(
+        self, player: Player, balance_before: int = None, net_change: int = None,
+    ):
+        """Eliminate only when cash is strictly negative after a net change. Exactly $0 is solvent.
+        When balance_before and net_change are given, use their sum instead of player.money
+        (avoids elimination on intermediate negatives during multi-step transactions)."""
+        if balance_before is not None and net_change is not None:
+            final_balance = int(balance_before) + int(net_change)
+        else:
+            final_balance = player.get_money()
+        if final_balance < 0 and not player.is_player_eliminated():
             self.eliminate_player(player)
             return True
         return False
@@ -600,12 +608,16 @@ class Game:
         from vehicle_presets import get_vehicle_registry
         
         registry = get_vehicle_registry()
-        all_locomotives = registry.get_locomotives_by_year()
-        
         newly_available = []
-        for vehicle, year in all_locomotives:
-            if year and old_year < year <= new_year:
-                newly_available.append((vehicle.name, year))
+        for vehicles_by_year in (
+            registry.get_locomotives_by_year(),
+            registry.get_railcars_by_year(),
+            registry.get_ferries_by_year(),
+            registry.get_buses_by_year(),
+        ):
+            for vehicle, year in vehicles_by_year:
+                if year and old_year < year <= new_year:
+                    newly_available.append((vehicle.name, year))
         
         return newly_available
     
@@ -701,6 +713,11 @@ class Game:
             setattr(self, '_lobby_audit_targets', None)
             setattr(self, '_lobby_audit_target', None)
             setattr(self, '_lobby_audit_year', None)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if not isinstance(getattr(self, 'build_queue', None), list):
+            self.build_queue = []
     
     def __repr__(self):
         return f"Game(year={self.get_year()}, players={len(self.players)}, is_playing={self.is_playing})"

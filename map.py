@@ -261,23 +261,13 @@ class Map:
         return self._buildable_included_points
         
     def is_point_in_buildable_area(self, x: float, y: float) -> bool:
-        """Check if a grid point is in the buildable play area (where lines can be built).
-        
-        For preset maps: buildable = cells with population in INITIAL_POPULATION.
-        For standard maps: all points within bounds are buildable.
-        
-        Returns:
-            True if a line can be built through this point, False otherwise.
+        """Check if a grid point is within map bounds.
+
+        Buildable-area zone restrictions (preset population cells) are not enforced here;
+        water/street validation applies at line-build time instead.
         """
         gx, gy = int(round(x)), int(round(y))
-        if gx < 0 or gx > self.width or gy < 0 or gy > self.height:
-            return False
-        included = self._get_buildable_included_points()
-        if included is not None:
-            return (gx, gy) in included
-        if self.map_preset_name:
-            return True  # Fallback: allow if file read fails
-        return True
+        return 0 <= gx <= self.width and 0 <= gy <= self.height
     
     def get_tile_system(self):
         """Get the tile system for this map. Returns None if not initialized."""

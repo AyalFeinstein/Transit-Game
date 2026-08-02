@@ -56,14 +56,14 @@ class Lawsuit:
     
     def resolve(self, plaintiff_lawyers: int, defendant_lawyers: int) -> 'Player':
         """Resolve the lawsuit based on number of lawyers each side has"""
-        # Base chance: 75% if there's a real excuse, 10% if no excuse (made-up cause)
+        # Base chance: higher when there is a real excuse; modest chance for made-up causes
         has_cause = self.excuse is not None
-        base_plaintiff_chance = 0.75 if has_cause else 0.10
+        base_plaintiff_chance = 0.85 if has_cause else 0.20
         
-        # Lawyer modifications: each lawyer adds 5% to their side's chance
+        # Lawyer modifications: each lawyer adds 7% to their side's chance
         # Maximum 95% chance, minimum 5% chance
-        plaintiff_chance = base_plaintiff_chance + (plaintiff_lawyers * 0.05)
-        defendant_chance = (1.0 - base_plaintiff_chance) + (defendant_lawyers * 0.05)
+        plaintiff_chance = base_plaintiff_chance + (plaintiff_lawyers * 0.07)
+        defendant_chance = (1.0 - base_plaintiff_chance) + (defendant_lawyers * 0.07)
         
         # Normalize so they sum to 1.0
         total_chance = plaintiff_chance + defendant_chance
@@ -77,24 +77,25 @@ class Lawsuit:
         # Random choice
         random_value = random.random()
         
-        # Both sides pay court costs (10% of damages each)
+        # Both sides pay court costs (10% of damages each). Apply net change atomically so
+        # bankruptcy is not triggered by intermediate negative balances mid-resolution.
         court_costs = int(self.damages * 0.1)
-        self.defendant.deduct_money(court_costs)
-        # Only deduct from plaintiff if they're a Player (not an Agency)
-        if hasattr(self.plaintiff, 'deduct_money'):
-            self.plaintiff.deduct_money(court_costs)
-        
+
+        def _apply_net_money(entity, net_change: int) -> None:
+            if net_change > 0 and hasattr(entity, 'add_money'):
+                entity.add_money(net_change)
+            elif net_change < 0 and hasattr(entity, 'deduct_money'):
+                entity.deduct_money(-net_change)
+
         if random_value < plaintiff_chance:
             self.winner = self.plaintiff
-            self.defendant.deduct_money(self.damages)
-            if hasattr(self.plaintiff, 'add_money'):
-                self.plaintiff.add_money(self.damages)
+            _apply_net_money(self.defendant, -(court_costs + self.damages))
+            _apply_net_money(self.plaintiff, self.damages - court_costs)
         else:
             self.winner = self.defendant
-            reparations = int(self.damages * 0.5)  
-            self.defendant.add_money(reparations)
-            if hasattr(self.plaintiff, 'deduct_money'):
-                self.plaintiff.deduct_money(reparations)
+            reparations = int(self.damages * 0.5)
+            _apply_net_money(self.defendant, reparations - court_costs)
+            _apply_net_money(self.plaintiff, -(court_costs + reparations))
         
         self.resolved = True
         return self.winner

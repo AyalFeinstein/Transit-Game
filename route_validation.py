@@ -18,6 +18,7 @@ from game_presets import (
     LINE_NIMBY_LAWSUIT_BASE_CHANCE,
     STARTING_MONEY,
     STATION_MAX_WATER_DISTANCE_TO_LAND_M,
+    FERRY_MAX_DISTANCE_FROM_WATER_M,
 )
 
 # NIMBY line-build excuses (noise / property / environment).
@@ -274,7 +275,9 @@ def _route_segment_is_water_crossing(
     return False
 
 
-def _ferry_point_near_water(game_map: Map, x: float, y: float, max_distance_m: float = 60.0) -> bool:
+def _ferry_point_near_water(
+    game_map: Map, x: float, y: float, max_distance_m: float = FERRY_MAX_DISTANCE_FROM_WATER_M,
+) -> bool:
     """True when a ferry terminal may be placed: on water or within max_distance_m of water."""
     import math
 
@@ -315,6 +318,34 @@ def _ferry_point_near_water(game_map: Map, x: float, y: float, max_distance_m: f
     return False
 
 
+def _ferry_segment_near_water(
+    game_map: Map,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    max_distance_m: float = FERRY_MAX_DISTANCE_FROM_WATER_M,
+) -> bool:
+    """True when every sampled point on the segment is within max_distance_m of water."""
+    ts = getattr(game_map, 'tile_system', None)
+    if ts and hasattr(ts, 'is_segment_near_water'):
+        return bool(ts.is_segment_near_water(x1, y1, x2, y2, max_distance_m, skip_osm=False))
+    if not _ferry_point_near_water(game_map, x1, y1, max_distance_m):
+        return False
+    if not _ferry_point_near_water(game_map, x2, y2, max_distance_m):
+        return False
+    segment_length = math.hypot(x2 - x1, y2 - y1)
+    sample_interval_grid = 0.02  # ~20 m in grid units (1 unit ≈ 1 km)
+    num_samples = max(2, int(math.ceil(segment_length / sample_interval_grid)) + 1)
+    for i in range(num_samples):
+        t = i / (num_samples - 1) if num_samples > 1 else 0.0
+        sx = x1 + t * (x2 - x1)
+        sy = y1 + t * (y2 - y1)
+        if not _ferry_point_near_water(game_map, sx, sy, max_distance_m):
+            return False
+    return True
+
+
 def _ferry_segment_crosses_open_water(
     game_map: Map,
     x1: float,
@@ -323,7 +354,7 @@ def _ferry_segment_crosses_open_water(
     y2: float,
     min_fraction: float = 0.72,
 ) -> bool:
-    """True when the interior of a segment is mostly open water (single ferry geometry check)."""
+    """True when the interior of a segment is mostly open water (legacy ferry geometry check)."""
     preset_name = getattr(game_map, 'map_preset_name', None)
     if preset_name:
         from map_preset_loader import preset_has_water_areas, preset_is_point_in_water
@@ -1062,15 +1093,8 @@ def _normalize_build_point(pt) -> tuple[float, float]:
 
 
 def _assert_points_in_buildable_area(game_map: Map, points: list) -> None:
-    if not points or not hasattr(game_map, 'is_point_in_buildable_area'):
-        return
-    for i, pt in enumerate(points):
-        x, y = _normalize_build_point(pt)
-        if not game_map.is_point_in_buildable_area(x, y):
-            raise ValueError(
-                f"Point {i + 1} at ({x:.1f}, {y:.1f}) is outside the buildable area. "
-                "Lines can only be built within the play area."
-            )
+    """No-op: preset buildable-zone restrictions removed."""
+    return
 
 
 def _validate_land_line_route_for_build(

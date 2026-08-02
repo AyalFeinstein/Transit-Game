@@ -96,6 +96,9 @@ class Marketplace:
         self.worker_supply = {}
         self.marketplace_years_visible = marketplace_years_visible
         self.target_total_items = None
+        self.target_railcar_total = None
+        self.num_players = 2
+        self.railcars_per_player_factor = None
     
     def get_worker_supply(self, worker_type_name: str) -> int:
         """Get available supply of a worker type"""
@@ -259,6 +262,129 @@ class Marketplace:
                     self.available_vehicles.remove(existing_item)
                 break
     
+    def _get_railcars_per_player_factor(self) -> float:
+        from game_presets import MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR
+        if self.railcars_per_player_factor is not None:
+            return float(self.railcars_per_player_factor)
+        return float(MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR)
+
+    def _compute_target_railcar_total(self) -> int:
+        return max(1, int(self.num_players * self._get_railcars_per_player_factor()))
+
+    def _count_standalone_railcar_quantity(self) -> int:
+        from vehicle import Railcar, Trainset
+        total = 0
+        for item in self.available_vehicles:
+            vehicle = item.get_item()
+            if isinstance(vehicle, Railcar) and not isinstance(vehicle, Trainset):
+                total += item.get_quantity_available()
+        return total
+
+    @staticmethod
+    def _distribute_target_quantities(target_total: int, mults: list[int]) -> list[int]:
+        num_types = len(mults)
+        if num_types == 0:
+            return []
+        quantity_per_type = [1] * num_types
+        used = sum(mults)
+        extra = max(0, target_total - used)
+        while extra > 0:
+            added = False
+            for i in range(num_types):
+                if extra >= mults[i]:
+                    quantity_per_type[i] += 1
+                    extra -= mults[i]
+                    added = True
+                    break
+            if not added:
+                break
+        return quantity_per_type
+
+    def _replenish_standalone_railcars(
+        self,
+        current_year: int,
+        min_year: int,
+        registry,
+        railcars_needed: int,
+    ) -> None:
+        """Add standalone railcars up to railcars_needed (player-scaled target)."""
+        import random
+        from vehicle import Railcar
+
+        if railcars_needed <= 0:
+            return
+
+        categories = self._get_vehicle_categories(registry)
+        all_valid_railcars = []
+        seen_names = set()
+        for vehicles in categories.values():
+            for vehicle in vehicles:
+                if not isinstance(vehicle, Railcar):
+                    continue
+                year = getattr(vehicle, 'year_introduced', None)
+                if year is not None and min_year <= year <= current_year:
+                    if vehicle.name not in seen_names:
+                        seen_names.add(vehicle.name)
+                        all_valid_railcars.append((vehicle, year))
+        if not all_valid_railcars:
+            return
+
+        railcars_added = 0
+        existing_items_list = list(self.available_vehicles)
+        random.shuffle(existing_items_list)
+        for existing_item in existing_items_list:
+            if railcars_added >= railcars_needed:
+                break
+            existing_vehicle = existing_item.get_item()
+            if not isinstance(existing_vehicle, Railcar):
+                continue
+            for vehicle, _year in all_valid_railcars:
+                if railcars_added >= railcars_needed:
+                    break
+                if getattr(existing_vehicle, 'name', None) == getattr(vehicle, 'name', None):
+                    existing_item.add_quantity()
+                    railcars_added += 1
+                    break
+
+        existing_railcar_names = {
+            item.get_item().name
+            for item in self.available_vehicles
+            if isinstance(item.get_item(), Railcar)
+        }
+        random.shuffle(all_valid_railcars)
+        for vehicle, _year in all_valid_railcars:
+            if railcars_added >= railcars_needed:
+                break
+            if vehicle.name in existing_railcar_names:
+                continue
+            railcar_is_on_sale = random.random() < 0.15
+            railcar_sale_discount = random.uniform(0.05, 0.30) if railcar_is_on_sale else 0.0
+            if hasattr(vehicle, 'get_price'):
+                base_price = vehicle.get_price(current_year=current_year)
+            else:
+                base_price = 200
+            sale_item = SaleItem(
+                item=vehicle, price=base_price, seller="Manufacturer",
+                year_added=current_year, sale_year=current_year if railcar_is_on_sale else None,
+            )
+            if railcar_is_on_sale:
+                sale_item.original_price = base_price
+                sale_item.discount_percent = int(railcar_sale_discount * 100)
+            self.available_vehicles.append(sale_item)
+            existing_railcar_names.add(vehicle.name)
+            railcars_added += 1
+
+        while railcars_added < railcars_needed and all_valid_railcars:
+            vehicle, _year = random.choice(all_valid_railcars)
+            for existing_item in self.available_vehicles:
+                if railcars_added >= railcars_needed:
+                    break
+                existing_vehicle = existing_item.get_item()
+                if isinstance(existing_vehicle, Railcar) and existing_vehicle.name == vehicle.name:
+                    existing_item.add_quantity()
+                    railcars_added += 1
+                    break
+
     def _get_vehicle_categories(self, registry):
         """Organize vehicles into categories based on vehicle_presets.py structure.
         Categories match the multi-line string markers in vehicle_presets.py"""
@@ -360,15 +486,20 @@ class Marketplace:
         # 20 year window for always-available items
         always_available_min_year = current_year - 20
         
-        # Calculate current total items (sum of all quantities)
-        current_total = sum(item.get_quantity_available() for item in self.available_vehicles)
+        # Calculate current total items (non-railcar quantities for replenishment)
+        current_railcar_total = self._count_standalone_railcar_quantity()
+        current_total = sum(item.get_quantity_available() for item in self.available_vehicles) - current_railcar_total
         is_first_generation = (self.target_total_items is None)
         
         # First time: use target from presets and distribute among available types
         if is_first_generation:
             self.target_total_items = MARKETPLACE_TARGET_TOTAL_ITEMS
+            if self.target_railcar_total is None:
+                self.target_railcar_total = self._compute_target_railcar_total()
             # Clear existing vehicles (except lines and workers)
             self.available_vehicles = []
+            current_total = 0
+            current_railcar_total = 0
         
         # Get vehicles organized by category
         categories = self._get_vehicle_categories(registry)
@@ -397,6 +528,8 @@ class Marketplace:
             for vehicle, year in valid_vehicles:
                 if vehicle.name in seen_names:
                     continue
+                if isinstance(vehicle, Railcar):
+                    continue
                 seen_names.add(vehicle.name)
                 is_loco = isinstance(vehicle, Locomotive)
                 is_ferry = isinstance(vehicle, Ferry)
@@ -406,6 +539,20 @@ class Marketplace:
                 mult = 2 if (is_standalone and creates_trainset) else 1
                 type_list.append((vehicle.name, vehicle, year, mult))
         
+        railcar_type_list = []
+        seen_railcar_names = set()
+        for category_name, vehicles in categories.items():
+            if not vehicles:
+                continue
+            for vehicle in vehicles:
+                if not isinstance(vehicle, Railcar):
+                    continue
+                year = getattr(vehicle, 'year_introduced', None)
+                if year is not None and min_year <= year <= current_year:
+                    if vehicle.name not in seen_railcar_names:
+                        seen_railcar_names.add(vehicle.name)
+                        railcar_type_list.append((vehicle.name, vehicle, year))
+        
         # Distribute target total among types: each type gets at least 1, rest so sum(quantity*mult) = target
         target_total = MARKETPLACE_TARGET_TOTAL_ITEMS
         num_types = len(type_list)
@@ -413,22 +560,15 @@ class Marketplace:
             quantity_per_type = []
         else:
             mults = [t[3] for t in type_list]
-            quantity_per_type = [1] * num_types  # each type gets at least 1
-            used = sum(mults)
-            extra = max(0, target_total - used)
-            # Distribute extra items: each +1 to quantity[i] adds mult[i] items
-            while extra > 0:
-                added = False
-                for i in range(num_types):
-                    if extra >= mults[i]:
-                        quantity_per_type[i] += 1
-                        extra -= mults[i]
-                        added = True
-                        break
-                if not added:
-                    break
+            quantity_per_type = self._distribute_target_quantities(target_total, mults)
+        
+        railcar_target = self.target_railcar_total if self.target_railcar_total is not None else self._compute_target_railcar_total()
+        railcar_quantity_per_type = self._distribute_target_quantities(
+            railcar_target, [1] * len(railcar_type_list),
+        )
         
         type_index = 0
+        railcar_type_index = 0
         
         # Process each category
         for category_name, vehicles in categories.items():
@@ -461,8 +601,14 @@ class Marketplace:
                 is_bus = isinstance(vehicle, Bus)
                 is_standalone_vehicle = is_locomotive or is_ferry or is_bus
                 
-                # Quantity from distributed target (same total items, spread across available types)
-                if type_index < len(quantity_per_type):
+                # Quantity from distributed target (railcars use player-scaled target)
+                if isinstance(vehicle, Railcar):
+                    if railcar_type_index < len(railcar_quantity_per_type):
+                        quantity = max(1, railcar_quantity_per_type[railcar_type_index])
+                        railcar_type_index += 1
+                    else:
+                        quantity = 1
+                elif type_index < len(quantity_per_type):
                     quantity = max(1, quantity_per_type[type_index])
                     type_index += 1
                 else:
@@ -621,6 +767,7 @@ class Marketplace:
             effective_target = int(self.target_total_items * multiplier)
             # Replenishment: bring total up to effective target
             items_needed = effective_target - current_total
+            early_scale = 1.0
             if current_year <= MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR:
                 early_span = max(1, MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR - MARKETPLACE_REPLENISHMENT_START_YEAR)
                 early_progress = (current_year - MARKETPLACE_REPLENISHMENT_START_YEAR) / early_span
@@ -638,13 +785,15 @@ class Marketplace:
                 if not available_railcars:
                     available_railcars = [(registry.get_earliest_railcar(), 1830)]
                 
-                # Collect all valid vehicles for replenishment (deduplicated by name)
+                # Collect all valid non-railcar vehicles for replenishment (deduplicated by name)
                 all_valid_vehicles = []
                 seen_vehicles = set()
                 for category_name, vehicles in categories.items():
                     if not vehicles:
                         continue
                     for vehicle in vehicles:
+                        if isinstance(vehicle, Railcar):
+                            continue
                         year = getattr(vehicle, 'year_introduced', None)
                         if year is not None and min_year <= year <= current_year:
                             vehicle_name = getattr(vehicle, 'name', None)
@@ -693,12 +842,6 @@ class Marketplace:
                                     existing_item.add_quantity()
                                     items_added += 1
                                     break
-                        # Match railcars
-                        elif not is_standalone_vehicle and isinstance(existing_vehicle, Railcar):
-                            if hasattr(existing_vehicle, 'name') and hasattr(vehicle, 'name') and existing_vehicle.name == vehicle.name:
-                                existing_item.add_quantity()
-                                items_added += 1
-                                break
                 
                 # Second pass: if still need items, create new ones (only if they truly don't exist)
                 # Build a set of existing vehicle names to avoid duplicates
@@ -743,8 +886,6 @@ class Marketplace:
                         vehicle_key = ('ferry', vehicle.name)
                     elif is_bus:
                         vehicle_key = ('bus', vehicle.name)
-                    elif isinstance(vehicle, Railcar):
-                        vehicle_key = ('railcar', vehicle.name)
                     
                     # Only create new item if it doesn't exist, we still need items, and we haven't exceeded target
                     # Also check if we've already created enough of this type (target is typically 2 per type)
@@ -787,10 +928,13 @@ class Marketplace:
                                 cars = []
                                 associated_railcar_name = getattr(vehicle, 'associated_railcar_name', None)
                                 if associated_railcar_name:
-                                    # Find matching railcar
-                                    for railcar, railcar_year in all_valid_vehicles:
-                                        if isinstance(railcar, Railcar) and hasattr(railcar, 'name') and railcar.name == associated_railcar_name:
-                                            cars = [railcar]
+                                    # Find matching railcar from registry categories
+                                    for _vehicles in categories.values():
+                                        for railcar in _vehicles:
+                                            if isinstance(railcar, Railcar) and getattr(railcar, 'name', None) == associated_railcar_name:
+                                                cars = [railcar]
+                                                break
+                                        if cars:
                                             break
                                 
                                 from vehicle import Trainset
@@ -806,33 +950,74 @@ class Marketplace:
                                     trainset_sale_item.original_price = trainset_base_price
                                     trainset_sale_item.discount_percent = int(trainset_sale_discount * 100)
                                 self.available_vehicles.append(trainset_sale_item)
-                        else:
-                            # Railcar
-                            railcar_is_on_sale = random.random() < 0.15
-                            railcar_sale_discount = random.uniform(0.05, 0.30) if railcar_is_on_sale else 0.0
-                            
-                            if hasattr(vehicle, 'get_price'):
-                                base_price = vehicle.get_price(current_year=current_year)
-                            else:
-                                base_price = 200
-                            
-                            # Store original price (before discount) - discount will be applied in get_price() after inflation
-                            sale_item = SaleItem(item=vehicle, price=base_price, seller="Manufacturer", year_added=current_year, sale_year=current_year if railcar_is_on_sale else None)
-                            if railcar_is_on_sale:
-                                sale_item.original_price = base_price
-                                sale_item.discount_percent = int(railcar_sale_discount * 100)
-                            self.available_vehicles.append(sale_item)
-                            items_added += 1
-                            # Update tracking to prevent duplicates
-                            if vehicle_key:
-                                existing_vehicle_names.add(vehicle_key)
-                                vehicle_counts[vehicle_key] = vehicle_counts.get(vehicle_key, 0) + 1
+
+            railcar_target = self.target_railcar_total if self.target_railcar_total is not None else self._compute_target_railcar_total()
+            effective_railcar_target = int(railcar_target * multiplier)
+            railcars_needed = effective_railcar_target - self._count_standalone_railcar_quantity()
+            if current_year <= MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR:
+                railcars_needed = max(0, int(railcars_needed * early_scale))
+            self._replenish_standalone_railcars(current_year, min_year, registry, railcars_needed)
         self.last_generation_year = current_year
     
+    def _marketplace_new_vehicle_min_copies(self) -> int:
+        from game_presets import (
+            MARKETPLACE_NEW_LOCOMOTIVE_COPIES,
+            MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER,
+        )
+        num_players = getattr(self, 'num_players', 2) or 2
+        per_player = num_players * MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER
+        return max(MARKETPLACE_NEW_LOCOMOTIVE_COPIES, per_player)
+
+    def _count_standalone_vehicle_qty(self, vehicle_name: str, vehicle_type: type) -> int:
+        from vehicle import Trainset
+        qty = 0
+        for sale_item in self.available_vehicles:
+            item = sale_item.get_item()
+            if isinstance(item, vehicle_type) and not isinstance(item, Trainset):
+                if getattr(item, 'name', None) == vehicle_name:
+                    qty += sale_item.get_quantity_available()
+        return qty
+
+    def _ensure_vehicle_marketplace_stock(
+        self, vehicle, vehicle_name: str, vehicle_type: type, current_year: int, min_copies: int,
+    ):
+        copies_needed = max(0, min_copies - self._count_standalone_vehicle_qty(vehicle_name, vehicle_type))
+        if copies_needed <= 0:
+            return
+        self.add_vehicle(vehicle, current_year=current_year)
+        if copies_needed > 1:
+            for sale_item in self.available_vehicles:
+                item = sale_item.get_item()
+                from vehicle import Trainset
+                if isinstance(item, vehicle_type) and not isinstance(item, Trainset):
+                    if getattr(item, 'name', None) == vehicle_name:
+                        sale_item.add_quantity(copies_needed - 1)
+                        break
+
     def add_trainsets_for_new_technology(self, current_year: int, newly_researched_vehicles: list):
         """Regenerate marketplace when new technology is researched.
         This ensures the marketplace is updated with new categories and availability."""
-        # Regenerate entire marketplace to ensure proper categorization and availability
         self.generate_trainsets_based_on_discoveries(current_year)
+        if not newly_researched_vehicles:
+            return
+        from vehicle_presets import get_vehicle_registry
+        from vehicle import Locomotive, Railcar, Ferry, Bus
+        registry = get_vehicle_registry()
+        vehicle_lookup = (
+            (registry.get_all_locomotives(), Locomotive),
+            (registry.get_all_railcars(), Railcar),
+            (registry.get_all_ferries(), Ferry),
+            (registry.get_all_buses(), Bus),
+        )
+        by_name = [{v.name: v for v in vehicles} for vehicles, _ in vehicle_lookup]
+        min_copies = self._marketplace_new_vehicle_min_copies()
+        for vehicle_name, _year in newly_researched_vehicles:
+            for (vehicles, vehicle_type), name_map in zip(vehicle_lookup, by_name):
+                vehicle = name_map.get(vehicle_name)
+                if vehicle is not None:
+                    self._ensure_vehicle_marketplace_stock(
+                        vehicle, vehicle_name, vehicle_type, current_year, min_copies,
+                    )
+                    break
 
     

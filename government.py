@@ -6,7 +6,7 @@ from typing import Optional
 
 # Small chance each year that laws override favor (pass favorable laws for unfavored, or vice versa)
 # Low value = laws most likely favor the player the government favors
-LAW_OVERRIDE_CHANCE = 0.02
+LAW_OVERRIDE_CHANCE = 0.01
 
 # First election year - seats are unaffiliated (gray) until then; can be lobbyed before
 FIRST_ELECTION_YEAR = 1832

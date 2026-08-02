@@ -58,11 +58,17 @@ class Player:
             self.buses = []
         if not hasattr(self, 'ferries'):
             self.ferries = []
+        if getattr(self, 'line_names', None) is None:
+            self.line_names = []
+        if getattr(self, 'trainsets', None) is None:
+            self.trainsets = []
 
     def get_money(self):
         return self.money
 
     def get_line_names(self):
+        if self.line_names is None:
+            self.line_names = []
         return self.line_names
 
     def get_player_id(self):
@@ -83,6 +89,8 @@ class Player:
         self.trainsets.append(trainset)
 
     def get_trainsets(self):
+        if self.trainsets is None:
+            self.trainsets = []
         return self.trainsets
     
     def get_trainsets_by_line(self, line_name: str):

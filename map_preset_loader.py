@@ -692,9 +692,7 @@ def preset_has_population_init(preset_name: str) -> bool:
 
 
 def preset_ai_uses_street_network(preset_name: str, game_map=None) -> bool:
-    """True for OSM / street-routing maps — AI uses the same rules on all of them."""
-    if game_map is not None and getattr(game_map, 'use_osm', False):
-        return True
+    """True when AI line building must follow preset street/road polylines (not display-only OSM tiles)."""
     if not preset_name:
         return False
     return preset_has_road_support(preset_name)

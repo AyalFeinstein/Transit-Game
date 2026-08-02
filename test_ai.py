@@ -605,6 +605,22 @@ class TestAIPerformance(unittest.TestCase):
         self.assertLess(elapsed, 60.0, f"run_ai_turn took {elapsed:.1f}s (bug if > 60s; target < 15s)")
         self.assertIsInstance(results, list)
 
+    def test_run_ai_turn_has_lines_before_network_growth_logic(self):
+        """run_ai_turn must not raise UnboundLocalError for has_lines (used before fare-update block)."""
+        ops = Operations(
+            ["Human", "AI1"], 50, 50, 50000, 1.0, 1.0,
+            ai_player_indices=[1],
+        )
+        ai = ops.get_players()[1]
+        pts = [(10, 10), (15, 15), (20, 20)]
+        ops.create_line_complete("AI Test Line", pts, ai, ['street', 'street'])
+        ops.process_build_queue()
+        for _ in range(2):
+            run_ai_turn(ops, ai)
+            ops.advance_year_complete(ops.get_year())
+        results = run_ai_turn(ops, ai)
+        self.assertIsInstance(results, list)
+
     def test_advance_year_with_ai_completes_under_60_seconds(self):
         """Timed test: AI turn + advance_year must complete in under 60s. Target < 15s; > 60s indicates a bug."""
         year = self.ops.get_year()
@@ -682,6 +698,38 @@ class TestAIPerformance(unittest.TestCase):
         second = _get_existing_line_routes_for_overlap(self.ops, game_map)
         self.assertIs(first, second)
         self.assertEqual(len(second), 2)
+
+
+class TestAIBuildQueueNoneSafety(unittest.TestCase):
+    """AI turns must not crash when legacy saves have build_queue=None."""
+
+    def test_run_pending_ai_in_year_turns_with_none_build_queue(self):
+        ops = Operations(
+            ["Human", "Northern Transit", "Lakeside Railway", "Western Railway"],
+            30, 30, 50000, 1.0, 1.0,
+            map_preset_name="standard",
+            ai_player_indices=[1, 2, 3],
+        )
+        ops.game.build_queue = None
+        _, failures = run_pending_ai_in_year_turns(ops)
+        self.assertEqual(failures, [])
+        self.assertIsInstance(ops.get_build_queue(), list)
+
+    def test_route_dominant_street_names_returns_list_when_preset_returns_none(self):
+        from ai import _route_dominant_street_names
+
+        ops = Operations(
+            ["Human", "Northern Transit"], 30, 30, 50000, 1.0, 1.0,
+            map_preset_name="standard", ai_player_indices=[1],
+        )
+        game_map = ops.get_map()
+        with patch(
+            "map_preset_loader.get_preset_streets_route_runs_along", return_value=None
+        ):
+            streets = _route_dominant_street_names(
+                game_map, [(5.0, 5.0), (6.0, 6.0)], "standard", ops.get_year()
+            )
+        self.assertEqual(streets, [])
 
 
 def _run_advance_year_like_server(ops):
@@ -1495,6 +1543,57 @@ class TestAILineNamingAndOverlap(unittest.TestCase):
                 )
             )
         self.assertEqual(len(set(names)), 3, f"Expected 3 unique line names, got {names}")
+        for name in names:
+            self.assertFalse(
+                __import__('ai')._ai_name_has_numeric_suffix(name),
+                f"Line name must not use numeric suffix: {name!r}",
+            )
+
+    def test_line_names_skip_taken_without_numeric_suffix(self):
+        from ai import _generate_ai_line_name, _ai_name_has_numeric_suffix
+        from line import Line
+        import random
+
+        ops = Operations(["A", "B"], 50, 50, 50000, ai_player_indices=[0, 1], map_preset_name="standard")
+        p1, p2 = ops.get_players()
+        game_map = ops.get_map()
+        taken_line = Line("A", 1, [(5, 5), (8, 5)], owner=p1)
+        game_map.add_line(taken_line)
+        p1.line_names = ["A"]
+        rng = random.Random(7)
+        name = _generate_ai_line_name(
+            p2, rng, ops=ops, route_points=[(10, 10), (12, 10)], current_year=1830,
+        )
+        self.assertNotEqual(name, "A")
+        self.assertFalse(_ai_name_has_numeric_suffix(name), f"Got numeric suffix in {name!r}")
+
+    def test_ai_resolve_unique_station_name_no_numeric_suffix(self):
+        from ai import _ai_resolve_unique_station_name, _ai_name_has_numeric_suffix
+        from line import Line
+        from station import Station
+
+        ops = Operations(["AI"], 50, 50, 50000, ai_player_indices=[0], map_preset_name="standard")
+        player = ops.get_players()[0]
+        game_map = ops.get_map()
+        line = Line("Alpha", 1, [(5, 5), (10, 5)], owner=player)
+        game_map.add_line(line)
+        player.line_names = ["Alpha"]
+        game_map.stations = [Station("Union Square", 5.0, 5.0, line_names=["Alpha"])]
+        line.add_station(game_map.stations[0])
+        resolved = _ai_resolve_unique_station_name(
+            ops, player, "Union Square", x=8.0, y=5.0, line_name="Alpha",
+        )
+        self.assertNotEqual(resolved, "Union Square")
+        self.assertFalse(_ai_name_has_numeric_suffix(resolved), f"Got numeric suffix in {resolved!r}")
+
+    def test_transit_company_name_no_numeric_suffix(self):
+        from transit_company_names import TRANSIT_NAMES_NYC, get_transit_company_name
+        from ai import _ai_name_has_numeric_suffix
+
+        existing = set(TRANSIT_NAMES_NYC)
+        name = get_transit_company_name(existing_names=existing, map_preset_name="nyc")
+        self.assertNotIn(name, existing)
+        self.assertFalse(_ai_name_has_numeric_suffix(name), f"Got numeric suffix in {name!r}")
 
     def test_line_name_not_wrong_borough_on_manhattan_route(self):
         from ai import _generate_ai_line_name, _line_name_matches_route_areas
@@ -1563,6 +1662,35 @@ class TestAIRouteBacktracking(unittest.TestCase):
 
         hairpin = [(0.0, 0.0), (2.0, 0.0), (0.1, 0.2)]
         self.assertTrue(route_exceeds_max_turn(hairpin, MAX_TRAIN_ROUTE_TURN_DEGREES))
+
+    def test_extension_turn_ok_allows_sharp_turn(self):
+        from ai import _extension_turn_ok
+
+        route = [(0.0, 0.0), (10.0, 0.0)]
+        sharp_ext = [(10.0, 0.0), (10.0, 10.0)]
+        self.assertTrue(_extension_turn_ok(route, sharp_ext, extend_from_end=True))
+
+    def test_extension_allows_sharp_turn_on_existing_line(self):
+        from line import Line
+
+        ops = Operations(["Human"], 50, 50, 200000, 1.0, 1.0, map_preset_name="standard")
+        player = ops.get_players()[0]
+        game_map = ops.get_map()
+        route = [(5.0, 5.0), (15.0, 5.0)]
+        line = Line("Sharp Ext", 1, route, player, [])
+        game_map.add_line(line)
+        player.line_names.append("Sharp Ext")
+        additional = [(15.0, 5.0), (15.0, 15.0), (5.0, 15.0)]
+        cost_info = ops.calculate_extend_cost(
+            "Sharp Ext", additional, extend_from_end=True,
+            elevation_levels=['street', 'street', 'street'],
+        )
+        result = ops.extend_line_complete(
+            "Sharp Ext", player, additional, extend_from_end=True,
+            elevation_levels=['street', 'street', 'street'], cost_info=cost_info, use_fast_path=True,
+        )
+        self.assertIn('cost', result)
+        self.assertGreater(result['cost'], 0)
 
     def test_ai_cannot_create_doubling_back_line(self):
         from operations import _ai_route_has_backtracking

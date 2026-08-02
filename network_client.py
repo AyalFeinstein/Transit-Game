@@ -15,6 +15,7 @@ except ImportError:
     socketio.exceptions = socketio
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from game import Game
+from message_protocol import parse_server_address
 
 
 class NetworkClient(QObject):
@@ -34,9 +35,9 @@ class NetworkClient(QObject):
     end_year_status = pyqtSignal(dict)  # Emitted when end year status updates
     chat_received = pyqtSignal(dict)  # Emitted when chat message received {message, sender}
     
-    def __init__(self, server_url: str = "http://localhost:8080"):
+    def __init__(self, server_url: str = "http://localhost:8080", port: Optional[int] = None):
         super().__init__()
-        self.server_url = server_url
+        self.server_url = parse_server_address(server_url, port=port)
         self.sio: Optional[socketio.Client] = None
         self.session_id: Optional[str] = None
         self.player_id: Optional[int] = None
@@ -70,12 +71,18 @@ class NetworkClient(QObject):
     
     def disconnect_from_server(self):
         """Disconnect from the game server"""
-        if self.sio and self.connected_flag:
-            self.sio.disconnect()
-            self.connected_flag = False
-            self.session_id = None
-            self.player_id = None
-            self.disconnected.emit()
+        if self.sio:
+            try:
+                if self.connected_flag:
+                    self.sio.disconnect()
+            except Exception:
+                pass
+            self.sio = None
+        self.connected_flag = False
+        self.session_id = None
+        self.player_id = None
+        self.player_name = None
+        self.disconnected.emit()
     
     def _setup_event_handlers(self):
         """Setup Socket.IO event handlers"""
@@ -380,12 +387,8 @@ class NetworkThread(QThread):
         # Keep thread alive - socketio will handle its own event loop
         # We just need to keep the thread running
         import time
-        while True:
-            if self.client.connected_flag:
-                time.sleep(0.5)
-            else:
-                # If not connected, check periodically if we should reconnect
-                time.sleep(1)
-                if not self.client.sio:
-                    break
+        while self.client.sio is not None:
+            time.sleep(0.5)
+            if not self.client.connected_flag and self.client.sio is None:
+                break
 

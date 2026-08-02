@@ -18,6 +18,7 @@ AI money fluctuation: AIs often alternate between large gains and losses because
 import logging
 import random
 import math
+import re
 import time
 from typing import Optional
 
@@ -47,22 +48,26 @@ class AIIdleTurnError(RuntimeError):
     """Raised when a living AI would finish a turn with zero actions (debug invariant)."""
 
 
-def _preset_requires_street_polylines(game_map, preset=None) -> bool:
-    """True when AI line building must follow OSM/street polylines (no population-point fallback)."""
-    if bool(getattr(game_map, 'use_osm', False)):
-        return True
-    if preset and hasattr(preset, 'get_road_segment_points_for_ai'):
-        return True
-    preset_name = getattr(game_map, 'map_preset_name', None)
-    if preset_name:
+def _ai_map_uses_street_build(game_map, preset=None) -> bool:
+    """True when AI must build along preset street/road polylines (not display-only OSM tiles)."""
+    preset_name = getattr(game_map, 'map_preset_name', None) if game_map else None
+    if preset is None and preset_name:
         try:
             from map_preset_loader import load_map_preset
-            p = preset if preset is not None else load_map_preset(preset_name)
-            if p and hasattr(p, 'get_road_segment_points_for_ai'):
-                return True
+            preset = load_map_preset(preset_name)
         except Exception:
-            pass
+            preset = None
+    if preset and hasattr(preset, 'get_road_segment_points_for_ai'):
+        return True
+    if preset_name:
+        from map_preset_loader import preset_has_road_support
+        return preset_has_road_support(preset_name)
     return False
+
+
+def _preset_requires_street_polylines(game_map, preset=None) -> bool:
+    """True when AI line building must follow OSM/street polylines (no population-point fallback)."""
+    return _ai_map_uses_street_build(game_map, preset)
 
 
 def _format_street_route_failure_message(ops, player, game_map, current_year, preset=None) -> str:
@@ -158,6 +163,11 @@ def _ai_turn_time_remaining(ops) -> float:
     return max(0.0, float(deadline) - time.monotonic())
 
 
+def _ai_turn_time_low(ops, threshold_sec: float = 20.0) -> bool:
+    """True when less than threshold_sec remains on the AI turn clock."""
+    return _ai_turn_time_remaining(ops) < float(threshold_sec)
+
+
 _AI_ROAD_SEGMENT_MAX_POINTS_DEFAULT = 24
 _AI_ROAD_SEGMENT_MAX_POINTS_OPENER = 36
 
@@ -172,7 +182,7 @@ def _ai_osm_line_build_prefer_speed(
     """Take the first viable OSM corridor instead of scoring many retries."""
     if existing_routes:
         return True
-    if _ai_turn_time_remaining(ops) < 35.0:
+    if _ai_turn_time_remaining(ops) < 45.0:
         return True
     return not (first_game_year and is_first)
 
@@ -242,8 +252,12 @@ def _ai_first_year_opener_already_attempted(ops) -> bool:
 def _ai_osm_build_budget_exhausted(ops, *, first_opener: bool = False) -> bool:
     if ops is None:
         return False
+    if _ai_turn_time_low(ops, 12.0):
+        return True
     n = int(getattr(ops, '_ai_osm_full_build_calls', 0) or 0)
     cap = 6 if first_opener else 2
+    if _ai_turn_time_low(ops, 25.0):
+        cap = min(cap, 3 if first_opener else 1)
     return n >= cap
 
 
@@ -859,14 +873,6 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
         player.ai_difficulty = difficulty
     results = []
     money = ops.get_player_money(player)
-    idle_benchmark = get_idle_human_benchmark_player(ops, player)
-    idle_money = (
-        ops.get_player_money(idle_benchmark)
-        if idle_benchmark and not ops.is_player_eliminated(idle_benchmark)
-        else None
-    )
-    idle_benchmark_game = is_idle_human_benchmark_game(ops, player)
-    capital_preservation_vs_idle = False
 
     # Per-player RNG (same seed order as before so reserve/build choices unchanged for survival)
     rng = _ai_rng(player, current_year, ops)
@@ -892,8 +898,53 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
 
     has_assets = (len(player.get_line_names()) > 0 or len(player.get_trainsets()) > 0)
     ai_join_first_line_pending = _ai_join_year_pending_first_line(ops, player, current_year)
+    first_turn_opener = (first_calendar_year or ai_join_first_line_pending) and not has_assets
 
-    # Survival reserve: keep buffer so we don't go broke; early years need enough to pay taxes + workers.
+    _turn_start = time.monotonic()
+    _turn_budget_sec = max(1.0, float(deadline_sec if deadline_sec is not None else AI_TURN_TIME_BUDGET_SEC))
+    if ops is not None:
+        ops._ai_turn_deadline_mono = _turn_start + _turn_budget_sec
+    _ai_begin_line_build_turn(ops)
+
+    def _turn_time_exceeded() -> bool:
+        return _ai_turn_time_exceeded(ops)
+
+    # Fast OSM opener before reserve/finance scans (multi-AI NYC turn 1 timeout fix).
+    if first_turn_opener:
+        build_queue_early = ops.get_build_queue() if hasattr(ops, 'get_build_queue') else []
+        my_line_builds_early = [
+            b for b in build_queue_early
+            if b.get('player') == player and b.get('type') in ('line', 'line_extension')
+        ]
+        osm_opener_map = _ai_map_uses_street_build(game_map, preset)
+        if not my_line_builds_early and osm_opener_map:
+            try:
+                from map_preset_loader import preload_road_data_for_preset
+                preload_road_data_for_preset(map_preset, game_map)
+            except Exception:
+                pass
+            try:
+                budget = min(max(_inf(500), int(ops.get_player_money(player))), _inf(120000))
+                direct = _osm_first_turn_try_cached_segment_build(
+                    ops, player, game_map, current_year, rng, preset, budget,
+                    existing_routes=existing_routes,
+                )
+                if _ai_line_create_result_ok(direct):
+                    _ai_mark_first_year_opener_attempted(ops)
+                    results.append(('create_line', direct))
+                    validate_ai_turn_results(ops, player, results)
+                    return results
+            except Exception:
+                pass
+
+    idle_benchmark = get_idle_human_benchmark_player(ops, player)
+    idle_money = (
+        ops.get_player_money(idle_benchmark)
+        if idle_benchmark and not ops.is_player_eliminated(idle_benchmark)
+        else None
+    )
+    idle_benchmark_game = is_idle_human_benchmark_game(ops, player)
+    capital_preservation_vs_idle = False
     next_year = current_year + 1
     estimated_costs_next = (ops.estimate_annual_costs_for_player(player, next_year, 0)
                             if hasattr(ops, 'estimate_annual_costs_for_player') else _inf(10000))
@@ -947,7 +998,10 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
     min_spendable_for_station = _inf(1200) if years_from_start <= 10 else _inf(500)
 
     try:
-        summary = ops.get_player_financial_summary(player, current_year) if hasattr(ops, 'get_player_financial_summary') else {}
+        if first_turn_opener:
+            summary = {}
+        else:
+            summary = ops.get_player_financial_summary(player, current_year) if hasattr(ops, 'get_player_financial_summary') else {}
     except Exception:
         summary = {}
     is_losing_money = summary.get('net', 0) < 0
@@ -986,14 +1040,6 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
         money >= _inf(_WEALTHY_MONEY_THRESHOLD) and net_income > _inf(2000)
         and (not sustained_profit_phase or net_income > 0)
     )
-    _turn_start = time.monotonic()
-    _turn_budget_sec = max(1.0, float(deadline_sec if deadline_sec is not None else AI_TURN_TIME_BUDGET_SEC))
-    if ops is not None:
-        ops._ai_turn_deadline_mono = _turn_start + _turn_budget_sec
-    _ai_begin_line_build_turn(ops)
-
-    def _turn_time_exceeded() -> bool:
-        return _ai_turn_time_exceeded(ops)
 
     # Track early visible network growth: by 1841 each AI should have built/expanded at least twice.
     try:
@@ -1047,7 +1093,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
         for line in [map_lines.get(ln)]
         if line and _line_needs_extension_before_second_station(ops, ln, line)
     ]
-    osm_like_map = bool(getattr(game_map, 'use_osm', False)) or bool(
+    osm_like_map = _ai_map_uses_street_build(game_map, preset) or bool(
         preset and hasattr(preset, 'get_road_extension_points_from_end')
     )
     force_station_extension_needed = osm_like_map and years_from_start >= 2 and bool(
@@ -1058,6 +1104,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
         for ln in player.get_line_names()
         if map_lines.get(ln)
     )
+    has_lines = len(player.get_line_names()) > 0
     lines_missing_trainsets = [
         ln for ln in player.get_line_names()
         if _line_needs_trainset_assignment(map_lines, ln)
@@ -1223,19 +1270,22 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
         if target_spend >= min_extend_spendable:
             reserve = min(reserve, max(0, money - target_spend))
             spendable = max(0, money - reserve)
-    # Fast OSM opener: on first turn with no lines, build a short adjacent road segment immediately.
-    # This avoids expensive route-search retries and guarantees each AI opens service on NYC/NY Metro style maps.
-    if (first_calendar_year or ai_join_first_line_pending) and len(player.get_line_names()) == 0 and not my_line_builds and (
-        bool(getattr(game_map, 'use_osm', False)) or (preset and hasattr(preset, 'get_road_segment_points_for_ai'))
+
+    # Fallback OSM opener after queue snapshot (retries when early fast-path did not queue a line).
+    if (
+        (first_calendar_year or ai_join_first_line_pending)
+        and len(player.get_line_names()) == 0
+        and not my_line_builds
+        and not any(a == 'create_line' for a, _ in results)
+        and _ai_map_uses_street_build(game_map, preset)
     ):
         try:
             budget = min(max(_inf(500), int(ops.get_player_money(player))), _inf(120000))
-            ex_opener = existing_routes
-            _ai_mark_first_year_opener_attempted(ops)
             direct = _osm_guaranteed_first_year_line(
-                ops, player, game_map, current_year, rng, preset, budget, ex_opener,
+                ops, player, game_map, current_year, rng, preset, budget, existing_routes,
             )
             if _ai_line_create_result_ok(direct):
+                _ai_mark_first_year_opener_attempted(ops)
                 _do_action('create_line', direct)
                 validate_ai_turn_results(ops, player, results)
                 return results
@@ -1244,8 +1294,10 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
 
     # Cache population points once per turn (expensive on large maps).
     # Delayed until after the first-turn OSM fast-path so multi-AI NYC openers do not time out.
-    if points_with_pop is None:
+    if points_with_pop is None and not _turn_time_exceeded():
         pop_cap = _MAX_BUILD_CANDIDATES
+        if _ai_turn_time_low(ops, 30.0):
+            pop_cap = min(pop_cap, 10)
         if game_map and getattr(game_map, 'population', None):
             if len(game_map.population) > 5000:
                 pop_cap = min(pop_cap, 16)
@@ -1526,6 +1578,8 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
         wants_new_line = False
     if any_line_needs_stations and has_assets and not (first_calendar_year or ai_join_first_line_pending):
         wants_new_line = False
+    if has_lines and route_extend_ok and spendable > min_extend_spendable and not (first_calendar_year or ai_join_first_line_pending):
+        pass  # prefer extend/station in action1 before discretionary new lines
     max_build_cost = spendable
     if surplus_cash_expand and not has_unfinished_lines:
         wants_new_line = True
@@ -1546,7 +1600,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
 
     def _try_action1_build_extend_station():
         """Action 1: Build, extend, or add station. Returns (name, result) or None.
-        Priority: (1) build on first turn (one line only so we can afford workers), (2) add stations, (3) assign trainsets, (4) extend, (5) build more."""
+        Priority: (1) first line on turn 1, (2) stations, (3) extend existing lines, (4) assign trainsets, (5) new lines."""
         spend = _refresh_spendable()
         lines = player.get_line_names()
         # Only build first line on turn 1 when we have no line in queue yet (use current queue, not start-of-turn snapshot)
@@ -1561,7 +1615,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
         )
         # First turn: all AIs must build one line regardless of finances (game year 1 or join-year spawn).
         if is_first_or_no_assets and (spend > 0 or first_calendar_year or ai_join_first_line_pending):
-            _osm_first_turn = bool(getattr(game_map, 'use_osm', False)) or bool(preset and hasattr(preset, 'get_road_segment_points_for_ai'))
+            _osm_first_turn = _ai_map_uses_street_build(game_map, preset)
             # Turn 1: allow enough for a real first line (all AIs must build on first turn)
             if (first_calendar_year or ai_join_first_line_pending) and _osm_first_turn:
                 first_build_cap = min(spend, _inf(60000))
@@ -1577,18 +1631,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
             rent_result = _try_rent_workers(ops, player, current_year, spend)
             if rent_result:
                 return ('rent_workers', rent_result)
-        # Too short for second station at required spacing: extend onto a neighboring street first.
-        if lines and spend > min_extend_spendable and lines_requiring_extension_for_station:
-            if route_extend_ok:
-                spend = _refresh_spendable()
-                extend_result = _try_extend_line(
-                    ops, player, game_map, spend, current_year, points_with_pop,
-                    rng=rng, preset=preset, line_names_priority=lines_requiring_extension_for_station,
-                )
-                if extend_result:
-                    return ('extend_line', extend_result)
-        # Lines need 2 stations to earn profit - add stations before assigning trainsets.
-        # Lines with only one station are prioritized (sort by station_count) so AI must add a second station.
+        # Lines need 2 stations to earn profit - add stations before extending or building new lines.
         if lines and spend >= _inf(500):
             lines_with_station_count = []
             for ln in lines:
@@ -1618,6 +1661,32 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
             )
             if rescue:
                 return rescue
+        # Too short for second station at required spacing: extend onto a neighboring street first.
+        if lines and spend > min_extend_spendable and lines_requiring_extension_for_station:
+            if route_extend_ok:
+                spend = _refresh_spendable()
+                extend_result = _try_extend_line(
+                    ops, player, game_map, spend, current_year, points_with_pop,
+                    rng=rng, preset=preset, line_names_priority=lines_requiring_extension_for_station,
+                )
+                if extend_result:
+                    return ('extend_line', extend_result)
+        if route_extend_ok and not (profit_recovery_mode and lines_missing_trainsets and near_term_bankruptcy_risk):
+            spend = _refresh_spendable()
+            if spend > min_extend_spendable:
+                extend_result = _try_extend_line(
+                    ops,
+                    player,
+                    game_map,
+                    spend,
+                    current_year,
+                    points_with_pop,
+                    rng=rng,
+                    preset=preset,
+                    require_profit_when_troubled=extension_profit_gate,
+                )
+                if extend_result:
+                    return ('extend_line', extend_result)
         # Assign trainsets to lines that have 2+ stations (lines earn profit only with stations)
         unassigned = ops.get_unassigned_trainsets(player)
         lines_with_stations = [ln for ln in lines if map_lines.get(ln) and len((map_lines.get(ln).get_stations() if hasattr(map_lines.get(ln), 'get_stations') else [])) >= 2]
@@ -1649,22 +1718,6 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
                             return ('assign_trainset', {'line': best_line})
                         except Exception:
                             pass
-        if route_extend_ok and not (profit_recovery_mode and lines_missing_trainsets and near_term_bankruptcy_risk):
-            spend = _refresh_spendable()
-            if spend > min_extend_spendable:
-                extend_result = _try_extend_line(
-                    ops,
-                    player,
-                    game_map,
-                    spend,
-                    current_year,
-                    points_with_pop,
-                    rng=rng,
-                    preset=preset,
-                    require_profit_when_troubled=extension_profit_gate,
-                )
-                if extend_result:
-                    return ('extend_line', extend_result)
         # On turn 1 / join year, do not build a second line (we already have one in queue; need money for workers)
         if wants_new_line and not ((first_calendar_year or ai_join_first_line_pending) and _my_builds_now) and spend > min_spendable_for_station:
             spend = _refresh_spendable()
@@ -1749,6 +1802,39 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
             if lobby_result:
                 return ('lobby', lobby_result)
         if focus == 'line_expansion' and wants_new_line and spend > min_spendable_for_station:
+            lines = player.get_line_names()
+            if lines and spend >= _inf(500):
+                for ln in lines:
+                    line = map_lines.get(ln)
+                    if not line:
+                        continue
+                    stations = line.get_stations() if hasattr(line, 'get_stations') else []
+                    if len(stations) >= 2:
+                        continue
+                    min_spacing = _get_ai_station_spacing(line_name=ln, line=line)
+                    pt = _pick_station_point(
+                        ops, game_map, ln, line, points_with_pop, set(),
+                        min_spacing=min_spacing, player=player,
+                    )
+                    if pt:
+                        name = _generate_ai_station_name(
+                            ops, game_map, pt[0], pt[1], current_year, line_name=ln,
+                        )
+                        r = _try_ai_add_station(ops, player, ln, name, pt[0], pt[1])
+                        if r:
+                            r['line_name'] = ln
+                            r['station_name'] = name
+                            r['point'] = (pt[0], pt[1])
+                            return ('add_station', r)
+            if route_extend_ok and spend > min_extend_spendable:
+                extend_result = _try_extend_line(
+                    ops, player, game_map, spend, current_year, points_with_pop,
+                    rng=rng, preset=preset,
+                    line_names_priority=lines_requiring_extension_for_station,
+                    require_profit_when_troubled=extension_profit_gate,
+                )
+                if extend_result:
+                    return ('extend_line', extend_result)
             max_cost = min(max_build_cost, spend)
             if max_cost > min_spendable_for_station:
                 build_result = _try_build_line(
@@ -1937,19 +2023,19 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
     elif surplus_cash_expand:
         all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
     else:
-        all_slots = [_try_action2_focus, _try_action1_build_extend_station, _try_action3_situational]
+        all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
         if focus == 'lobbying':
-            all_slots = [_try_action2_focus, _try_action1_build_extend_station, _try_action3_situational]
+            all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
         elif focus == 'marketplace':
-            all_slots = [_try_action2_focus, _try_action3_situational, _try_action1_build_extend_station]
+            all_slots = [_try_action1_build_extend_station, _try_action3_situational, _try_action2_focus]
         elif focus == 'line_expansion':
-            all_slots = [_try_action2_focus, _try_action1_build_extend_station, _try_action3_situational]
+            all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
         if is_losing_money and not about_to_go_bankrupt and not slow_bleed_long_runway:
             all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
         if slow_bleed_long_runway:
-            all_slots = [_try_action2_focus, _try_action1_build_extend_station, _try_action3_situational]
+            all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
             if focus == 'lobbying':
-                all_slots = [_try_action2_focus, _try_action1_build_extend_station, _try_action3_situational]
+                all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
             elif focus in ('marketplace', 'line_expansion', 'balanced'):
                 all_slots = [_try_action1_build_extend_station, _try_action2_focus, _try_action3_situational]
 
@@ -2184,16 +2270,12 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
             if not my_line_q:
                 spend = max(0, _refresh_spendable())
                 money_now = max(0, int(ops.get_player_money(player)))
-                _uses_osm_roads = bool(getattr(game_map, 'use_osm', False)) or bool(
-                    preset and hasattr(preset, 'get_road_segment_points_for_ai')
-                )
+                _uses_osm_roads = _ai_map_uses_street_build(game_map, preset)
                 force_cap = _ai_budget_bounds(
                     ops, current_year, max(spend, money_now),
                     ceiling=(120000 if _uses_osm_roads else 20000),
                 )
-                uses_osm_roads = bool(getattr(game_map, 'use_osm', False)) or bool(
-                    preset and hasattr(preset, 'get_road_segment_points_for_ai')
-                )
+                uses_osm_roads = _ai_map_uses_street_build(game_map, preset)
                 n_force_attempts = 1 if _ai_first_year_opener_already_attempted(ops) else (
                     3
                     if uses_osm_roads and (first_calendar_year or ai_join_first_line_pending)
@@ -2359,9 +2441,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
             q = ops.get_build_queue() if hasattr(ops, 'get_build_queue') else []
             my_line_q = [b for b in q if b.get('player') == player and b.get('type') in ('line', 'line_extension')]
             if not my_line_q and not any(a == 'create_line' for a, _ in results):
-                _uses_osm_roads = bool(getattr(game_map, 'use_osm', False)) or bool(
-                    preset and hasattr(preset, 'get_road_segment_points_for_ai')
-                )
+                _uses_osm_roads = _ai_map_uses_street_build(game_map, preset)
                 force_cap = _ai_budget_bounds(
                     ops, current_year, ops.get_player_money(player),
                     ceiling=(120000 if _uses_osm_roads else 15000),
@@ -2381,7 +2461,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
                         ops, player, game_map, force_cap, current_year, points_with_pop,
                         rng=rng, existing_routes=_overlap_routes, preset=preset,
                     )
-                if not _ai_line_create_result_ok(forced) and (first_calendar_year or ai_join_first_line_pending) and (bool(getattr(game_map, 'use_osm', False)) or bool(preset and hasattr(preset, 'get_road_segment_points_for_ai'))):
+                if not _ai_line_create_result_ok(forced) and (first_calendar_year or ai_join_first_line_pending) and _ai_map_uses_street_build(game_map, preset):
                     forced = _osm_emergency_first_line_from_preset(
                         ops, player, game_map, current_year, rng, preset, force_cap, existing_routes,
                     )
@@ -2484,7 +2564,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
     ):
         q = ops.get_build_queue() if hasattr(ops, 'get_build_queue') else []
         if not any(b.get('player') == player and b.get('type') in ('line', 'line_extension') for b in (q or [])):
-            _osm_lr = bool(getattr(game_map, 'use_osm', False)) or bool(preset and hasattr(preset, 'get_road_segment_points_for_ai'))
+            _osm_lr = _ai_map_uses_street_build(game_map, preset)
             if _osm_lr:
                 cap = _ai_budget_bounds(ops, current_year, ops.get_player_money(player))
                 ex_lr = existing_routes
@@ -2694,9 +2774,7 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
             if b.get('player') == player and b.get('type') in ('line', 'line_extension')
         ]
         if not my_q and len(player.get_line_names()) == 0:
-            _osm_lr = bool(getattr(game_map, 'use_osm', False)) or bool(
-                preset and hasattr(preset, 'get_road_segment_points_for_ai')
-            )
+            _osm_lr = _ai_map_uses_street_build(game_map, preset)
             if _osm_lr:
                 ops._ai_turn_deadline_mono = time.monotonic() + 20.0
                 cap = _ai_budget_bounds(ops, current_year, ops.get_player_money(player))
@@ -2732,6 +2810,51 @@ def run_ai_turn(ops, player, progress_callback=None, deadline_sec=None):
                     f"(spendable ${spend_end:,})."
                 ),
             )
+
+    # Never leave a living AI with zero actions when schedule/fare/rent adjustments are still available.
+    if (
+        not results
+        and getattr(player, 'is_ai', False)
+        and ops
+        and not ops.is_player_eliminated(player)
+        and not _turn_time_exceeded()
+    ):
+        if player.get_line_names():
+            schedule_updates = _adjust_ai_schedules(
+                ops,
+                player,
+                game_map,
+                has_profitable_line=has_profitable_line,
+                is_losing_money=is_losing_money,
+                is_wealthy_and_profitable=is_wealthy_and_profitable,
+                early_growth=early_growth,
+                schedule_survival_tight=schedule_survival_tight or near_term_bankruptcy_risk,
+            )
+            if schedule_updates:
+                _do_action('set_schedule', {'lines': schedule_updates})
+        if not results and player.get_line_names():
+            fare_changes = _adjust_ai_fares(ops, player, current_year, game_map, rng)
+            if fare_changes:
+                _do_action('set_fares', {'lines': fare_changes})
+        if not results:
+            spend_fb = max(_refresh_spendable(), min(_inf(3000), int(ops.get_player_money(player) * 0.15)))
+            if spend_fb >= _inf(300):
+                rent_result = _try_rent_workers(ops, player, current_year, spend_fb)
+                if rent_result:
+                    _do_action('rent_workers', rent_result)
+        if not results:
+            for slot_fn in (_try_action2_focus, _try_action3_situational):
+                if _turn_time_exceeded():
+                    break
+                extra = slot_fn()
+                if extra:
+                    _do_action(extra[0], extra[1])
+                    break
+        if not results:
+            _try_mandatory_network_or_focus_action()
+        if not results and player.get_line_names():
+            # Last resort: record a schedule pass so the year is not idle when all discretionary checks noop.
+            _do_action('set_schedule', {'lines': [player.get_line_names()[0]]})
 
     validate_ai_turn_results(ops, player, results)
     return results
@@ -2903,21 +3026,21 @@ MIN_STATION_SPACING_GRID = 0.6
 
 
 def _osm_last_resort_create_line_from_preset(
-    ops, player, game_map, current_year: int, rng: random.Random, preset, force_cap: int
+    ops, player, game_map, current_year: int, rng: random.Random, preset, force_cap: int,
+    *, skip_cached: bool = False,
 ):
     """OSM year-1 opener: cached preset segments, then a long trimmed road polyline if those fail."""
     preset_name = getattr(game_map, 'map_preset_name', None)
     if not preset_name or force_cap < _inflate_econ(ops, current_year, 500):
         return None
-    if not (
-        bool(getattr(game_map, 'use_osm', False))
-        or (preset and hasattr(preset, 'get_road_segment_points_for_ai'))
-    ):
+    if not _ai_map_uses_street_build(game_map, preset):
         return None
     ex_routes_lr = _get_existing_line_routes_for_overlap(ops, game_map)
-    cached = _osm_first_turn_try_cached_segment_build(
-        ops, player, game_map, current_year, rng, preset, force_cap
-    )
+    cached = None
+    if not skip_cached and not _ai_turn_time_exceeded(ops):
+        cached = _osm_first_turn_try_cached_segment_build(
+            ops, player, game_map, current_year, rng, preset, force_cap
+        )
     if cached:
         return cached
     # Hard last resort: ask preset for a long road polyline and trim to budget while preserving station-viable length.
@@ -3077,12 +3200,19 @@ AI_COMMUTER_STOP_SPACING_GRID = 1.35
 AI_FIRST_TURN_MAX_STREET_EDGE_GRID = AI_MAX_STRAIGHT_LAND_SEGMENT_GRID
 # Persist AI-decided rail service type for station spacing decisions.
 _AI_LINE_SERVICE_TYPE: dict[str, str] = {}
+def _ai_opener_wall_exceeded(ops, started_mono: float, cap_sec: float = 55.0) -> bool:
+    """True when AI turn deadline or opener wall-clock cap is exceeded."""
+    if _ai_turn_time_exceeded(ops):
+        return True
+    return (time.monotonic() - float(started_mono)) > float(cap_sec)
+
+
 # Cache expensive first-turn OSM corridor sampling so multi-AI NYC openers do not time out.
 _AI_FIRST_TURN_OSM_SEGMENTS_CACHE: dict[tuple, list] = {}
 # Pre-validated segment polylines (cheap checks only) per cache_key — avoids O(n^2) create_line_complete.
 _AI_FIRST_TURN_OSM_CANDIDATES_CACHE: dict[tuple, list] = {}
 _AI_FIRST_TURN_MAX_CREATE_ATTEMPTS = 3
-_AI_FIRST_TURN_MAX_CANDIDATES = 10
+_AI_FIRST_TURN_MAX_CANDIDATES = 6
 _AI_FIRST_TURN_BRUTE_SAMPLES = 1
 _AI_FIRST_TURN_ALT_SAMPLES = 1
 _AI_FIRST_TURN_SEED_TRIES = 1
@@ -3234,6 +3364,10 @@ def _ai_point_in_water(
     game_map, preset_name: str, x: float, y: float, *, for_route_validation: bool = False,
 ) -> bool:
     """Water check for AI route planning. Use for_route_validation=True only at create-time endpoint checks."""
+    if preset_name:
+        from map_preset_loader import preset_has_water_areas
+        if not preset_has_water_areas(preset_name):
+            return False
     ts = getattr(game_map, 'tile_system', None)
     use_osm = bool(getattr(game_map, 'use_osm', False))
     skip_osm = not for_route_validation
@@ -3419,13 +3553,22 @@ def _ai_build_route_chunks_as_lines(
     base = base_line_name or _generate_ai_line_name(
         player, rng, ops=ops, route_points=chunks[0]['points'], current_year=current_year,
     )
+    taken = _ai_collect_taken_line_names(ops) if ops else set()
     for idx, ch in enumerate(chunks):
         pts = ch['points']
         if len(pts) < 2:
             continue
         is_ferry = bool(ch.get('is_ferry'))
         if is_ferry:
-            line_name = f"{base} Ferry" if idx == 0 else f"{base} Ferry {idx + 1}"
+            line_name = _ai_pick_unused_line_name(
+                _ai_line_name_alternatives(base, is_ferry=True),
+                taken,
+                {_line_name_base_key(n) for n in taken},
+            )
+            if not line_name:
+                line_name = _generate_ai_line_name(
+                    player, rng, ops=ops, route_points=pts, current_year=current_year,
+                )
             elev = ['water'] * (len(pts) - 1)
             plen = _route_polyline_length(pts)
             cost = max(15, int(40 * plen * 0.8))
@@ -3450,9 +3593,22 @@ def _ai_build_route_chunks_as_lines(
             result['points'] = pts
             result['is_ferry_line'] = True
             last_result = result
+            taken.add(line_name)
             continue
 
-        line_name = base if idx == 0 else f"{base} ({idx + 1})"
+        if idx == 0:
+            line_name = base
+        else:
+            line_name = _generate_ai_line_name(
+                player, rng, ops=ops, route_points=pts, current_year=current_year,
+            )
+            if line_name in taken:
+                alt = _ai_pick_unused_line_name(
+                    _ai_line_name_alternatives(base, is_ferry=False), taken,
+                    {_line_name_base_key(n) for n in taken},
+                )
+                if alt:
+                    line_name = alt
         use_bus_chunk = bool(use_bus)
         elev = _get_safe_elevation_levels(pts, game_map, preset_name, base='street')
         plen = _route_polyline_length(pts)
@@ -3492,6 +3648,7 @@ def _ai_build_route_chunks_as_lines(
         result['line_name'] = line_name
         result['points'] = pts
         result['is_bus_line'] = use_bus_chunk
+        taken.add(line_name)
         last_result = result
     return last_result
 
@@ -3515,6 +3672,7 @@ def _ai_trim_route_endpoints_off_water(
 
 def _ai_finalize_osm_route_points(
     points: list, game_map, preset_name: str, current_year: int, min_seg: float = None,
+    ops=None, *, skip_osm_majority: bool = False,
 ) -> Optional[list]:
     """Prepare OSM street geometry, then normalize water crossings (bridges / shore chords)."""
     prepared = _ai_prepare_osm_route_points(points, game_map, min_seg)
@@ -3562,10 +3720,17 @@ def _ai_finalize_osm_route_points(
             return None
     from operations import _ai_route_majority_on_osm_polylines
 
-    if _ai_land_straight_limit_applies(game_map) and not _ai_route_majority_on_osm_polylines(
-        game_map, trimmed, int(current_year), skip_osm=True,
+    skip_majority = skip_osm_majority or (
+        ops is not None and (_ai_turn_time_exceeded(ops) or _ai_turn_time_low(ops, 40.0))
+    )
+    if (
+        _ai_land_straight_limit_applies(game_map)
+        and not skip_majority
+        and not _ai_route_majority_on_osm_polylines(
+            game_map, trimmed, int(current_year), skip_osm=True,
+        )
     ):
-            return None
+        return None
     return trimmed
 
 
@@ -3831,14 +3996,24 @@ def _osm_first_turn_create_from_candidate(
     plen: float,
     seg_cost: int,
     source_seeded: list = None,
+    opener_t0: float = None,
 ):
     """Try create_line_complete for one pre-validated street polyline candidate."""
+    if opener_t0 is not None and _ai_opener_wall_exceeded(ops, opener_t0, 42.0):
+        return None
+    if _ai_turn_time_exceeded(ops):
+        return None
     pts_work = list(pts_work)
     source_seeded = list(source_seeded or pts_work)
-    finalized = _ai_finalize_osm_route_points(
-        pts_work, game_map, preset_name or '', current_year, min_seg=None,
-    )
-    if not finalized and preset_name:
+    if _ai_turn_time_low(ops, 18.0) or opener_t0 is not None:
+        prepared = _ai_prepare_osm_route_points(pts_work, game_map, min_seg=None)
+        finalized = prepared
+    else:
+        finalized = _ai_finalize_osm_route_points(
+            pts_work, game_map, preset_name or '', current_year, min_seg=None,
+            ops=ops, skip_osm_majority=(opener_t0 is not None),
+        )
+    if not finalized and preset_name and not _ai_turn_time_low(ops, 18.0):
         try:
             from map_preset_loader import get_preset_polyline_follows_streets
             if get_preset_polyline_follows_streets(
@@ -3879,32 +4054,48 @@ def _osm_first_turn_create_from_candidate(
         return None
     if not _osm_first_turn_endpoints_viable(game_map, pts_work[0], pts_work[-1]):
         return None
+    if _ai_turn_time_exceeded(ops):
+        return None
     use_bus = _ai_first_turn_use_bus(player, rng, current_year)
     bus_svc = _decide_ai_bus_service_type(pts_work) if use_bus else None
     rail_service = None if use_bus else _decide_ai_rail_service_type(pts_work)
-    lengthened = _ai_ensure_route_supports_two_stations(
-        pts_work,
-        game_map,
-        preset_name or '',
-        current_year,
-        preset=None,
-        is_bus=use_bus,
-        service_type=bus_svc if use_bus else rail_service,
-    )
-    if not lengthened:
-        return None
+    if opener_t0 is not None:
+        min_sp = _ai_min_spacing_for_new_route(
+            pts_work, is_bus=use_bus, service_type=bus_svc if use_bus else rail_service,
+        )
+        if _route_polyline_length(pts_work) < min_sp:
+            return None
+        lengthened = pts_work
+    else:
+        lengthened = _ai_ensure_route_supports_two_stations(
+            pts_work,
+            game_map,
+            preset_name or '',
+            current_year,
+            preset=None,
+            is_bus=use_bus,
+            service_type=bus_svc if use_bus else rail_service,
+            ops=ops,
+        )
+        if not lengthened:
+            return None
     pts_work = lengthened
     from operations import _ai_route_has_backtracking
     if _ai_route_has_backtracking(pts_work, game_map):
+        return None
+    if _ai_turn_time_exceeded(ops):
         return None
     plen = _osm_polyline_length(pts_work)
     unit_mult = 0.5 * 1.5 if use_bus else 1.5
     seg_cost = max(15, int(plen * 225 * unit_mult))
     if seg_cost > budget:
         return None
-    elevation_levels = _get_safe_elevation_levels(pts_work, game_map, preset_name or '', base='street')
     line_name = _generate_ai_line_name(
-        player, rng, ops=ops, route_points=pts_work, current_year=current_year,
+        player,
+        rng,
+        ops=ops,
+        route_points=None if opener_t0 is not None else (pts_work if not _ai_turn_time_low(ops, 40.0) else None),
+        current_year=current_year,
     )
     for try_bus in ([use_bus] if use_bus else [False]):
         bus_line = bool(try_bus)
@@ -3934,18 +4125,19 @@ def _osm_first_turn_create_from_candidate(
             direct = None
         if not _ai_line_create_result_ok(direct):
             continue
-        if bus_line:
-            bus_svc = _decide_ai_bus_service_type(pts_work)
-            _ai_open_line_with_two_stations(
-                ops, player, line_name, pts_work, is_bus_line=True, service_type=bus_svc,
-            )
-            _try_assign_unassigned_bus_to_line(ops, player, line_name)
-        else:
-            rail_service = _decide_ai_rail_service_type(pts_work)
-            _AI_LINE_SERVICE_TYPE[line_name] = rail_service
-            _ai_open_line_with_two_stations(
-                ops, player, line_name, pts_work, is_bus_line=False, service_type=rail_service,
-            )
+        if opener_t0 is None:
+            if bus_line:
+                bus_svc = _decide_ai_bus_service_type(pts_work)
+                _ai_open_line_with_two_stations(
+                    ops, player, line_name, pts_work, is_bus_line=True, service_type=bus_svc,
+                )
+                _try_assign_unassigned_bus_to_line(ops, player, line_name)
+            else:
+                rail_service = _decide_ai_rail_service_type(pts_work)
+                _AI_LINE_SERVICE_TYPE[line_name] = rail_service
+                _ai_open_line_with_two_stations(
+                    ops, player, line_name, pts_work, is_bus_line=False, service_type=rail_service,
+                )
         direct['line_name'] = line_name
         direct['points'] = [(float(p[0]), float(p[1])) for p in pts_work]
         direct['is_bus_line'] = bus_line
@@ -4097,12 +4289,18 @@ def _osm_guaranteed_first_year_line(
     ops, player, game_map, current_year, rng, preset, force_cap, existing_routes=None,
 ):
     """Run year-1 OSM opener strategies until one queues a street-following line."""
+    opener_t0 = time.monotonic()
+
+    def _opener_done() -> bool:
+        return _ai_opener_wall_exceeded(ops, opener_t0)
+
     fast_strategies = (
             lambda: _osm_first_turn_try_cached_segment_build(
                 ops, player, game_map, current_year, rng, preset, force_cap,
+                existing_routes=existing_routes,
             ),
             lambda: _osm_last_resort_create_line_from_preset(
-                ops, player, game_map, current_year, rng, preset, force_cap,
+                ops, player, game_map, current_year, rng, preset, force_cap, skip_cached=True,
             ),
     )
     slow_strategies = (
@@ -4114,7 +4312,7 @@ def _osm_guaranteed_first_year_line(
             ),
     )
     for fn in fast_strategies:
-        if _ai_turn_time_exceeded(ops):
+        if _opener_done():
             break
         try:
             out = fn()
@@ -4122,11 +4320,11 @@ def _osm_guaranteed_first_year_line(
             out = None
         if _ai_line_create_result_ok(out):
             return out
-    if _ai_turn_time_exceeded(ops):
+    if _opener_done():
         return None
-    if _ai_turn_time_remaining(ops) > 20.0:
+    if _ai_turn_time_remaining(ops) > 12.0:
         for fn in slow_strategies:
-            if _ai_turn_time_exceeded(ops):
+            if _opener_done():
                 break
             try:
                 out = fn()
@@ -4138,12 +4336,18 @@ def _osm_guaranteed_first_year_line(
 
 
 def _osm_first_turn_try_cached_segment_build(
-    ops, player, game_map, current_year: int, rng: random.Random, preset, budget: int
+    ops, player, game_map, current_year: int, rng: random.Random, preset, budget: int,
+    existing_routes=None,
 ):
     """Year-1 OSM opener: fill/populate cached corridors, pick a segment pair per player_id, create_line + endpoint stations.
 
     Used by the fast path and by the pre-validate last resort so multi-AI NYC does not diverge into flaky RNG pulls.
     """
+    opener_t0 = time.monotonic()
+
+    def _opener_done() -> bool:
+        return _ai_opener_wall_exceeded(ops, opener_t0)
+
     try:
         from map_preset_loader import get_preset_road_segment_points
     except Exception:
@@ -4157,7 +4361,10 @@ def _osm_first_turn_try_cached_segment_build(
     gs = int(_get_game_seed(ops)) if ops else 0
     gs_cache = 0
     pid = int(getattr(player, 'player_id', 0) or 0)
-    ex_routes = _get_existing_line_routes_for_overlap(ops, game_map)
+    if existing_routes is None:
+        ex_routes = _get_existing_line_routes_for_overlap(ops, game_map)
+    else:
+        ex_routes = existing_routes
     ex_pull = _osm_existing_routes_for_preset_pull(ops, game_map, current_year)
     route_fp = _existing_line_routes_cache_fingerprint(ex_routes)
     # Cache is per-game-map instance (so we don't reuse point lists across fresh games in long test loops).
@@ -4203,9 +4410,12 @@ def _osm_first_turn_try_cached_segment_build(
         n_cand = len(candidates)
         start_offset = int(start_offset) % max(1, n_cand)
         create_attempts = 0
+        max_create = _AI_FIRST_TURN_MAX_CREATE_ATTEMPTS
+        if ops is not None and _ai_turn_time_low(ops, 35.0):
+            max_create = 1
         for min_vertices in (3, 2):
             for step in range(n_cand):
-                if create_attempts >= _AI_FIRST_TURN_MAX_CREATE_ATTEMPTS:
+                if create_attempts >= max_create or _opener_done():
                     break
                 idx = (start_offset + step) % n_cand
                 pts_work, plen, seg_cost = candidates[idx]
@@ -4219,10 +4429,11 @@ def _osm_first_turn_try_cached_segment_build(
                 out = _osm_first_turn_create_from_candidate(
                     ops, player, game_map, current_year, rng, preset_name, budget,
                     _min_seg, pts_work, plen, seg_cost, source_seeded=seeded_list,
+                    opener_t0=opener_t0,
                 )
                 if out:
                     return out
-            if create_attempts >= _AI_FIRST_TURN_MAX_CREATE_ATTEMPTS:
+            if create_attempts >= max_create:
                 break
         return None
 
@@ -4233,7 +4444,7 @@ def _osm_first_turn_try_cached_segment_build(
         fallback_seeded = []
         collect_ex = ex_routes if ex_routes else []
         for seed_try in range(seed_tries):
-            if _ai_turn_time_exceeded(ops):
+            if _opener_done():
                 break
             crng = random.Random((base_seed ^ seed_try * 7919) & 0xFFFFFFFF)
             trial_seeded = _ai_fetch_road_segment_points(
@@ -4254,7 +4465,7 @@ def _osm_first_turn_try_cached_segment_build(
             probe = _osm_first_turn_collect_candidates(
                 trial_work, budget, _min_seg, game_map, collect_ex,
                 player_id=pid, source_seeded=trial_seeded, current_year=current_year,
-                max_candidates=4,
+                max_candidates=2,
             )
             if probe:
                 seeded = list(trial_seeded)
@@ -4272,11 +4483,13 @@ def _osm_first_turn_try_cached_segment_build(
     )
     if out:
         return out
+    if _opener_done():
+        return None
     # Only bail before alt/brute pulls when this cache_key already has zero viable candidates.
     if not (_AI_FIRST_TURN_OSM_CANDIDATES_CACHE.get(cache_key) or []):
         return None
     for alt_k in range(alt_samples):
-        if _ai_turn_time_exceeded(ops):
+        if _opener_done():
             break
         prng = random.Random((gs_cache ^ pid * 0x9E3779B9 ^ int(current_year) * 2654435761 ^ alt_k * 0x1000193) & 0xFFFFFFFF)
         seeded_alt = _ai_fetch_road_segment_points(
@@ -4298,7 +4511,7 @@ def _osm_first_turn_try_cached_segment_build(
         if out:
             return out
     for brute_k in range(brute_samples):
-        if _ai_turn_time_exceeded(ops):
+        if _opener_done():
             break
         brng = random.Random((int(current_year) * 424243 + pid * 31337 + brute_k * 99991) & 0xFFFFFFFF)
         try:
@@ -4553,6 +4766,7 @@ def _ai_ensure_route_supports_two_stations(
     *,
     is_bus: bool = False,
     service_type: str = None,
+    ops=None,
 ) -> Optional[list]:
     """Lengthen a route when it is too short for two stations at required spacing."""
     if not route or len(route) < 2:
@@ -4562,7 +4776,7 @@ def _ai_ensure_route_supports_two_stations(
     if _route_polyline_length(pts) >= min_sp:
         return pts
 
-    if preset_name:
+    if preset_name and (ops is None or not _ai_turn_time_low(ops, 40.0)):
         try:
             from map_preset_loader import get_preset_road_extension_points
             start, end = pts[0], pts[-1]
@@ -4656,8 +4870,7 @@ def _ai_resolve_unique_station_name(
                 return base
         except Exception:
             pass
-    for attempt in range(24):
-        try_name = base if attempt == 0 else f"{base} ({attempt + 1})"
+    for try_name in _ai_station_name_alternatives(base):
         if hasattr(ops, 'assert_station_name_unique_for_player'):
             try:
                 kwargs = {}
@@ -4671,8 +4884,34 @@ def _ai_resolve_unique_station_name(
                 return try_name
             except ValueError:
                 continue
-        return try_name
-    return f"{base} {random.randint(1000, 9999)}"
+        elif try_name:
+            return try_name
+    try:
+        from game_presets import MAJOR_TERMINAL_STATION_NAMES
+        for alt in MAJOR_TERMINAL_STATION_NAMES:
+            if alt == base:
+                continue
+            if hasattr(ops, 'assert_station_name_unique_for_player'):
+                try:
+                    kwargs = {}
+                    if x is not None and y is not None and line_name:
+                        kwargs = {"x": float(x), "y": float(y), "line_names": [line_name]}
+                    ops.assert_station_name_unique_for_player(player, alt, **kwargs)
+                    return alt
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    for fallback in ("Transfer Point", "Transit Stop", "Platform", "Depot", "Waypoint"):
+        if fallback != base:
+            if hasattr(ops, 'assert_station_name_unique_for_player'):
+                try:
+                    ops.assert_station_name_unique_for_player(player, fallback)
+                    return fallback
+                except ValueError:
+                    continue
+            return fallback
+    return base
 
 
 def _adjust_ai_fares(ops, player, current_year: int, game_map, rng: random.Random = None) -> list:
@@ -5015,16 +5254,17 @@ def _try_build_ferry_line(ops, player, game_map, spendable: int, current_year: i
             continue
         if _population_at_or_near(p2[0], p2[1], pop_map, radius=10) < 80:
             continue
-        # Pre-filter: interior must be mostly *in* water when tile_system is available (avoids land shortcuts).
+        # Pre-filter: segment must stay within ferry proximity of water when tile_system is available.
         ts = getattr(game_map, "tile_system", None)
-        if ts and hasattr(ts, "ferry_corridor_interior_mostly_water"):
+        if ts and hasattr(ts, "is_segment_near_water"):
             ok_seg = True
             for i in range(len(points) - 1):
                 ax, ay = points[i]
                 bx, by = points[i + 1]
                 try:
-                    if not ts.ferry_corridor_interior_mostly_water(
-                        ax, ay, bx, by, skip_osm=False, min_fraction=0.88
+                    from game_presets import FERRY_MAX_DISTANCE_FROM_WATER_M
+                    if not ts.is_segment_near_water(
+                        ax, ay, bx, by, FERRY_MAX_DISTANCE_FROM_WATER_M, skip_osm=False
                     ):
                         ok_seg = False
                         break
@@ -5034,19 +5274,19 @@ def _try_build_ferry_line(ops, player, game_map, spendable: int, current_year: i
             if not ok_seg:
                 continue
         else:
-            # No tile system: use preset water only (no OSM during scoring).
-            water_hits = 0
-            water_total = 0
+            # No tile system: use preset water proximity only (no OSM during scoring).
+            from game_presets import FERRY_MAX_DISTANCE_FROM_WATER_M
+            from operations import _ferry_segment_near_water
+            ok_seg = True
             for i in range(len(points) - 1):
                 ax, ay = points[i]
                 bx, by = points[i + 1]
-                for t in (0.2, 0.4, 0.6, 0.8):
-                    sx = ax + t * (bx - ax)
-                    sy = ay + t * (by - ay)
-                    water_total += 1
-                    if preset_is_point_in_water(preset_name, sx, sy, game_map, skip_osm=True):
-                        water_hits += 1
-            if water_total > 0 and (water_hits / water_total) < 0.75:
+                if not _ferry_segment_near_water(
+                    game_map, ax, ay, bx, by, max_distance_m=FERRY_MAX_DISTANCE_FROM_WATER_M
+                ):
+                    ok_seg = False
+                    break
+            if not ok_seg:
                 continue
         total_length = sum(
             math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
@@ -5381,6 +5621,100 @@ def _ai_rng(player, current_year: int, ops=None):
     return random.Random(seed)
 
 
+_AI_LINE_ROUTE_SUFFIXES = (" Line", " Route", " Corridor", " Shuttle", " Express", " Local", " Branch")
+_AI_FERRY_ROUTE_SUFFIXES = (" Ferry", " Water Shuttle", " Harbor Route", " Ferry Route", " River Crossing")
+_AI_NAME_DISAMBIGUATORS = (
+    " North", " South", " East", " West", " Upper", " Lower", " Central", " Midtown", " Downtown",
+)
+_AI_NUMERIC_SUFFIX_RE = re.compile(
+    r"(?:\(\s*\d+\s*\)|(?<=\s)\d+$|(?<=[A-Za-z])\d+$|\s+\d+\s+(?:Line|Route|Ferry|Stop|Station)$)",
+    re.IGNORECASE,
+)
+
+
+def _ai_name_has_numeric_suffix(name: str) -> bool:
+    return bool(_AI_NUMERIC_SUFFIX_RE.search((name or "").strip()))
+
+
+def _ai_collect_taken_line_names(ops) -> set:
+    taken = set()
+    if not ops:
+        return taken
+    game_map = ops.get_map() if hasattr(ops, 'get_map') else None
+    if game_map and hasattr(game_map, 'get_lines_by_name'):
+        taken.update((game_map.get_lines_by_name() or {}).keys())
+    for b in (ops.get_build_queue() if hasattr(ops, 'get_build_queue') else []) or []:
+        if b.get('type') == 'line':
+            n = (b.get('data') or {}).get('name')
+            if n:
+                taken.add(n)
+    return taken
+
+
+def _ai_line_name_alternatives(base: str, *, is_ferry: bool = False) -> list:
+    base = (base or "").strip()
+    if not base:
+        return []
+    suffixes = _AI_FERRY_ROUTE_SUFFIXES if is_ferry else _AI_LINE_ROUTE_SUFFIXES
+    alts = []
+    seen = set()
+    for suf in suffixes:
+        cand = f"{base}{suf}"
+        if cand not in seen:
+            seen.add(cand)
+            alts.append(cand)
+    for dis in _AI_NAME_DISAMBIGUATORS:
+        for suf in suffixes[:4]:
+            cand = f"{base}{dis}{suf}"
+            if cand not in seen:
+                seen.add(cand)
+                alts.append(cand)
+    return alts
+
+
+def _ai_pick_unused_line_name(
+    candidates, taken: set, used_bases: set = None,
+) -> Optional[str]:
+    for cand in candidates or []:
+        c = (cand or "").strip()
+        if not c or c in taken:
+            continue
+        if used_bases is not None and _line_name_base_key(c) in used_bases:
+            continue
+        return c
+    return None
+
+
+def _ai_letter_name_at(k: int) -> str:
+    """A, B, ..., Z, AA, AB, ... without numeric digits."""
+    letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    n = max(0, int(k))
+    name = ''
+    while True:
+        name = letters[n % 26] + name
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return name
+
+
+def _ai_station_name_alternatives(base: str) -> list:
+    base = (base or "Station").strip()
+    alts = [base]
+    seen = {base}
+    for dis in _AI_NAME_DISAMBIGUATORS:
+        cand = f"{base}{dis}"
+        if cand not in seen:
+            seen.add(cand)
+            alts.append(cand)
+    for suf in (" Terminal", " Station", " Stop", " Plaza", " Square", " Junction", " Crossing"):
+        cand = f"{base}{suf}"
+        if cand not in seen:
+            seen.add(cand)
+            alts.append(cand)
+    return alts
+
+
 def _line_name_base_key(name: str) -> str:
     """Normalized corridor label without player suffixes or route-type suffixes."""
     s = (name or "").strip()
@@ -5461,16 +5795,11 @@ def _line_name_from_street_base(
     label = _format_street_label(base)
     if not label:
         return None
-    suffix = rng.choice((" Line", " Route", " Corridor"))
-    cand = f"{label}{suffix}"
-    if cand in taken or _line_name_base_key(cand) in used_bases:
-        k = 2
-        while f"{cand} ({k})" in taken and k < 999:
-            k += 1
-        cand = f"{cand} ({k})"
-    if cand not in taken and _line_name_base_key(cand) not in used_bases:
-        return cand
-    return None
+    suffixes = list(_AI_LINE_ROUTE_SUFFIXES)
+    rng.shuffle(suffixes)
+    candidates = [f"{label}{suffix}" for suffix in suffixes]
+    candidates.extend(_ai_line_name_alternatives(label, is_ferry=False))
+    return _ai_pick_unused_line_name(candidates, taken, used_bases)
 
 
 def _line_name_matches_route_areas(line_name: str, route_areas: set) -> bool:
@@ -5513,14 +5842,7 @@ def _geo_corridor_line_name(
     s = _format_street_label(str(base).strip())
     if not s:
         return None
-    suffix = rng.choice((" Line", " Route", " Corridor", " Shuttle"))
-    cand = f"{s}{suffix}"
-    if cand not in taken:
-        return cand
-    k = 2
-    while f"{cand} ({k})" in taken and k < 999:
-        k += 1
-    return f"{cand} ({k})"
+    return _ai_pick_unused_line_name(_ai_line_name_alternatives(s, is_ferry=False), taken, None)
 
 
 def _generate_ai_line_name(
@@ -5536,17 +5858,7 @@ def _generate_ai_line_name(
     When route_points are provided, tries a street the route runs along (within 10m) before letter/number schemes."""
     if preferred_name and preferred_name.strip():
         return preferred_name.strip()
-    # Names already used in the game (completed lines + under construction)
-    taken = set()
-    if ops:
-        game_map = ops.get_map() if hasattr(ops, 'get_map') else None
-        if game_map and hasattr(game_map, 'get_lines_by_name'):
-            taken.update((game_map.get_lines_by_name() or {}).keys())
-        for b in (ops.get_build_queue() if hasattr(ops, 'get_build_queue') else []) or []:
-            if b.get('type') == 'line':
-                n = (b.get('data') or {}).get('name')
-                if n:
-                    taken.add(n)
+    taken = _ai_collect_taken_line_names(ops) if ops else set()
     existing = player.get_line_names()
     idx = len(existing)
     used_bases = {_line_name_base_key(n) for n in taken}
@@ -5612,27 +5924,21 @@ def _generate_ai_line_name(
             pass
     game_seed = _get_game_seed(ops)
     pid = getattr(player, 'player_id', id(player))
-    # Deterministic across processes (avoid PYTHONHASHSEED / hash(tuple) variance).
     scheme = ((int(pid) * 7919) ^ (int(game_seed) % 1_000_003)) % 3
+    start_k = idx + (int(pid) % 7) + scheme * 13
 
-    def _name_at(k: int) -> str:
-        if scheme == 0:
-            if k < 26:
-                return chr(ord('A') + k)
-            return chr(ord('A') + (k % 26)) + str(k // 26)
-        if scheme == 1:
-            return str(k + 1)
-        letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        if k < len(letters):
-            return letters[k]
-        return letters[k % len(letters)] + str(k // len(letters))
-
-    # Pick first name in this player's scheme that is not taken.
-    for k in range(idx, idx + 200):
-        candidate = _name_at(k)
-        if candidate not in taken:
+    for k in range(start_k, start_k + 200):
+        candidate = _ai_letter_name_at(k)
+        if candidate not in taken and _line_name_base_key(candidate) not in used_bases:
             return candidate
-    return _name_at(idx)
+    try:
+        from transit_company_names import get_transit_company_name
+        tc = get_transit_company_name(existing_names=taken, map_preset_name=preset_name, rng=rng)
+        if tc and tc not in taken and _line_name_base_key(tc) not in used_bases:
+            return tc
+    except Exception:
+        pass
+    return _ai_letter_name_at(start_k)
 
 
 def _ai_segment_qualifies_as_ferry(p1, p2, game_map, preset_name: str) -> bool:
@@ -5645,7 +5951,7 @@ def _ai_segment_qualifies_as_ferry(p1, p2, game_map, preset_name: str) -> bool:
             return False
     except Exception:
         return False
-    from operations import _ferry_point_near_water, _ferry_segment_crosses_open_water
+    from operations import _ferry_point_near_water, _ferry_segment_near_water
     x1, y1 = float(p1[0]), float(p1[1])
     x2, y2 = float(p2[0]), float(p2[1])
     try:
@@ -5653,7 +5959,7 @@ def _ai_segment_qualifies_as_ferry(p1, p2, game_map, preset_name: str) -> bool:
             return False
         if not _ferry_point_near_water(game_map, x2, y2):
             return False
-        return _ferry_segment_crosses_open_water(game_map, x1, y1, x2, y2)
+        return _ferry_segment_near_water(game_map, x1, y1, x2, y2)
     except Exception:
         return False
 
@@ -6339,14 +6645,9 @@ def _pick_major_terminal_station_name(
     station_count = _count_map_stations(game_map, ops)
     game_seed = _get_game_seed(ops)
     if station_count == 0 and station_ordinal == 1:
-        rng = random.Random(int(game_seed) & 0xFFFFFFFF)
-        for base in MAJOR_TERMINAL_STATION_NAMES:
-            if base not in existing:
-                return base
-            for k in range(2, 10):
-                cand = f"{base} ({k})"
-                if cand not in existing:
-                    return cand
+        for terminal in MAJOR_TERMINAL_STATION_NAMES:
+            if terminal not in existing:
+                return terminal
     mix = (
         game_seed
         ^ int(current_year * 997)
@@ -6437,24 +6738,24 @@ def _generate_ai_station_name(
                     best_cell = cell
         if best_cell is not None and best_d <= 36:
             hood = f"Junction {best_cell[0]} & {best_cell[1]}"
-            if hood not in existing:
-                return hood
-            t = 2
-            while f"{hood} ({t})" in existing and t < 999:
-                t += 1
-            return f"{hood} ({t})"
+            picked = _ai_pick_unused_line_name(
+                _ai_station_name_alternatives(hood), existing, None,
+            )
+            if picked:
+                return picked
 
     return _unique_station_fallback(existing, station_ordinal)
 
 
 def _unique_station_fallback(existing: set, station_ordinal: int = None) -> str:
-    base = f"Station — Stop {station_ordinal}" if station_ordinal is not None else "Station"
-    if base not in existing:
-        return base
-    k = 2
-    while f"{base} ({k})" in existing and k < 999:
-        k += 1
-    return f"{base} ({k})"
+    bases = ["Station", "Transit Stop", "Platform", "Depot", "Transfer Point", "Waypoint"]
+    if station_ordinal is not None:
+        bases.insert(0, "Midline Stop")
+    for base in bases:
+        picked = _ai_pick_unused_line_name(_ai_station_name_alternatives(base), existing, None)
+        if picked:
+            return picked
+    return "Waypoint"
 
 
 def _try_build_line(ops, player, game_map, spendable: int, current_year: int, points_with_pop: list = None, rng: random.Random = None, existing_routes: list = None, preset=None) -> Optional[dict]:
@@ -6513,12 +6814,13 @@ def _try_build_line(ops, player, game_map, spendable: int, current_year: int, po
                         )
                         if _ai_line_create_result_ok(cached):
                             return cached
-                        return None
-                    cached = _osm_first_turn_try_cached_segment_build(
-                        ops, player, game_map, current_year, rng, preset, budget
-                    )
-                    if _ai_line_create_result_ok(cached):
-                        return cached
+                    else:
+                        cached = _osm_first_turn_try_cached_segment_build(
+                            ops, player, game_map, current_year, rng, preset, budget
+                        )
+                        if _ai_line_create_result_ok(cached):
+                            _ai_mark_first_year_opener_attempted(ops)
+                            return cached
                 except Exception:
                     pass
             try:
@@ -6570,6 +6872,7 @@ def _try_build_line(ops, player, game_map, spendable: int, current_year: int, po
                     preset_has_water_areas(preset_name)
                     and not is_first
                     and not prefer_speed
+                    and not _ai_turn_time_low(ops, 30.0)
                     and rng.random() < ferry_chance
                 ):
                     try:
@@ -6583,6 +6886,8 @@ def _try_build_line(ops, player, game_map, spendable: int, current_year: int, po
                     2 if (first_game_year and is_first and existing_routes)
                     else (2 if (first_game_year and is_first) else 1)
                 )
+                if _ai_turn_time_low(ops, 25.0):
+                    _osm_build_attempts = 1
                 for build_attempt in range(_osm_build_attempts):
                     if _ai_turn_time_exceeded(ops):
                         break
@@ -6881,7 +7186,10 @@ def _try_build_line(ops, player, game_map, spendable: int, current_year: int, po
             # Only raise if we exhausted all fallbacks (1000, 80, 100, 0) and still have no roads
             if len(road_points) < 2:
                 # When other AIs built this turn, try once more with different rng to get another borough/area.
-                if existing_routes and rng and not _ai_turn_time_exceeded(ops):
+                if (
+                    existing_routes and rng and not _ai_turn_time_exceeded(ops)
+                    and not _ai_turn_time_low(ops, 18.0)
+                ):
                     last_rng = random.Random((current_year * 1000 + _player_id_int(player) + 999) % (2**32))
                     road_points = _ai_fetch_road_segment_points(
                         ops, preset_name, game_map, current_year,
@@ -7151,9 +7459,11 @@ def _try_build_line(ops, player, game_map, spendable: int, current_year: int, po
         pairs = [pairs[idx]] + [p for i, p in enumerate(pairs) if i != idx]
 
     max_attempts = 15 if existing_routes else _MAX_LINE_CREATE_ATTEMPTS
+    if first_game_year and is_first:
+        max_attempts = min(max_attempts, 4)
     attempts = 0
     for score, p1, p2 in pairs:
-        if attempts >= max_attempts:
+        if attempts >= max_attempts or _ai_turn_time_exceeded(ops):
             break
         attempts += 1
         line_name = _generate_ai_line_name(
@@ -7182,9 +7492,11 @@ def _try_build_line(ops, player, game_map, spendable: int, current_year: int, po
             cost = max(15, int(150 * dist))
             elev = _get_safe_elevation_levels(points, game_map, preset_name or '', base='street')
             if preset_name:
-                from operations import _ai_route_off_street_cost_multiplier
-                street_mult = _ai_route_off_street_cost_multiplier(game_map, points, current_year)
-                cost = max(15, int(round(cost * street_mult)))
+                from map_preset_loader import preset_has_road_support
+                if preset_has_road_support(preset_name) and not _ai_turn_time_low(ops, 20.0):
+                    from operations import _ai_route_off_street_cost_multiplier
+                    street_mult = _ai_route_off_street_cost_multiplier(game_map, points, current_year)
+                    cost = max(15, int(round(cost * street_mult)))
         cost_info = {'cost': cost, 'length': dist, 'points_count': len(points), 'elevation_levels': elev}
         if not _ai_can_afford_line_with_two_stations(ops, player, cost):
             continue
@@ -7368,34 +7680,8 @@ def _pick_best_line_for_trainset(ops, player, trainset, line_names: list) -> Opt
 
 
 def _extension_turn_ok(route: list, additional_points: list, extend_from_end: bool, max_degrees: float = 145.0) -> bool:
-    """True if the extension does not turn the line more than max_degrees.
-    route: existing line route. additional_points: new points (includes connection point).
-    extend_from_end: True = extending from route end."""
-    def _pt(p):
-        if isinstance(p, (list, tuple)) and len(p) >= 2:
-            return (float(p[0]), float(p[1]))
-        return (float(getattr(p, 'x', 0)), float(getattr(p, 'y', 0)))
-    if len(route) < 2 or len(additional_points) < 2:
-        return True
-    # Incoming direction: last segment of route (into the end we're extending from)
-    if extend_from_end:
-        prev_pt = _pt(route[-2])
-        base_pt = _pt(route[-1])
-    else:
-        prev_pt = _pt(route[1])
-        base_pt = _pt(route[0])
-    # Outgoing direction: first segment of extension
-    add_base = _pt(additional_points[0])
-    add_next = _pt(additional_points[1])
-    v1 = (base_pt[0] - prev_pt[0], base_pt[1] - prev_pt[1])
-    v2 = (add_next[0] - add_base[0], add_next[1] - add_base[1])
-    d1 = math.hypot(v1[0], v1[1]) or 1e-9
-    d2 = math.hypot(v2[0], v2[1]) or 1e-9
-    dot = v1[0] * v2[0] + v1[1] * v2[1]
-    cos_angle = max(-1, min(1, dot / (d1 * d2)))
-    angle_rad = math.acos(cos_angle)
-    angle_deg = math.degrees(angle_rad)
-    return angle_deg <= max_degrees
+    """Extensions may turn freely; new-line geometry still uses route turn limits."""
+    return True
 
 
 def _try_extend_line(

@@ -42,6 +42,7 @@ from route_validation import *
 class MarketplaceMixin:
     def marketplace_add_trainsets_for_new_technology(self, new_year: int, newly_available: list):
         marketplace = self.game.get_marketplace()
+        marketplace.num_players = len(self.get_players())
         marketplace.add_trainsets_for_new_technology(new_year, newly_available)
     
     def marketplace_add_worker_supply(self, worker_type_name: str, quantity: int):

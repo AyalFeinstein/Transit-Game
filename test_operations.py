@@ -937,16 +937,23 @@ class TestFerryValidationExactPointInWater(unittest.TestCase):
         """When a point is not near water, validation fails with clear message."""
         tile_system = self.game_map.tile_system
         original_near = tile_system.is_point_near_water
+        original_in_water = tile_system.is_point_in_water
 
-        def mock_not_near(x, y, max_m=60, skip_osm=False):
+        def mock_not_near(x, y, max_m=100, skip_osm=False):
             return False
+
+        def mock_not_in_water(x, y, skip_osm=False):
+            return False
+
         tile_system.is_point_near_water = mock_not_near
+        tile_system.is_point_in_water = mock_not_in_water
         try:
             with self.assertRaises(ValueError) as ctx:
                 self.ops._validate_ferry_route([(10.0, 10.0), (20.0, 20.0)])
-            self.assertIn("60m of water", str(ctx.exception))
+            self.assertIn("100m of water", str(ctx.exception))
         finally:
             tile_system.is_point_near_water = original_near
+            tile_system.is_point_in_water = original_in_water
 
 import unittest
 from game import Game
@@ -1205,65 +1212,64 @@ class TestFerryValidationComprehensive(unittest.TestCase):
         self.game_map.tile_system.is_point_in_water = original_is_point_in_water
     
     def test_ferry_validation_point_on_land(self):
-        """Test ferry validation fails when a point is on land"""
+        """Test ferry validation fails when a point is on land far from water"""
         if not self.game_map.tile_system:
             self.skipTest("Tile system not available")
         
-        # Mock tile system to return land for one point
-        call_count = [0]
-        def mock_is_point_in_water(x, y):
-            call_count[0] += 1
-            # First point is water, second is land, third is water
-            if call_count[0] == 1:
-                return True
-            elif call_count[0] == 2:
-                return False  # Land!
-            else:
-                return True
-        
         original_is_point_in_water = self.game_map.tile_system.is_point_in_water
+        original_is_point_near_water = getattr(
+            self.game_map.tile_system, 'is_point_near_water', None
+        )
+
+        def mock_is_point_in_water(x, y, skip_osm=False):
+            return False
+
+        def mock_is_point_near_water(x, y, max_m=100, skip_osm=False):
+            return False
+
         self.game_map.tile_system.is_point_in_water = mock_is_point_in_water
+        self.game_map.tile_system.is_point_near_water = mock_is_point_near_water
         
-        # Test ferry route with one point on land
         mixed_points = [(10.0, 10.0), (20.0, 20.0), (30.0, 30.0)]
         
-        # Should raise ValueError
         with self.assertRaises(ValueError) as context:
             self.ui._validate_ferry_route(mixed_points)
         
-        self.assertIn("on land", str(context.exception))
+        self.assertIn("too far from water", str(context.exception))
         
-        # Restore original method
         self.game_map.tile_system.is_point_in_water = original_is_point_in_water
+        if original_is_point_near_water is not None:
+            self.game_map.tile_system.is_point_near_water = original_is_point_near_water
     
     def test_ferry_validation_segment_midpoint_on_land(self):
-        """Test ferry validation fails when segment midpoint is on land"""
+        """Test ferry validation fails when segment passes far from water"""
         if not self.game_map.tile_system:
             self.skipTest("Tile system not available")
         
-        # Mock tile system: points are water, but midpoint is land
-        call_count = [0]
-        def mock_is_point_in_water(x, y):
-            call_count[0] += 1
-            # Points are water, but midpoint (15, 15) is land
-            if abs(x - 15.0) < 0.1 and abs(y - 15.0) < 0.1:
-                return False  # Midpoint is land
-            return True  # All points are water
-        
         original_is_point_in_water = self.game_map.tile_system.is_point_in_water
+        original_is_segment_near_water = getattr(
+            self.game_map.tile_system, 'is_segment_near_water', None
+        )
+
+        def mock_is_point_in_water(x, y, skip_osm=False):
+            return True
+
+        def mock_is_segment_near_water(x1, y1, x2, y2, max_m=100, skip_osm=False):
+            return False
+
         self.game_map.tile_system.is_point_in_water = mock_is_point_in_water
+        self.game_map.tile_system.is_segment_near_water = mock_is_segment_near_water
         
-        # Test ferry route where segment passes through land
         points = [(10.0, 10.0), (20.0, 20.0)]
         
-        # Should raise ValueError
         with self.assertRaises(ValueError) as context:
             self.ui._validate_ferry_route(points)
         
-        self.assertIn("passes through land", str(context.exception))
+        self.assertIn("too far from water", str(context.exception))
         
-        # Restore original method
         self.game_map.tile_system.is_point_in_water = original_is_point_in_water
+        if original_is_segment_near_water is not None:
+            self.game_map.tile_system.is_segment_near_water = original_is_segment_near_water
     
     def test_ferry_validation_no_tile_system_fallback(self):
         """Test ferry validation uses fallback method when tile system unavailable"""
@@ -2008,6 +2014,169 @@ class TestStraightConnectorRules(unittest.TestCase):
         self.assertTrue(ops.check_and_eliminate_player(player))
         self.assertTrue(ops.is_player_eliminated(player))
 
+    def test_elimination_uses_net_change_not_intermediate_balance(self):
+        """Year-end finances apply net atomically; lawsuit net must not bankrupt on intermediate negatives."""
+        from operations import Operations
+        from lawsuit import Lawsuit, LawsuitExcuse
+        import random
+
+        ops = Operations(["P1", "P2"], 30, 30, 50000)
+        plaintiff = ops.get_players()[0]
+        defendant = ops.get_players()[1]
+        start_money = 20
+        defendant.money = start_money
+
+        excuse = LawsuitExcuse("Test", 800, "")
+        lawsuit = Lawsuit(plaintiff, defendant, excuse, ops.get_year())
+        court_costs = int(lawsuit.damages * 0.1)
+        reparations = int(lawsuit.damages * 0.5)
+        expected_net = reparations - court_costs
+        self.assertGreater(expected_net, 0)
+
+        with unittest.mock.patch.object(random, 'random', return_value=0.99):
+            lawsuit.resolve(plaintiff_lawyers=0, defendant_lawyers=0)
+
+        self.assertEqual(defendant.get_money(), start_money + expected_net)
+        self.assertFalse(ops.check_and_eliminate_player(defendant))
+
+    def test_process_player_finances_applies_net_atomically(self):
+        """Finances apply one net change; player survives when final balance stays non-negative."""
+        from operations import Operations
+
+        ops = Operations(["P1"], 30, 30, 50000)
+        player = ops.get_players()[0]
+        player.money = 30
+
+        with unittest.mock.patch.object(ops, 'calc_player_profit', return_value=-40):
+            with unittest.mock.patch.object(ops.game, 'calc_trainset_maintenance', return_value=0):
+                with unittest.mock.patch.object(ops.game, 'calc_resource_costs', return_value=0):
+                    with unittest.mock.patch.object(ops.game, 'calc_maitnance_by_player', return_value=0):
+                        with unittest.mock.patch.object(ops.game, 'calc_taxes', return_value=(0, 0, 0)):
+                            with unittest.mock.patch.object(ops.game, 'calc_worker_costs', return_value=(0, False)):
+                                with unittest.mock.patch.object(
+                                    ops, '_compute_transit_subsidy', return_value=50,
+                                ):
+                                    finances = ops.process_player_finances(player, ops.get_year())
+
+        self.assertEqual(finances['net'], -40 - 0 + 50)
+        self.assertEqual(player.get_money(), 30 + finances['net'])
+        self.assertFalse(ops.check_and_eliminate_player(player))
+
+    def test_line_annual_capacity_and_ridership_helpers(self):
+        from line import Line
+        from resource import Wood
+        from vehicle import Trainset, Locomotive, Railcar
+
+        ops = Operations(["P1"], 50, 50, 50000, map_preset_name="standard")
+        player = ops.get_players()[0]
+        route = [(5.0, 5.0), (10.0, 5.0), (15.0, 5.0)]
+        loco = Locomotive(
+            "Test Loco", fuel=Wood(), miles_per_unit=10.0, top_speed=30.0, average_speed=30.0,
+        )
+        trainset = Trainset(locomotive=loco, cars=[Railcar("Coach", 0, 60, 20)])
+        line = Line("CapLine", 1, route, player, [trainset])
+        line.schedule = {'peak': 4, 'off_peak': 2, 'night': 1}
+        ops.get_map().add_line(line)
+
+        capacity = ops.get_line_annual_capacity(line)
+        self.assertGreater(capacity, 0)
+
+        ops._cached_ridership_data = {'CapLine': 1234}
+        ops._cached_ridership_year = ops.get_year()
+        self.assertEqual(ops.get_line_ridership_for_year(line, ops.get_year()), 1234)
+
+        ops.game.timeline.year = ops.get_timeline_start_year() + 1
+        prev_year = ops.get_year() - 1
+        line._cached_ridership = 567
+        line._cached_ridership_year = prev_year
+        self.assertEqual(ops.get_line_previous_year_ridership(line), 567)
+
+        preview_schedule = {'peak': 1, 'off_peak': 0, 'night': 0}
+        preview_capacity = ops.get_line_annual_capacity(line, schedule=preview_schedule)
+        self.assertLess(preview_capacity, capacity)
+        self.assertEqual(line.schedule['peak'], 4)
+
+    def test_previous_year_ridership_zero_when_line_incomplete(self):
+        """Previous-year riders are 0 when the line still had pending construction."""
+        from line import Line
+        from resource import Wood
+        from vehicle import Trainset, Locomotive, Railcar
+
+        ops = Operations(["P1"], 50, 50, 50000, map_preset_name="standard")
+        player = ops.get_players()[0]
+        route = [(5.0, 5.0), (10.0, 5.0), (15.0, 5.0)]
+        loco = Locomotive(
+            "Test Loco", fuel=Wood(), miles_per_unit=10.0, top_speed=30.0, average_speed=30.0,
+        )
+        trainset = Trainset(locomotive=loco, cars=[Railcar("Coach", 0, 60, 20)])
+        line = Line("CapLine", 1, route, player, [trainset])
+        ops.get_map().add_line(line)
+
+        ops.game.timeline.year = ops.get_timeline_start_year() + 1
+        prev_year = ops.get_year() - 1
+        line._cached_ridership = 999
+        line._cached_ridership_year = prev_year
+        ops._cached_ridership_data = {'CapLine': 999}
+        ops._cached_ridership_year = prev_year
+
+        ops.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'CapLine',
+                'points': [(16.0, 5.0), (20.0, 5.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        self.assertFalse(ops.was_line_fully_built_at_end_of_year('CapLine', prev_year))
+        self.assertEqual(ops.get_line_previous_year_ridership(line), 0)
+
+    def test_get_pending_line_extension_routes_returns_display_polylines(self):
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        pending = ui.get_pending_line_extension_routes()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['line_name'], 'Main')
+        self.assertGreaterEqual(len(pending[0]['points']), 2)
+        self.assertEqual(pending[0]['points'][-1], (25.0, 0.0))
+        self.assertEqual(pending[0]['points'][0], (20.0, 0.0))
+
+    def test_check_and_eliminate_honors_net_change_over_intermediate_money(self):
+        """Bankruptcy uses balance_before + net_change, not a stale intermediate balance."""
+        from operations import Operations
+
+        ops = Operations(["P1"], 30, 30, 50000)
+        player = ops.get_players()[0]
+        player.money = -50
+        self.assertFalse(ops.check_and_eliminate_player(player, balance_before=30, net_change=20))
+        self.assertFalse(ops.is_player_eliminated(player))
+        self.assertTrue(ops.check_and_eliminate_player(player, balance_before=10, net_change=-20))
+        self.assertTrue(ops.is_player_eliminated(player))
+
 
 class TestRouteBacktrackingRules(unittest.TestCase):
     """Doubling-back is enforced for AI only; corner threshold is 80°."""
@@ -2396,21 +2565,74 @@ class TestExtensionClosestEnd(unittest.TestCase):
         self.assertEqual(merged_start, add + route)
 
 
-    def test_get_segment_elevation_options_water_defaults_underground(self):
+    def test_get_segment_elevation_options_water_defaults_above_ground(self):
         from operations import Operations
         from unittest.mock import Mock, patch
 
         ui = Operations(['Human'], 50, 50, 50000, 1.0, map_preset_name='standard')
         game_map = ui.game.get_map()
-        # A segment that cannot be at street level (over water) auto-defaults to underground.
+        # A segment that cannot be at street level (over water) auto-defaults to above-ground.
         with patch.object(ui, 'segment_is_over_water_not_bridge', return_value=True):
             choices, default = ui.get_segment_elevation_options((0.0, 0.0), (1.0, 0.0))
         self.assertEqual(choices, ['above_ground', 'underground'])
-        self.assertEqual(default, 'underground')
+        self.assertEqual(default, 'above_ground')
+        self.assertIn('above_ground', choices)
         with patch.object(ui, 'segment_is_over_water_not_bridge', return_value=False):
             choices, default = ui.get_segment_elevation_options((0.0, 0.0), (1.0, 0.0), is_bus_line=True)
         self.assertIn('street', choices)
         self.assertEqual(default, 'street')
+
+    def test_route_segment_is_water_crossing_any_endpoint_in_water(self):
+        from operations import _route_segment_is_water_crossing
+        from map import Map
+
+        game_map = Map(width=50, height=50, map_preset_name='nyc', use_osm=False)
+
+        def in_water(_preset, x, y, _game_map, skip_osm=True):
+            fx, fy = float(x), float(y)
+            if fx == 10.0 and fy == 10.0:
+                return True
+            if fx == 5.0 and fy == 5.0:
+                return True
+            return False
+
+        with unittest.mock.patch('map_preset_loader.preset_has_water_areas', return_value=True):
+            with unittest.mock.patch('map_preset_loader.preset_is_point_in_water', side_effect=in_water):
+                self.assertTrue(
+                    _route_segment_is_water_crossing(game_map, 10.0, 10.0, 20.0, 20.0, skip_osm=True),
+                )
+                self.assertTrue(
+                    _route_segment_is_water_crossing(game_map, 0.0, 0.0, 10.0, 10.0, skip_osm=True),
+                )
+                self.assertFalse(
+                    _route_segment_is_water_crossing(game_map, 0.0, 0.0, 2.0, 2.0, skip_osm=True),
+                )
+
+        def in_water_midpoint_only(_preset, x, y, _game_map, skip_osm=True):
+            return float(x) == 5.0 and float(y) == 0.0
+
+        with unittest.mock.patch('map_preset_loader.preset_has_water_areas', return_value=True):
+            with unittest.mock.patch('map_preset_loader.preset_is_point_in_water', side_effect=in_water_midpoint_only):
+                self.assertTrue(
+                    _route_segment_is_water_crossing(game_map, 0.0, 0.0, 10.0, 0.0, skip_osm=True),
+                )
+
+    def test_calculate_line_cost_allows_above_ground_on_water_segment(self):
+        from operations import Operations
+        from unittest.mock import patch
+
+        ui = Operations(['Human'], 50, 50, 50000, 1.0, map_preset_name='standard')
+        points = [(0.0, 0.0), (10.0, 10.0)]
+        with patch('operations._route_segment_is_water_crossing', return_value=True):
+            with patch('operations._segment_on_bridge_or_tunnel', return_value=False):
+                cost_info = ui.calculate_line_cost(points, ['above_ground'])
+        self.assertIn('cost', cost_info)
+        self.assertGreater(cost_info['cost'], 0)
+        with patch('operations._route_segment_is_water_crossing', return_value=True):
+            with patch('operations._segment_on_bridge_or_tunnel', return_value=False):
+                with self.assertRaises(ValueError) as ctx:
+                    ui.calculate_line_cost(points, ['street'])
+                self.assertIn('street level on water', str(ctx.exception).lower())
 
 
     def test_train_segment_requires_midpoint_on_street(self):
@@ -3690,6 +3912,89 @@ class TestMarketplaceLinePurchase(unittest.TestCase):
         self.assertEqual(self.ui.get_line_owner(purchased), buyer)
 
 
+class TestSellLineSegment(unittest.TestCase):
+    """Tests for selling/removing a line segment between two route clicks."""
+
+    def setUp(self):
+        self.timeline = Timeline(initial_year=1850, end_year=2000)
+        self.marketplace = Marketplace()
+        self.game_map = Map(
+            width=100,
+            height=100,
+            use_osm=False,
+            map_center_lat=40.7128,
+            map_center_lon=-74.0060,
+        )
+        self.player1 = Player(player_id=1, name="Player 1", money=100000)
+        self.game = Game(
+            players=[self.player1],
+            game_map=self.game_map,
+            timeline=self.timeline,
+            marketplace=self.marketplace,
+        )
+        self.ui = Operations(["Player 1"], use_osm=False)
+        self.ui.game = self.game
+
+    def _add_built_line(self, name, route):
+        from line import Line
+        line = Line(
+            name=name,
+            object_id=1,
+            route=list(route),
+            owner=self.player1,
+            vehicles=[],
+            elevation_levels=['street'] * max(0, len(route) - 1),
+        )
+        self.ui.add_line_to_map(line)
+        self.player1.acquire_line(line)
+        return line
+
+    def test_sell_line_segment_splits_into_two_lines(self):
+        self._add_built_line("Main", [(0, 0), (10, 0), (20, 0), (30, 0), (40, 0)])
+        money_before = self.player1.get_money()
+        result = self.ui.sell_line_segment_complete(
+            self.player1, "Main", (12, 0), (28, 0),
+        )
+        self.assertTrue(result['success'])
+        self.assertTrue(result['split'])
+        self.assertEqual(len(result['resulting_lines']), 2)
+        self.assertIn("Main", self.ui.get_map_lines())
+        self.assertIn(result['resulting_lines'][1], self.ui.get_map_lines())
+        self.assertGreaterEqual(self.player1.get_money(), money_before)
+
+    def test_sell_line_segment_keeps_single_line_when_end_segment_removed(self):
+        self._add_built_line("Spur", [(0, 0), (10, 0), (20, 0), (30, 0)])
+        result = self.ui.sell_line_segment_complete(
+            self.player1, "Spur", (22, 0), (30, 0),
+        )
+        self.assertTrue(result['success'])
+        self.assertFalse(result['split'])
+        line = self.ui.get_map_lines()["Spur"]
+        self.assertGreaterEqual(len(line.get_route()), 2)
+        last = line.get_route()[-1]
+        self.assertLessEqual(last[0], 22)
+
+    def test_sell_line_segment_rejects_same_click(self):
+        self._add_built_line("Tiny", [(0, 0), (10, 0), (20, 0)])
+        with self.assertRaises(ValueError):
+            self.ui.sell_line_segment_complete(
+                self.player1, "Tiny", (10, 0), (10, 0),
+            )
+
+    def test_sell_line_segment_closes_station_on_removed_portion(self):
+        from station import Station
+        line = self._add_built_line("Urban", [(0, 0), (10, 0), (20, 0), (30, 0), (40, 0)])
+        station = Station("Mid", 20, 0, line_names=["Urban"])
+        line.add_station(station)
+        self.game_map.stations = getattr(self.game_map, 'stations', [])
+        self.game_map.stations.append(station)
+        result = self.ui.sell_line_segment_complete(
+            self.player1, "Urban", (12, 0), (28, 0),
+        )
+        self.assertTrue(result['success'])
+        self.assertIn("Mid", result.get('closed_stations', []))
+
+
 class TestPerformanceTimeout(unittest.TestCase):
     def setUp(self):
         self._app = _ensure_app()
@@ -3961,9 +4266,83 @@ class TestMarketplace(unittest.TestCase):
         # Generate again - should replenish
         self.marketplace.generate_trainsets_based_on_discoveries(current_year)
         
-        # Should have replenished to target
+        # Should have replenished to target (non-railcar items plus player-scaled railcars)
         current_total = sum(item.get_quantity_available() for item in self.marketplace.available_vehicles)
-        self.assertGreaterEqual(current_total, target_total - 1)  # Allow for rounding
+        railcar_total = self.marketplace._count_standalone_railcar_quantity()
+        non_railcar_total = current_total - railcar_total
+        self.assertGreaterEqual(non_railcar_total, target_total - 1)  # Allow for rounding
+        self.assertGreaterEqual(railcar_total, self.marketplace.target_railcar_total - 1)
+
+    def test_marketplace_railcar_count_scales_with_players(self):
+        """Standalone marketplace railcars = num_players * factor at game start."""
+        from operations import initialize_marketplace_trainsets
+        from game_presets import MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR
+
+        marketplace = Marketplace()
+        num_players = 3
+        factor = MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR
+        initialize_marketplace_trainsets(marketplace, num_players=num_players, railcars_per_player_factor=factor)
+
+        expected = int(num_players * factor)
+        self.assertEqual(marketplace.target_railcar_total, expected)
+        railcar_total = marketplace._count_standalone_railcar_quantity()
+        self.assertGreaterEqual(railcar_total, expected)
+        self.assertLessEqual(railcar_total, expected + 5)
+
+    def test_marketplace_railcar_replenishment_uses_player_factor(self):
+        """Railcar replenishment target uses num_players * factor."""
+        from operations import initialize_marketplace_trainsets
+        from game_presets import MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR
+        from vehicle import Railcar
+
+        marketplace = Marketplace()
+        num_players = 2
+        factor = MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR
+        initialize_marketplace_trainsets(marketplace, num_players=num_players, railcars_per_player_factor=factor)
+        target = int(num_players * factor)
+        marketplace.available_vehicles = [
+            item for item in marketplace.available_vehicles
+            if not isinstance(item.get_item(), Railcar)
+        ]
+        marketplace.generate_trainsets_based_on_discoveries(1830)
+        self.assertGreaterEqual(marketplace._count_standalone_railcar_quantity(), target - 1)
+
+    def test_new_locomotive_spawns_on_invention(self):
+        """Newly invented locomotive types get guaranteed marketplace stock."""
+        from operations import initialize_marketplace_trainsets
+        from game_presets import (
+            MARKETPLACE_NEW_LOCOMOTIVE_COPIES,
+            MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER,
+        )
+        from vehicle import Locomotive, Trainset
+
+        ops, game, p1, p2 = _make_ops_and_players()
+        game.timeline.year = 1849
+        marketplace = game.get_marketplace()
+        num_players = len(game.get_players())
+        initialize_marketplace_trainsets(marketplace, num_players=num_players)
+        min_copies = max(
+            MARKETPLACE_NEW_LOCOMOTIVE_COPIES,
+            num_players * MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER,
+        )
+
+        target_name = "0-6-0 Tank Coal"
+
+        def count_loco_qty(name):
+            qty = 0
+            for sale_item in marketplace.available_vehicles:
+                item = sale_item.get_item()
+                if isinstance(item, Locomotive) and not isinstance(item, Trainset):
+                    if getattr(item, 'name', None) == name:
+                        qty += sale_item.get_quantity_available()
+            return qty
+
+        self.assertEqual(count_loco_qty(target_name), 0)
+        newly = ops.get_newly_available_vehicles(1849, 1850)
+        self.assertTrue(any(n == target_name for n, y in newly))
+        ops.advance_year_complete(1849)
+        self.assertEqual(ops.get_year(), 1850)
+        self.assertGreaterEqual(count_loco_qty(target_name), min_copies)
     
     def test_get_available_items(self):
         """Test getting all available items"""
@@ -4030,8 +4409,8 @@ class TestLobbyInflation(unittest.TestCase):
 class TestLobbySuccessChance(unittest.TestCase):
     def test_chance_minimum(self):
         ops, *_ = _make_ops_and_players()
-        self.assertGreaterEqual(ops.get_lobby_success_chance(0), 0.10)
-        self.assertLessEqual(ops.get_lobby_success_chance(0), 0.15)
+        self.assertGreaterEqual(ops.get_lobby_success_chance(0), 0.20)
+        self.assertLessEqual(ops.get_lobby_success_chance(0), 0.25)
 
     def test_chance_increases_with_amount(self):
         ops, *_ = _make_ops_and_players()
@@ -4041,6 +4420,130 @@ class TestLobbySuccessChance(unittest.TestCase):
         c3 = ops.get_lobby_success_chance(min_c * 100)
         self.assertLess(c1, c3)
         self.assertLessEqual(c3, 0.95)
+
+
+class TestLawTargetCountModifier(unittest.TestCase):
+    def test_extra_targets_help_good_laws(self):
+        ops, *_ = _make_ops_and_players()
+        self.assertGreater(
+            ops._law_target_count_chance_modifier("reduce_property_tax_5", 3), 0.0
+        )
+        self.assertEqual(
+            ops._law_target_count_chance_modifier("reduce_property_tax_5", 3), 0.10
+        )
+
+    def test_extra_targets_hurt_bad_laws(self):
+        ops, *_ = _make_ops_and_players()
+        self.assertLess(ops._law_target_count_chance_modifier("gov_attack", 3), 0.0)
+        self.assertEqual(ops._law_target_count_chance_modifier("gov_attack", 3), -0.10)
+
+    def test_single_target_no_modifier(self):
+        ops, *_ = _make_ops_and_players()
+        self.assertEqual(ops._law_target_count_chance_modifier("gov_attack", 1), 0.0)
+        self.assertEqual(ops._law_target_count_chance_modifier("reduce_property_tax_5", 1), 0.0)
+
+    def test_committee_chance_includes_target_modifier(self):
+        ops, *_ = _make_ops_and_players()
+        base = ops._compute_law_committee_pass_chance(
+            "reduce_property_tax_5", 10.0, 5.0, True, 1, num_targets=1
+        )
+        with_targets = ops._compute_law_committee_pass_chance(
+            "reduce_property_tax_5", 10.0, 5.0, True, 1, num_targets=3
+        )
+        self.assertGreater(with_targets, base)
+
+
+class TestStationDuplicateNameDistance(unittest.TestCase):
+    def _ops_with_named_station(self, x=10.0, y=10.0, name="Central"):
+        from line import Line
+        from station import Station
+
+        ops, game, p1, p2 = _make_ops_and_players()
+        line_name = "Line A"
+        line = Line(line_name, 1, [(5.0, 10.0), (15.0, 10.0)], owner=p1)
+        game.get_map().add_line(line)
+        p1.line_names = [line_name]
+        station = Station(name, x, y, line_names=[line_name])
+        line.add_station(station)
+        return ops, p1, line
+
+    def test_duplicate_name_allowed_within_20m(self):
+        ops, player, _ = self._ops_with_named_station()
+        # 0.015 grid units ≈ 15 m on non-OSM maps
+        ops.assert_station_name_unique_for_player(
+            player, "Central", x=10.015, y=10.0, line_names=["Line A"],
+        )
+
+    def test_duplicate_name_blocked_beyond_20m(self):
+        ops, player, _ = self._ops_with_named_station()
+        with self.assertRaises(ValueError):
+            ops.assert_station_name_unique_for_player(
+                player, "Central", x=10.03, y=10.0, line_names=["Line A"],
+            )
+
+
+class TestStationMerge(unittest.TestCase):
+    def _ops_with_two_lines_and_station(self):
+        from line import Line
+        from station import Station
+
+        ops, game, p1, p2 = _make_ops_and_players()
+        line_a = Line("Line A", 1, [(5.0, 10.0), (15.0, 10.0)], owner=p1)
+        line_b = Line("Line B", 1, [(10.0, 5.0), (10.0, 15.0)], owner=p1)
+        game.get_map().add_line(line_a)
+        game.get_map().add_line(line_b)
+        p1.line_names = ["Line A", "Line B"]
+        station = Station("Central", 10.0, 10.0, line_names=["Line A"])
+        line_a.add_station(station)
+        game.get_map().stations = [station]
+        return ops, p1, station, line_a, line_b
+
+    def test_find_merge_target_within_20m(self):
+        ops, player, station, _, _ = self._ops_with_two_lines_and_station()
+        target = ops.find_player_station_merge_target(
+            player, "Central", 10.015, 10.0,
+        )
+        self.assertIs(target, station)
+
+    def test_find_merge_target_beyond_20m(self):
+        ops, player, station, _, _ = self._ops_with_two_lines_and_station()
+        target = ops.find_player_station_merge_target(
+            player, "Central", 10.04, 10.0,
+        )
+        self.assertIsNone(target)
+
+    def test_merge_cost_cheaper_than_new_station(self):
+        ops, player, station, _, _ = self._ops_with_two_lines_and_station()
+        new_cost = ops.calculate_station_cost(1, 10.04, 10.0)
+        merge_cost = ops.calculate_station_cost(
+            1, 10.015, 10.0, player=player, station_name="Central",
+        )
+        self.assertLess(merge_cost, new_cost)
+
+    def test_create_station_immediate_merges_same_name_nearby(self):
+        ops, player, station, line_a, line_b = self._ops_with_two_lines_and_station()
+        result = ops.create_station_immediate(
+            "Central", 10.015, 10.01, player, ["Line B"],
+        )
+        self.assertTrue(result.get("merged"))
+        self.assertIs(result["station"], station)
+        self.assertIn("Line B", station.get_line_names())
+        self.assertIn(station, line_b.get_stations())
+
+    def test_merge_maintenance_savings_for_multi_line_hub(self):
+        ops, player, station, _, line_b = self._ops_with_two_lines_and_station()
+        self.assertEqual(ops.calc_player_station_merge_maintenance_savings(player, 1830), 0)
+        ops.create_station_immediate("Central", 10.015, 10.01, player, ["Line B"])
+        savings = ops.calc_player_station_merge_maintenance_savings(player, 1830)
+        self.assertGreater(savings, 0)
+
+    def test_map_display_merged_flag(self):
+        ops, player, station, _, line_b = self._ops_with_two_lines_and_station()
+        ops.create_station_immediate("Central", 10.015, 10.01, player, ["Line B"])
+        rows = ops.get_stations_for_map_display(ops.get_map(), current_player=player)
+        merged_rows = [r for r in rows if r.get("is_merged")]
+        self.assertEqual(len(merged_rows), 1)
+        self.assertGreaterEqual(merged_rows[0]["num_lines"], 2)
 
 
 class TestGovernmentLobbySeatAndTiebreaker(unittest.TestCase):
@@ -4244,6 +4747,27 @@ class TestTryFileLawsuit(unittest.TestCase):
         self.assertEqual(len(ops.get_player_lawsuit_excuses(p1)), 0)
 
 
+class TestLawsuitResolveChance(unittest.TestCase):
+    def test_lawyer_bonus_increased(self):
+        from lawsuit import Lawsuit, LAWSUIT_EXCUSES
+
+        ops, _, p1, p2 = _make_ops_and_players()
+        lawsuit = Lawsuit(p1, p2, LAWSUIT_EXCUSES[0], 1830)
+        with unittest.mock.patch("lawsuit.random.random", return_value=0.0):
+            lawsuit.resolve(0, 0)
+        self.assertEqual(lawsuit.winner, p1)
+
+    def test_base_chance_higher_with_cause(self):
+        from lawsuit import Lawsuit, LAWSUIT_EXCUSES
+
+        ops, _, p1, p2 = _make_ops_and_players()
+        lawsuit = Lawsuit(p1, p2, LAWSUIT_EXCUSES[0], 1830)
+        # 0.84 is below new 85% base plaintiff chance
+        with unittest.mock.patch("lawsuit.random.random", return_value=0.84):
+            lawsuit.resolve(0, 0)
+        self.assertEqual(lawsuit.winner, p1)
+
+
 class TestDistributeGovernmentFunding(unittest.TestCase):
     def test_no_funding_before_1970(self):
         ops, game, p1, p2 = _make_ops_and_players()
@@ -4351,7 +4875,7 @@ class TestFerryWaterDetectionHelpers(unittest.TestCase):
     """Preset-first ferry validation must accept water and reject land."""
 
     def test_ferry_helpers_use_preset_water_not_redundant_tile_checks(self):
-        from operations import Operations, _ferry_point_near_water, _ferry_segment_crosses_open_water
+        from operations import Operations, _ferry_point_near_water, _ferry_segment_near_water
         import map_presets_nyc as nyc
 
         ops = Operations(
@@ -4364,7 +4888,7 @@ class TestFerryWaterDetectionHelpers(unittest.TestCase):
         gx = int(round((lon - nyc.NYC_BOUNDS['min_lon']) / (nyc.NYC_BOUNDS['max_lon'] - nyc.NYC_BOUNDS['min_lon']) * game_map.width))
         self.assertTrue(_ferry_point_near_water(game_map, float(gx), float(gy)))
         self.assertTrue(
-            _ferry_segment_crosses_open_water(
+            _ferry_segment_near_water(
                 game_map, float(gx), float(gy), float(gx + 1), float(gy),
             )
         )
@@ -4372,6 +4896,22 @@ class TestFerryWaterDetectionHelpers(unittest.TestCase):
             [(float(gx), float(gy)), (float(gx + 1), float(gy))],
         )
         self.assertTrue(vr.get('success'))
+
+    def test_ferry_segment_near_shore_not_in_water_passes(self):
+        """Ferry routes on land within 100m of water are valid (no open-water crossing required)."""
+        from operations import Operations, _ferry_point_near_water, _ferry_segment_near_water
+        from unittest.mock import patch
+
+        ops = Operations(
+            ["P"], map_width=50, map_height=50, starting_money=50000,
+            use_osm=True, map_center_lat=40.7, map_center_lon=-73.9,
+        )
+        game_map = ops.get_map()
+
+        with patch('operations._ferry_point_near_water', return_value=True), \
+             patch('operations._ferry_segment_near_water', return_value=True):
+            vr = ops._validate_ferry_route([(10.0, 10.0), (20.0, 20.0)])
+            self.assertTrue(vr.get('success'))
 
     def test_validate_ferry_route_rejects_land(self):
         from operations import Operations
@@ -4845,6 +5385,24 @@ class TestStationCreation(unittest.TestCase):
         self.assertIn('line_names', result)
         self.assertEqual(result['line_names'], [line_name])
 
+    def test_get_station_creation_info_no_lines(self):
+        """Station dialog helper must report has_lines=False when player has no lines."""
+        info = self.ui.get_station_creation_info(self.player)
+        self.assertFalse(info['has_lines'])
+
+    def test_get_station_creation_info_with_lines(self):
+        """Station dialog helper must report has_lines=True when player owns a line."""
+        line = self.ui.game.create_line(
+            "Station Info Line",
+            self.player,
+            [(10, 10), (20, 20), (30, 30)],
+        )
+        self.player.acquire_line(line)
+        self.ui.game.get_map().add_line(line)
+        info = self.ui.get_station_creation_info(self.player)
+        self.assertTrue(info['has_lines'])
+        self.assertIn("Station Info Line", info['line_names'])
+
 
 class TestPopulationPointRemoval(unittest.TestCase):
     """Test population point removal functionality."""
@@ -5127,6 +5685,104 @@ class TestTimelineFareTarget(unittest.TestCase):
         self.assertEqual(round_fare_to_quarter(2.13), 2.25)
         self.assertEqual(round_fare_to_quarter(2.37), 2.25)
         self.assertEqual(round_fare_to_quarter(2.38), 2.5)
+
+
+class TestFinancialSummaryAndScheduleCost(unittest.TestCase):
+    def setUp(self):
+        self.ui = Operations(["Alice"], map_width=30, map_height=30, starting_money=100000, map_preset_name="standard")
+        self.player = self.ui.get_players()[0]
+
+    def test_schedule_operating_cost_per_train_hour_scales_with_year(self):
+        early = self.ui.get_schedule_operating_cost_per_train_hour(1830)
+        late = self.ui.get_schedule_operating_cost_per_train_hour(2000)
+        self.assertGreater(late, early)
+        self.assertGreater(early, 0)
+
+    def test_schedule_operating_cost_per_train_year_uses_timetable(self):
+        hourly = self.ui.get_schedule_operating_cost_per_train_hour(1830)
+        schedule = {'peak': 4, 'off_peak': 2, 'night': 1}
+        annual = self.ui.get_schedule_operating_cost_per_train_year(1830, schedule=schedule)
+        trips_per_hour = 4 * 0.4 + 2 * 0.4 + 1 * 0.2
+        expected = hourly * trips_per_hour * 8760.0
+        self.assertAlmostEqual(annual, expected, places=4)
+        self.assertGreater(annual, hourly)
+
+    def test_construction_cost_multiplier_applies_to_line_creation_and_extension(self):
+        from game_presets import CONSTRUCTION_COST_MULTIPLIER
+        from line import Line
+
+        points = [(10, 10), (20, 20)]
+        elevation = ['street']
+        create_cost = self.ui.calculate_line_cost(points, elevation)['cost']
+        self.assertGreater(create_cost, 0)
+
+        game_map = self.ui.get_map()
+        line = Line("ExtendMe", 1, points, self.player, [])
+        game_map.add_line(line)
+        self.player.line_names.append("ExtendMe")
+        ext_points = [(20, 20), (25, 25)]
+        ext_cost = self.ui.calculate_extend_cost(
+            "ExtendMe", ext_points, extend_from_end=True, elevation_levels=['street', 'street'],
+        )['cost']
+        self.assertGreater(ext_cost, 0)
+
+        base_create = int(create_cost / CONSTRUCTION_COST_MULTIPLIER)
+        base_ext = int(ext_cost / CONSTRUCTION_COST_MULTIPLIER)
+        self.assertGreater(base_create, 0)
+        self.assertGreater(base_ext, 0)
+
+    def test_construction_cost_multiplier_doubles_extension_and_station(self):
+        from game_presets import CONSTRUCTION_COST_MULTIPLIER
+
+        points = [(10, 10), (20, 20)]
+        elevation = ['street']
+        with unittest.mock.patch('game_presets.CONSTRUCTION_COST_MULTIPLIER', 1.0):
+            base_create = self.ui.calculate_line_cost(points, elevation)['cost']
+            base_station = self.ui.calculate_station_cost(1)
+
+        doubled_create = self.ui.calculate_line_cost(points, elevation)['cost']
+        doubled_station = self.ui.calculate_station_cost(1)
+        self.assertEqual(doubled_create, base_create * CONSTRUCTION_COST_MULTIPLIER)
+        self.assertEqual(doubled_station, base_station * CONSTRUCTION_COST_MULTIPLIER)
+
+    def test_construction_cost_multiplier_runtime_settings(self):
+        from game_presets import CONSTRUCTION_COST_MULTIPLIER
+        import game_presets
+
+        points = [(10, 10), (20, 20)]
+        elevation = ['street']
+        default_cost = self.ui.calculate_line_cost(points, elevation)['cost']
+        self.ui.apply_runtime_game_settings({'construction_cost_multiplier': 1.0})
+        self.assertEqual(game_presets.CONSTRUCTION_COST_MULTIPLIER, 1.0)
+        halved_cost = self.ui.calculate_line_cost(points, elevation)['cost']
+        self.assertEqual(halved_cost * 2, default_cost)
+        settings = self.ui.get_runtime_game_settings()
+        self.assertEqual(settings['construction_cost_multiplier'], 1.0)
+        self.ui.apply_runtime_game_settings({'construction_cost_multiplier': CONSTRUCTION_COST_MULTIPLIER})
+
+    def test_financial_summary_uses_requested_year_for_taxes(self):
+        from inflation_utils import get_inflation_factor
+        year = self.ui.get_year()
+        summary_now = self.ui.get_player_financial_summary(self.player, year)
+        summary_next = self.ui.get_player_financial_summary(self.player, year + 1)
+        infl_now = get_inflation_factor(year, max_factor=5.5)
+        infl_next = get_inflation_factor(year + 1, max_factor=5.5)
+        if infl_next > infl_now:
+            self.assertGreaterEqual(summary_next['poll_tax'], summary_now['poll_tax'])
+
+    def test_financial_summary_includes_uncached_line_profit(self):
+        from line import Line
+
+        game_map = self.ui.get_map()
+        route = [(1, 1), (2, 2), (3, 3)]
+        line = Line("NewLine", 99, route, self.player, [])
+        line.profit = 0
+        game_map.add_line(line)
+        self.player.line_names.append("NewLine")
+        self.assertFalse(hasattr(line, '_cached_profit'))
+        profit = self.ui.calc_player_profit_for_financial_summary(self.player, self.ui.get_year())
+        summary = self.ui.get_player_financial_summary(self.player, self.ui.get_year())
+        self.assertEqual(summary['profit'], profit)
 
 
 if __name__ == '__main__':

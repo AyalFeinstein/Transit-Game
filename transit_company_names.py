@@ -83,9 +83,18 @@ def get_transit_company_name(existing_names: set = None, map_preset_name: str = 
     available = [n for n in names if n not in existing]
     if available:
         return rand.choice(available)
-    # Fallback: add numeric suffix
-    base = rand.choice(names)
-    idx = 1
-    while f"{base} {idx}" in existing:
-        idx += 1
-    return f"{base} {idx}"
+    qualifiers = (
+        "Metropolitan", "Regional", "Central", "Union", "City",
+        "Northern", "Southern", "Eastern", "Western", "Coastal",
+    )
+    for q in qualifiers:
+        for n in names:
+            cand = f"{q} {n}" if q.lower() not in n.lower() else f"{n} {q}"
+            if cand not in existing:
+                return cand
+    for n in names:
+        for suf in (" Railway", " Transit", " Lines", " Railroad"):
+            cand = f"{n}{suf}"
+            if cand not in existing:
+                return cand
+    return rand.choice(names)
