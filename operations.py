@@ -2344,6 +2344,7 @@ class Operations:
         trainset.assign_to_line(line_name)
         if trainset not in target_line.vehicles:
             target_line.vehicles.append(trainset)
+        self.enforce_line_schedule_limits(target_line)
 
     def unassign_trainset_complete(self, trainset: Trainset) -> dict:
         """Unassign a trainset from its current line and remove it from line vehicles."""
@@ -2354,6 +2355,8 @@ class Operations:
         if line and trainset in line.vehicles:
             line.vehicles.remove(trainset)
         trainset.assign_to_line(None)
+        if line:
+            self.enforce_line_schedule_limits(line)
         return {'line_name': line_name}
 
     def get_player_by_id(self, player_id: int) -> Player:
@@ -2972,6 +2975,19 @@ class Operations:
         )
         return self.get_schedule_operating_cost_per_train_hour(year) * trips_per_hour * 8760.0
 
+    def enforce_line_schedule_limits(self, line) -> dict:
+        """Clamp line schedule to current max trains/hour when capacity rules change."""
+        if not line or not hasattr(line, 'schedule') or not hasattr(line, 'set_schedule_frequency'):
+            return {'changed': {}}
+        changed = {}
+        for period in ('peak', 'off_peak', 'night'):
+            old = float(line.schedule.get(period, 0) or 0)
+            line.set_schedule_frequency(period, old)
+            new = float(line.schedule.get(period, 0) or 0)
+            if new != old:
+                changed[period] = {'old': old, 'new': new}
+        return {'changed': changed}
+
     def get_line_annual_capacity(self, line: Line, schedule: dict = None) -> int:
         """Maximum passengers per year from schedule and assigned trainsets."""
         vehicles = self.get_line_vehicles(line)
@@ -3105,9 +3121,11 @@ class Operations:
     
     def extend_line_route_from_beginning(self, line: Line, additional_points: list):
         line.extend_route_from_beginning(additional_points)
+        self.enforce_line_schedule_limits(line)
 
     def extend_line_route_from_end(self, line: Line, additional_points: list):
         line.extend_route_from_end(additional_points)
+        self.enforce_line_schedule_limits(line)
 
     def is_line_name_in_use(self, name: str, exclude_line: Line = None) -> bool:
         """True if any completed line or queued line build uses this name (case-insensitive)."""
@@ -4168,8 +4186,16 @@ class Operations:
         new_name = (new_name or "").strip()
         if not new_name:
             raise ValueError("Station name cannot be empty.")
+        sx = float(station.get_x()) if hasattr(station, 'get_x') else float(getattr(station, 'x', 0))
+        sy = float(station.get_y()) if hasattr(station, 'get_y') else float(getattr(station, 'y', 0))
+        line_names = (
+            station.get_line_names() if hasattr(station, 'get_line_names')
+            else list(getattr(station, 'line_names', []) or [])
+        )
         for p in self._station_players(station):
-            self.assert_station_name_unique_for_player(p, new_name, exclude_station=station)
+            self.assert_station_name_unique_for_player(
+                p, new_name, exclude_station=station, x=sx, y=sy, line_names=line_names,
+            )
         station.name = new_name
     
     def get_station_name(self, station) -> str:
@@ -8650,6 +8676,7 @@ class Operations:
         elif hasattr(station, 'line_names'):
             if line_name not in station.line_names:
                 station.line_names.append(line_name)
+        self.enforce_line_schedule_limits(line)
     
     def convert_click_to_grid(self, lat: float, lon: float) -> tuple[float, float]:
         """Convert lat/lon click to grid coordinates with 0.000001 precision.
@@ -9017,6 +9044,115 @@ class Operations:
             'refund': refund,
             'removed_points': len(removed),
             'closed_stations': closed_stations,
+        }
+
+    def estimate_line_scrap_refund(self, line_name: str) -> int:
+        """Estimate 50% scrap refund for an entire built line."""
+        from line import Ferry, Bus
+
+        line = self.get_map_lines().get(line_name)
+        if line is None:
+            return 0
+        route = list(line.get_route() or [])
+        if len(route) < 2:
+            return 0
+        is_ferry = isinstance(line, Ferry)
+        is_bus = isinstance(line, Bus)
+        default_elev = 'water' if is_ferry else 'street'
+        elevs = list(getattr(line, 'elevation_levels', None) or [])
+        elevs = _fit_elevation_levels(elevs, max(0, len(route) - 1), default_elev)
+        try:
+            line_cost = self.calculate_line_cost(
+                route, elevs, is_bus_line=is_bus, is_ferry_line=is_ferry,
+            ).get('cost', 0)
+        except Exception:
+            line_cost = 0
+        return int(line_cost * 0.5)
+
+    def sell_line_complete(self, player: Player, line_name: str) -> dict:
+        """Scrap an entire owned line for 50% of construction cost (not marketplace sale)."""
+        from line import Ferry, Bus
+
+        if not line_name:
+            raise ValueError("Line name required")
+        if line_name not in player.get_line_names():
+            raise ValueError(f"Player does not own line '{line_name}'")
+
+        game_map = self.get_map()
+        line = game_map.get_lines_by_name().get(line_name)
+        if line is None:
+            raise ValueError(f"Line '{line_name}' not found on map")
+
+        owner = self.get_line_owner(line)
+        if owner is not None and owner != player:
+            raise ValueError(f"Player does not own line '{line_name}'")
+
+        route = list(line.get_route() or [])
+        if len(route) < 2:
+            raise ValueError(f"Line '{line_name}' has no route to sell")
+
+        for ts in list(player.get_trainsets()):
+            if ts.get_line_assignment() == line_name:
+                try:
+                    self.unassign_trainset_complete(ts)
+                except ValueError:
+                    pass
+        if hasattr(line, 'vehicles'):
+            line.vehicles.clear()
+
+        cancelled = []
+        queue = self.get_build_queue() if hasattr(self, 'get_build_queue') else []
+        for idx in range(len(queue) - 1, -1, -1):
+            build = queue[idx]
+            if build.get('player') != player:
+                continue
+            data = build.get('data') or {}
+            matches = (
+                (build.get('type') == 'line' and data.get('name') == line_name)
+                or (build.get('type') == 'line_extension' and data.get('line_name') == line_name)
+                or (build.get('type') == 'station' and line_name in (data.get('line_names') or []))
+            )
+            if matches:
+                cancelled.append(self.cancel_build(idx))
+
+        is_ferry = isinstance(line, Ferry)
+        is_bus = isinstance(line, Bus)
+        default_elev = 'water' if is_ferry else 'street'
+        elevs = list(getattr(line, 'elevation_levels', None) or [])
+        elevs = _fit_elevation_levels(elevs, max(0, len(route) - 1), default_elev)
+        try:
+            line_cost = self.calculate_line_cost(
+                route, elevs, is_bus_line=is_bus, is_ferry_line=is_ferry,
+            ).get('cost', 0)
+        except Exception:
+            line_cost = 0
+        refund = int(line_cost * 0.5)
+
+        closed_stations = []
+        for station in list(
+            line.get_stations() if hasattr(line, 'get_stations') else (getattr(line, 'stations', None) or [])
+        ):
+            line_names = list(
+                station.get_line_names() if hasattr(station, 'get_line_names')
+                else getattr(station, 'line_names', []) or []
+            )
+            if line_name in line_names and len(line_names) <= 1:
+                closed_stations.append(self.get_station_name(station))
+
+        if line_name in player.get_line_names():
+            player.remove_line(line_name)
+        self.delete_line_from_map(line)
+
+        if refund > 0:
+            self.add_player_money(player, refund, reason='Line scrap refund')
+
+        self.invalidate_ridership_cache()
+        return {
+            'success': True,
+            'line_name': line_name,
+            'refund': refund,
+            'closed_stations': closed_stations,
+            'cancelled_builds': len(cancelled),
         }
     
     def _snap_point_to_route(self, route: list, x: float, y: float, max_distance: float = 0.5) -> tuple:

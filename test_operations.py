@@ -1639,6 +1639,39 @@ class TestLine(unittest.TestCase):
         line_no_trains.set_schedule_frequency('peak', 10.0)
         self.assertEqual(line_no_trains.schedule['peak'], 0.0)
 
+    def test_enforce_line_schedule_limits_clamps_after_unassign(self):
+        """Schedule auto-updates when max trains/hour drops after unassigning trainsets."""
+        from vehicle import Trainset, Locomotive, Railcar
+        from map import Map
+        from game import Game
+        from timeline import Timeline
+        from marketplace import Marketplace
+
+        loco = Locomotive("Test Loco", 1830, 30, 100, "Wood", 50, 100)
+        ts1 = Trainset(locomotive=loco, cars=[Railcar("Car", 1830, 50, 20)])
+        ts2 = Trainset(locomotive=loco, cars=[Railcar("Car2", 1830, 50, 20)])
+        player = Player(0, 10000, [], "Test Player")
+        line = Line("Ops Line", 1, self.route, player, [ts1, ts2])
+        ts1.assign_to_line("Ops Line")
+        ts2.assign_to_line("Ops Line")
+        max_peak = line.get_max_frequency_per_hour('peak')
+        line.schedule = {'peak': max_peak, 'off_peak': max_peak, 'night': max_peak}
+
+        game_map = Map(width=100, height=100, use_osm=False)
+        game = Game(
+            players=[player],
+            game_map=game_map,
+            timeline=Timeline(1830, 2000),
+            marketplace=Marketplace(),
+        )
+        ui = Operations(["Test Player"], use_osm=False)
+        ui.game = game
+        game_map.add_line(line)
+        player.acquire_line(line)
+
+        ui.unassign_trainset_complete(ts2)
+        self.assertLess(line.schedule['peak'], max_peak)
+
     def test_zero_schedule_yields_zero_trains_per_year(self):
         """All-zero timetable means no annual train trips and no schedule operating cost."""
         from vehicle import Trainset, Locomotive, Railcar
@@ -3995,6 +4028,84 @@ class TestSellLineSegment(unittest.TestCase):
         self.assertIn("Mid", result.get('closed_stations', []))
 
 
+class TestSellEntireLine(unittest.TestCase):
+    """Tests for scrapping/selling an entire owned line."""
+
+    def setUp(self):
+        self.timeline = Timeline(initial_year=1850, end_year=2000)
+        self.marketplace = Marketplace()
+        self.game_map = Map(
+            width=100,
+            height=100,
+            use_osm=False,
+            map_center_lat=40.7128,
+            map_center_lon=-74.0060,
+        )
+        self.player1 = Player(player_id=1, name="Player 1", money=100000)
+        self.game = Game(
+            players=[self.player1],
+            game_map=self.game_map,
+            timeline=self.timeline,
+            marketplace=self.marketplace,
+        )
+        self.ui = Operations(["Player 1"], use_osm=False)
+        self.ui.game = self.game
+
+    def _add_built_line(self, name, route):
+        from line import Line
+        line = Line(
+            name=name,
+            object_id=1,
+            route=list(route),
+            owner=self.player1,
+            vehicles=[],
+            elevation_levels=['street'] * max(0, len(route) - 1),
+        )
+        self.ui.add_line_to_map(line)
+        self.player1.acquire_line(line)
+        return line
+
+    def test_sell_line_complete_removes_line_and_refunds(self):
+        self._add_built_line("Main", [(0, 0), (10, 0), (20, 0)])
+        money_before = self.player1.get_money()
+        result = self.ui.sell_line_complete(self.player1, "Main")
+        self.assertTrue(result['success'])
+        self.assertNotIn("Main", self.ui.get_map_lines())
+        self.assertNotIn("Main", self.player1.get_line_names())
+        self.assertGreaterEqual(self.player1.get_money(), money_before)
+
+    def test_sell_line_complete_unassigns_trainsets(self):
+        from vehicle import Trainset, Locomotive, Railcar
+        line = self._add_built_line("Rail", [(0, 0), (10, 0), (20, 0)])
+        loco = Locomotive("Test Loco", 1830, 30, 100, "Wood", 50, 100)
+        ts = Trainset(locomotive=loco, cars=[Railcar("Car", 1830, 50, 20)])
+        ts.assign_to_line("Rail")
+        line.vehicles.append(ts)
+        self.player1.trainsets = getattr(self.player1, 'trainsets', [])
+        self.player1.trainsets.append(ts)
+        self.ui.sell_line_complete(self.player1, "Rail")
+        self.assertIsNone(ts.get_line_assignment())
+
+    def test_sell_line_complete_closes_single_line_station(self):
+        from station import Station
+        line = self._add_built_line("Urban", [(0, 0), (10, 0), (20, 0)])
+        station = Station("Only", 10, 0, line_names=["Urban"])
+        line.add_station(station)
+        self.game_map.stations = getattr(self.game_map, 'stations', [])
+        self.game_map.stations.append(station)
+        result = self.ui.sell_line_complete(self.player1, "Urban")
+        self.assertTrue(result['success'])
+        self.assertIn("Only", result.get('closed_stations', []))
+        self.assertNotIn(station, self.game_map.stations)
+
+    def test_sell_line_complete_rejects_unowned(self):
+        self._add_built_line("Other", [(0, 0), (10, 0)])
+        from player import Player
+        other = Player(player_id=2, name="Player 2", money=100000)
+        with self.assertRaises(ValueError):
+            self.ui.sell_line_complete(other, "Other")
+
+
 class TestPerformanceTimeout(unittest.TestCase):
     def setUp(self):
         self._app = _ensure_app()
@@ -4480,6 +4591,16 @@ class TestStationDuplicateNameDistance(unittest.TestCase):
             ops.assert_station_name_unique_for_player(
                 player, "Central", x=10.03, y=10.0, line_names=["Line A"],
             )
+
+    def test_rename_station_allows_same_name_within_20m(self):
+        from station import Station
+        ops, player, line = self._ops_with_named_station()
+        station = line.get_stations()[0]
+        nearby = Station("Central Hub", 10.015, 10.0, line_names=["Line A"])
+        game_map = ops.get_map()
+        game_map.stations.append(nearby)
+        line.add_station(nearby)
+        ops.rename_station(station, "Central Hub")
 
 
 class TestStationMerge(unittest.TestCase):

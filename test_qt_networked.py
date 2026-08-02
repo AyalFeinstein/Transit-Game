@@ -105,7 +105,7 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
             w.close()
 
     def test_rolling_stock_only_refresh_button(self):
-        """Rolling stock tab keeps only the Refresh Rolling Stock action button."""
+        """Rolling stock tab keeps only Refresh Rolling Stock at top level; per-item buttons live in scroll content."""
         from PyQt6.QtWidgets import QPushButton
         from operations import Operations
         from qt_networked import MainWindow
@@ -167,6 +167,33 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
         finally:
             w.close()
 
+    def test_map_sidebar_has_sell_line_controls(self):
+        """Map sidebar exposes sell-entire-line controls."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(
+            ["Human"],
+            map_width=30,
+            map_height=30,
+            starting_money=200000,
+            map_preset_name="standard",
+            random_ai_spawn_enabled=False,
+        )
+        player = ops.get_players()[0]
+        w = MainWindow()
+        w.operations = ops
+        w.player_tabs_dict = {}
+        try:
+            w._create_player_tabs(player, for_other_player=False)
+            player_id = ops.get_player_id(player)
+            tabs = w.player_tabs_dict[player_id]
+            self.assertIsNotNone(tabs.get('sell_line_btn'))
+            self.assertEqual(tabs['sell_line_btn'].text(), "Sell Line")
+            self.assertIsNotNone(tabs.get('sell_line_combo'))
+        finally:
+            w.close()
+
     def test_map_html_includes_segment_sell_js(self):
         """Generated map HTML includes line segment sell click-mode helpers."""
         from operations import Operations
@@ -189,6 +216,30 @@ class TestQtNetworkedMainWindow(unittest.TestCase):
             self.assertIn("cancelLineSegmentSell", html)
             self.assertIn("isSellingLineSegment", html)
             self.assertIn("pendingSegmentSell", html)
+        finally:
+            w.close()
+
+    def test_map_html_includes_station_rename_js(self):
+        """Generated map HTML includes station rename popup helpers."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(
+            ["Human"],
+            map_width=30,
+            map_height=30,
+            starting_money=200000,
+            map_preset_name="standard",
+            random_ai_spawn_enabled=False,
+        )
+        w = MainWindow()
+        w.operations = ops
+        try:
+            game_map = ops.get_map()
+            html = w._generate_osm_map_html(game_map)
+            self.assertIn("rename-station-btn", html)
+            self.assertIn("renameStation", html)
+            self.assertIn("mapRenameStation", html)
         finally:
             w.close()
 

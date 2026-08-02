@@ -3280,6 +3280,19 @@ class MainWindow(QMainWindow):
         cancel_sell_segment_btn = QPushButton("Cancel Sell Segment")
         cancel_sell_segment_btn.setEnabled(False)
         map_sidebar_layout.addWidget(cancel_sell_segment_btn)
+
+        map_sidebar_layout.addWidget(QLabel(""))
+
+        sell_line_label = QLabel("Sell Entire Line")
+        sell_line_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        map_sidebar_layout.addWidget(sell_line_label)
+
+        sell_line_btn = QPushButton("Sell Line")
+        map_sidebar_layout.addWidget(sell_line_btn)
+
+        sell_line_combo = QComboBox()
+        sell_line_combo.addItem("Select line...")
+        map_sidebar_layout.addWidget(sell_line_combo)
         
         map_sidebar_layout.addWidget(QLabel(""))  # Spacer
         
@@ -3376,6 +3389,8 @@ class MainWindow(QMainWindow):
         player_tabs_dict['sell_segment_combo'] = sell_segment_combo
         player_tabs_dict['sell_segment_points_label'] = sell_segment_points_label
         player_tabs_dict['cancel_sell_segment_btn'] = cancel_sell_segment_btn
+        player_tabs_dict['sell_line_btn'] = sell_line_btn
+        player_tabs_dict['sell_line_combo'] = sell_line_combo
         player_tabs_dict['create_station_btn'] = create_station_btn
         player_tabs_dict['station_name_input'] = station_name_input
         player_tabs_dict['station_line_combo'] = station_line_combo
@@ -6529,12 +6544,20 @@ class MainWindow(QMainWindow):
                     upgrade_tracks_btn.setToolTip(f"Current tracks: {getattr(line, 'num_tracks', 1)}")
                     def upgrade_tracks():
                         line.upgrade_tracks(1)
+                        if hasattr(self.operations, 'enforce_line_schedule_limits'):
+                            self.operations.enforce_line_schedule_limits(line)
                         for spin, period in (
                             (peak_spin, 'peak'), (off_peak_spin, 'off_peak'), (night_spin, 'night')
                         ):
                             spin.setMaximum(schedule_spin_max(period))
+                            actual = int(line.schedule.get(period, 0))
+                            if spin.value() != actual:
+                                spin.blockSignals(True)
+                                spin.setValue(actual)
+                                spin.blockSignals(False)
                         max_freq_label.setText(f"Max: {int(line.get_max_frequency_per_hour('peak'))}/hr")
                         upgrade_tracks_btn.setToolTip(f"Current tracks: {getattr(line, 'num_tracks', 1)}")
+                        refresh_schedule_cost_label()
                     upgrade_tracks_btn.clicked.connect(upgrade_tracks)
                     schedule_controls.addWidget(upgrade_tracks_btn)
 
@@ -8548,6 +8571,18 @@ class MainWindow(QMainWindow):
                                 if line_name not in sell_line_names_set:
                                     sell_segment_combo.addItem(line_name, line)
                                     sell_line_names_set.add(line_name)
+            sell_line_combo = player_tabs_dict.get('sell_line_combo')
+            if sell_line_combo:
+                sell_line_combo.clear()
+                sell_line_combo.addItem("Select line...")
+                if current_player and all_lines:
+                    sell_entire_names_set = set()
+                    for line_name, line in all_lines.items():
+                        owner = self.operations.get_line_owner(line)
+                        if owner and self.operations.get_player_id(owner) == current_player_id:
+                            if line_name not in sell_entire_names_set:
+                                sell_line_combo.addItem(line_name, line)
+                                sell_entire_names_set.add(line_name)
 
     def _build_map_lines_overlay_data(self, game_map) -> list:
         """Build line overlay data for lightweight map refresh after line creation."""
@@ -9099,6 +9134,19 @@ class MainWindow(QMainWindow):
                                         if line_name not in sell_line_names_set:
                                             sell_segment_combo.addItem(line_name, line)
                                             sell_line_names_set.add(line_name)
+
+                    sell_line_combo = player_tabs_dict.get('sell_line_combo')
+                    if sell_line_combo:
+                        sell_line_combo.clear()
+                        sell_line_combo.addItem("Select line...")
+                        if current_player and all_lines:
+                            sell_entire_names_set = set()
+                            for line_name, line in all_lines.items():
+                                owner = self.operations.get_line_owner(line)
+                                if owner and self.operations.get_player_id(owner) == current_player_id:
+                                    if line_name not in sell_entire_names_set:
+                                        sell_line_combo.addItem(line_name, line)
+                                        sell_entire_names_set.add(line_name)
                     
                     # Get map tab and ensure it's visible
                     map_tab = player_tabs_dict.get('map_tab')
@@ -9339,6 +9387,7 @@ class MainWindow(QMainWindow):
             for key in ('create_line_btn', 'finish_line_btn', 'cancel_line_btn', 'extend_line_btn',
                         'finish_extend_btn', 'cancel_extend_btn', 'line_name_input', 'extend_line_combo',
                         'sell_segment_btn', 'sell_segment_combo', 'cancel_sell_segment_btn',
+                        'sell_line_btn', 'sell_line_combo',
                         'station_name_input', 'station_line_combo'):
                 w = player_tabs_dict.get(key)
                 if w is not None:
@@ -10105,6 +10154,62 @@ class MainWindow(QMainWindow):
                     spl.setText("Clicks: 0/2")
 
             cancel_sell_segment_btn.clicked.connect(cancel_sell_segment)
+
+        sell_line_btn = player_tabs_dict.get('sell_line_btn')
+        if sell_line_btn:
+            receivers = sell_line_btn.receivers(sell_line_btn.clicked)
+            if receivers > 0:
+                sell_line_btn.clicked.disconnect()
+
+            def sell_entire_line():
+                current_player_tabs_dict = self.player_tabs_dict.get(player_id)
+                if not current_player_tabs_dict:
+                    QMessageBox.warning(self, "Error", "Player tabs not found.")
+                    return
+                sell_line_combo = current_player_tabs_dict.get('sell_line_combo')
+                if not sell_line_combo:
+                    QMessageBox.warning(self, "Error", "Line selector not found.")
+                    return
+                selected_line = sell_line_combo.currentText()
+                if not selected_line or selected_line == "Select line...":
+                    QMessageBox.warning(self, "Error", "Please select a line first.")
+                    return
+                line = self.operations.get_map_lines().get(selected_line)
+                if line is None:
+                    QMessageBox.warning(self, "Error", f"Line '{selected_line}' is not built yet.")
+                    return
+                current_player = self.operations.get_current_player(self.current_player_index)
+                if not current_player:
+                    return
+                if selected_line not in current_player.get_line_names():
+                    QMessageBox.warning(self, "Cannot Sell Line", "You can only sell lines you own.")
+                    return
+                refund = self.operations.estimate_line_scrap_refund(selected_line)
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Sell Line",
+                    f"Scrap entire line '{selected_line}'?\n\n"
+                    f"Estimated refund: ${refund}\n"
+                    f"Trainsets will be unassigned and single-line stations removed.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                try:
+                    result = self.operations.sell_line_complete(current_player, selected_line)
+                    closed = result.get('closed_stations') or []
+                    msg = f"Line '{selected_line}' sold for ${result.get('refund', 0)}."
+                    if closed:
+                        msg += f"\nClosed stations: {', '.join(closed)}"
+                    QMessageBox.information(self, "Line Sold", msg)
+                    self.update_status_bar()
+                    self.DisplayMapInfo()
+                    self.DisplayLinesControls(current_player)
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Failed to sell line: {str(e)}")
+
+            sell_line_btn.clicked.connect(sell_entire_line)
         
         create_station_btn = player_tabs_dict.get('create_station_btn')
         station_name_input = player_tabs_dict.get('station_name_input')
@@ -10623,6 +10728,9 @@ class MainWindow(QMainWindow):
             if (typeof window.pendingCloseStation === 'undefined') {
                 window.pendingCloseStation = null;
             }
+            if (typeof window.pendingRenameStation === 'undefined') {
+                window.pendingRenameStation = null;
+            }
             if (typeof window.getCurrentPointCount === 'undefined') {
                 window.getCurrentPointCount = function() {
                     return window.pendingPointCount || 0;
@@ -10661,6 +10769,15 @@ class MainWindow(QMainWindow):
                 });
                 window.addEventListener('mapCloseStation', function(e) {
                     window.pendingCloseStation = e.detail.stationName;
+                });
+                window.addEventListener('mapRenameStation', function(e) {
+                    if (e && e.detail) {
+                        window.pendingRenameStation = {
+                            stationName: e.detail.stationName,
+                            lat: e.detail.lat,
+                            lon: e.detail.lon
+                        };
+                    }
                 });
                 window.mapEventListenersSet = true;
             }
@@ -10759,6 +10876,61 @@ class MainWindow(QMainWindow):
             if close_station_check_page:
                 close_station_check_page.runJavaScript("window.pendingCloseStation || null;", handle_close)
         
+        def check_rename_station():
+            def handle_rename(result):
+                if not result or result == "null" or result == "undefined":
+                    return
+                if self.operations is None:
+                    return
+                if not hasattr(self, 'current_player_index') or self.current_player_index is None:
+                    return
+                try:
+                    import json
+                    data = json.loads(result) if isinstance(result, str) else result
+                except (json.JSONDecodeError, TypeError):
+                    return
+                if not data or not isinstance(data, dict):
+                    return
+                station_name = str(data.get('stationName') or data.get('station_name') or '').strip()
+                lat = data.get('lat')
+                lon = data.get('lon')
+                if lat is None or lon is None:
+                    return
+                x, y = self.operations.convert_click_to_grid(float(lat), float(lon))
+                stations = self.operations.get_stations_at_point(x, y)
+                if not stations:
+                    game_map = self.operations.get_map()
+                    if hasattr(game_map, 'stations') and game_map.stations:
+                        for station in game_map.stations:
+                            if hasattr(station, 'name') and station.name == station_name:
+                                line_names = (
+                                    station.get_line_names() if hasattr(station, 'get_line_names')
+                                    else getattr(station, 'line_names', [])
+                                )
+                                if line_names:
+                                    line = self.operations.get_map_lines().get(line_names[0])
+                                    if line:
+                                        stations = [(station, line_names[0], line)]
+                                        break
+                if not stations:
+                    QMessageBox.warning(self, "Station Not Found", f"Could not find station '{station_name}'.")
+                    return
+                if len(stations) == 1:
+                    station, line_name, line = stations[0]
+                    self.show_station_edit_dialog(station, line_name, line, x, y)
+                else:
+                    self.on_station_clicked(x, y, stations)
+                rename_clear_page = self._safe_get_webview_page(web_view)
+                if rename_clear_page:
+                    rename_clear_page.runJavaScript("window.pendingRenameStation = null;")
+
+            rename_check_page = self._safe_get_webview_page(web_view)
+            if rename_check_page:
+                rename_check_page.runJavaScript(
+                    "(function(){ var d=window.pendingRenameStation; window.pendingRenameStation=null; return JSON.stringify(d||null); })();",
+                    handle_rename,
+                )
+
         timer_key_close_station = f'close_station_timer_{player_id}'
         if not hasattr(self, '_close_station_timers'):
             self._close_station_timers = {}
@@ -10767,6 +10939,15 @@ class MainWindow(QMainWindow):
             close_station_timer.timeout.connect(check_close_station)
             close_station_timer.start(500)
             self._close_station_timers[timer_key_close_station] = close_station_timer
+
+        timer_key_rename_station = f'rename_station_timer_{player_id}'
+        if not hasattr(self, '_rename_station_timers'):
+            self._rename_station_timers = {}
+        if timer_key_rename_station not in self._rename_station_timers:
+            rename_station_timer = QTimer()
+            rename_station_timer.timeout.connect(check_rename_station)
+            rename_station_timer.start(500)
+            self._rename_station_timers[timer_key_rename_station] = rename_station_timer
         
         def check_extend_point_count():
             if self.operations is None:
@@ -11152,12 +11333,14 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                         if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
                             line_names_build = build_data.get('line_names', [])
                             can_close = True
+                            can_rename = True
                             if self.operations and line_names_build:
                                 cp = self.operations.get_current_player(self.current_player_index)
                                 for ln in line_names_build:
                                     line = self.operations.get_map_lines().get(ln)
                                     if line and self.operations.get_line_owner(line) != cp:
                                         can_close = False
+                                        can_rename = False
                                         break
                             num_lines = len(line_names_build or [])
                             stations_data.append({
@@ -11165,6 +11348,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                                 'name': build_data.get('name', 'Station'),
                                 'under_construction': True,
                                 'can_close': can_close,
+                                'can_rename': can_rename,
                                 'line_names': line_names_build or [],
                                 'is_merged': num_lines >= 2,
                                 'num_lines': num_lines,
@@ -11189,6 +11373,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
                         station_name = station.name if hasattr(station, 'name') else str(station)
                         can_close = True
+                        can_rename = True
                         line_names_st = getattr(station, 'get_line_names', lambda: getattr(station, 'line_names', []))()
                         if self.operations:
                             cp = self.operations.get_current_player(self.current_player_index)
@@ -11196,6 +11381,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                                 line = self.operations.get_map_lines().get(ln)
                                 if line and self.operations.get_line_owner(line) != cp:
                                     can_close = False
+                                    can_rename = False
                                     break
                         num_lines = len(line_names_st or [])
                         stations_data.append({
@@ -11203,6 +11389,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                             'name': station_name,
                             'under_construction': False,
                             'can_close': can_close,
+                            'can_rename': can_rename,
                             'line_names': line_names_st or [],
                             'is_merged': num_lines >= 2,
                             'num_lines': num_lines,
@@ -11608,8 +11795,9 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     }});
                     var encodedName = encodeURIComponent(station.name || '');
                     var closeBtnHtml = (station.can_close !== false) ? '<button class="close-station-btn" data-station-name="' + encodedName + '">Close Station</button>' : '';
+                    var renameBtnHtml = (station.can_rename !== false && station.under_construction !== true) ? '<button class="rename-station-btn" data-station-name="' + encodedName + '" data-station-lat="' + station.lat + '" data-station-lon="' + station.lon + '">Rename Station</button>' : '';
                     var mergeNote = isMerged ? '<br/><i>Merged hub — ' + (station.num_lines || lineNames.length) + ' lines share this stop</i>' : '';
-                    var stationPopupContent = '<div><b>Station: ' + (station.name || '') + label + '</b>' + (lineLabel ? '<br/>Line(s): ' + (station.line_names || []).join(', ') : '') + mergeNote + '<br/>' + closeBtnHtml + '</div>';
+                    var stationPopupContent = '<div><b>Station: ' + (station.name || '') + label + '</b>' + (lineLabel ? '<br/>Line(s): ' + (station.line_names || []).join(', ') : '') + mergeNote + '<br/>' + renameBtnHtml + closeBtnHtml + '</div>';
                     stationMarker.bindPopup(stationPopupContent);
                     stationMarker.addTo(mapInstance);
                     stationLayers.push(stationMarker);
@@ -11674,6 +11862,15 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                             window.closeStation(decodeURIComponent(name));
                         }});
                     }}
+                    var renameStationBtn = popupEl.querySelector('.rename-station-btn');
+                    if (renameStationBtn) {{
+                        renameStationBtn.addEventListener('click', function() {{
+                            var name = renameStationBtn.getAttribute('data-station-name') || '';
+                            var lat = renameStationBtn.getAttribute('data-station-lat') || '';
+                            var lon = renameStationBtn.getAttribute('data-station-lon') || '';
+                            window.renameStation(decodeURIComponent(name), parseFloat(lat), parseFloat(lon));
+                        }});
+                    }}
                 }} catch (err) {{
                 }}
             }});
@@ -11681,6 +11878,13 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             window.closeStation = function(stationName) {{
                 var event = new CustomEvent('mapCloseStation', {{
                     detail: {{ stationName: stationName }}
+                }});
+                window.dispatchEvent(event);
+            }};
+
+            window.renameStation = function(stationName, lat, lon) {{
+                var event = new CustomEvent('mapRenameStation', {{
+                    detail: {{ stationName: stationName, lat: lat, lon: lon }}
                 }});
                 window.dispatchEvent(event);
             }};
@@ -12374,6 +12578,16 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 cap = getattr(car, 'capacity', 0)
                 railcar_layout = QHBoxLayout()
                 railcar_layout.addWidget(QLabel(f"  {car_name} (Capacity: {cap})"))
+                assign_btn = QPushButton("Assign to Trainset")
+                def make_assign_handler(c, p):
+                    return lambda: self.on_assign_railcar_to_trainset(c, p)
+                assign_btn.clicked.connect(make_assign_handler(car, player))
+                railcar_layout.addWidget(assign_btn)
+                sell_btn = QPushButton("Sell")
+                def make_sell_handler(c, p):
+                    return lambda: self.on_sell_railcar_from_rolling_stock(c, p)
+                sell_btn.clicked.connect(make_sell_handler(car, player))
+                railcar_layout.addWidget(sell_btn)
                 railcar_layout.addStretch()
                 railcar_widget = QWidget()
                 railcar_widget.setLayout(railcar_layout)
@@ -12419,6 +12633,33 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     trainset_layout = QHBoxLayout()
                     trainset_label = QLabel(f"  Trainset {i+1}: {loco_name}, {cars} cars, Capacity: {cap}{assignment_text}")
                     trainset_layout.addWidget(trainset_label)
+                    if line_assignment:
+                        unassign_btn = QPushButton("Unassign")
+                        def make_unassign_handler(t, p):
+                            return lambda: self.on_unassign_trainset_for_trainset(t, p)
+                        unassign_btn.clicked.connect(make_unassign_handler(ts, player))
+                        trainset_layout.addWidget(unassign_btn)
+                        change_line_btn = QPushButton("Change Line")
+                        def make_change_handler(t, p):
+                            return lambda: self.on_change_trainset_line(t, p)
+                        change_line_btn.clicked.connect(make_change_handler(ts, player))
+                        trainset_layout.addWidget(change_line_btn)
+                    else:
+                        assign_btn = QPushButton("Assign to Line")
+                        def make_assign_handler(t, p):
+                            return lambda: self.on_assign_trainset_for_trainset(t, p)
+                        assign_btn.clicked.connect(make_assign_handler(ts, player))
+                        trainset_layout.addWidget(assign_btn)
+                    modify_btn = QPushButton("Modify")
+                    def make_modify_handler(t, p):
+                        return lambda: self.on_modify_trainset_for_trainset(t, p)
+                    modify_btn.clicked.connect(make_modify_handler(ts, player))
+                    trainset_layout.addWidget(modify_btn)
+                    sell_btn = QPushButton("Sell")
+                    def make_sell_handler(t, p):
+                        return lambda: self.on_sell_trainset_from_rolling_stock(t, p)
+                    sell_btn.clicked.connect(make_sell_handler(ts, player))
+                    trainset_layout.addWidget(sell_btn)
                     trainset_layout.addStretch()
                     trainset_widget = QWidget()
                     trainset_widget.setLayout(trainset_layout)
@@ -12447,6 +12688,16 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 loco_layout = QHBoxLayout()
                 loco_label = QLabel(f"  {loco_name} (self-contained trainset)")
                 loco_layout.addWidget(loco_label)
+                create_ts_btn = QPushButton("Create Trainset")
+                def make_create_handler(l, p):
+                    return lambda: self.on_create_trainset_from_locomotive(l, p)
+                create_ts_btn.clicked.connect(make_create_handler(loco, player))
+                loco_layout.addWidget(create_ts_btn)
+                sell_btn = QPushButton("Sell")
+                def make_sell_handler(l, p):
+                    return lambda: self.on_sell_locomotive_from_rolling_stock(l, p)
+                sell_btn.clicked.connect(make_sell_handler(loco, player))
+                loco_layout.addWidget(sell_btn)
                 loco_layout.addStretch()
                 loco_widget = QWidget()
                 loco_widget.setLayout(loco_layout)
@@ -12457,6 +12708,16 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 loco_layout = QHBoxLayout()
                 loco_label = QLabel(f"  {loco_name}")
                 loco_layout.addWidget(loco_label)
+                create_ts_btn = QPushButton("Create Trainset")
+                def make_create_handler(l, p):
+                    return lambda: self.on_create_trainset_from_locomotive(l, p)
+                create_ts_btn.clicked.connect(make_create_handler(loco, player))
+                loco_layout.addWidget(create_ts_btn)
+                sell_btn = QPushButton("Sell")
+                def make_sell_handler(l, p):
+                    return lambda: self.on_sell_locomotive_from_rolling_stock(l, p)
+                sell_btn.clicked.connect(make_sell_handler(loco, player))
+                loco_layout.addWidget(sell_btn)
                 loco_layout.addStretch()
                 loco_widget = QWidget()
                 loco_widget.setLayout(loco_layout)
