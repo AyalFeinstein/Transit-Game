@@ -9,3 +9,9 @@ remove.*
 nyc_historical_roads_osm_generated.json.*
 .gitignore.*
 .__pycache__*
+__pycache__/
+*.pyc
+savegames/
+nyc_historical_roads_osm_generated.json
+nyc_historical_roads_osm_generated.py
+nyc_road_spatial_index.pkl
