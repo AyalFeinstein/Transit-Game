@@ -1,7 +1,7 @@
 #!/bin/bash
-# Quick start script for TransitGame server
+# Quick start script for GoCommuter server
 
-echo "Starting TransitGame Server..."
+echo "Starting GoCommuter Server..."
 echo "Server will run on port 8080 (or specify port as argument)"
 echo "Press Ctrl+C to stop the server"
 echo ""

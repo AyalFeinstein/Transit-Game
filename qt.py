@@ -96,7 +96,7 @@ class LineCreationWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Railroad Baron")
+        self.setWindowTitle("GoCommuter")
         self.setGeometry(100, 100, 800, 600)
         central_widget = QWidget()
         central_layout = QVBoxLayout()
@@ -867,7 +867,7 @@ class MainWindow(QMainWindow):
             rules_browser.setPlainText(
                 "# Game Rules\n\n"
                 "Please create a RULES.md or GAME_RULES.md file in the game directory to display game rules here.\n\n"
-                "The file should contain markdown-formatted text explaining the rules of the Transit Game."
+                "The file should contain markdown-formatted text explaining the rules of GoCommuter."
             )
         
         rules_layout.addWidget(rules_browser)
@@ -6553,7 +6553,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>Railroad Baron Map</title>
+    <title>GoCommuter Map</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

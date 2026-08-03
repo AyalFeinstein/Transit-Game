@@ -1,4 +1,4 @@
-"""NYC-specific historical events for the Transit Game"""
+"""NYC-specific historical events for GoCommuter"""
 
 from events import GameEvent
 try:

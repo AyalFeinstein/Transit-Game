@@ -17,7 +17,7 @@ from game_presets import (
     LINE_NIMBY_ELEVATION_CHANCE_MULTIPLIER,
     LINE_NIMBY_LAWSUIT_BASE_CHANCE,
     STARTING_MONEY,
-    STATION_MAX_WATER_DISTANCE_TO_LAND_M,
+    STATION_MAX_DISTANCE_FROM_LAND_M,
     FERRY_MAX_DISTANCE_FROM_WATER_M,
 )
 
@@ -451,13 +451,13 @@ class LineBuildMixin:
             )
 
     def _require_station_not_in_deep_water(self, game_map, grid_x: float, grid_y: float) -> None:
-        """Stations in water must be within STATION_MAX_WATER_DISTANCE_TO_LAND_M of land."""
+        """Stations in water must be within STATION_MAX_DISTANCE_FROM_LAND_M of land."""
         preset_name = getattr(game_map, "map_preset_name", None)
         from map_preset_loader import preset_has_water_areas
         if not (preset_name and preset_has_water_areas(preset_name)):
             return
         gx, gy = float(grid_x), float(grid_y)
-        max_m = float(STATION_MAX_WATER_DISTANCE_TO_LAND_M)
+        max_m = float(STATION_MAX_DISTANCE_FROM_LAND_M)
         ts = getattr(game_map, "tile_system", None)
         if ts and hasattr(ts, "is_point_in_water"):
             try:
@@ -1777,6 +1777,13 @@ class LineBuildMixin:
             extend_from_end,
             elevation_levels,
                 is_bus_line=is_bus_line,
+            existing_route=existing_route,
+            existing_elevation_levels=(
+                _collect_route_elevation_levels_from_build_queue(
+                    line_name, self.get_build_queue(),
+                )
+                if line is None else None
+            ),
         )
         if not is_ferry_line:
             street_check = _validate_land_line_route_for_build(
@@ -1894,16 +1901,23 @@ class LineBuildMixin:
                 route = route_points
 
         ext_builds = []
-        for build in build_queue:
+        for qi, build in enumerate(build_queue):
             if build.get('type') != 'line_extension':
                 continue
             data = build.get('data', {})
             if data.get('line_name') != line_name:
                 continue
-            ext_builds.append((data.get('segment_index', 0), data.get('points', []), data.get('extend_from_end', True)))
-        ext_builds.sort(key=lambda x: x[0])
+            ext_order = int(data.get('extension_order', qi))
+            seg_idx = int(data.get('segment_index', 0) or 0)
+            ext_builds.append((
+                ext_order,
+                seg_idx,
+                data.get('points', []),
+                data.get('extend_from_end', True),
+            ))
+        ext_builds.sort(key=lambda x: (x[0], x[1]))
 
-        for _seg_idx, ext_pts, extend_from_end in ext_builds:
+        for _ext_order, _seg_idx, ext_pts, extend_from_end in ext_builds:
             if not ext_pts:
                 continue
             ext_pts = [_pt(p) for p in ext_pts]
@@ -1924,6 +1938,19 @@ class LineBuildMixin:
             else:
                 route = route + ext_pts
         return route
+
+    def get_extension_attach_endpoints(self, line_name: str) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+        """Grid endpoints of the full route (built line + pending extensions)."""
+        route = self.get_line_route_including_extensions(line_name)
+        if not route:
+            return (None, None)
+
+        def _pt(p):
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                return (float(p[0]), float(p[1]))
+            return (float(getattr(p, 'x', 0)), float(getattr(p, 'y', 0)))
+
+        return (_pt(route[0]), _pt(route[-1]))
 
     def extension_attach_from_closest_end(self, line_name: str, click_point: tuple) -> bool:
         """Pick route end vs start by proximity to the first extension click."""

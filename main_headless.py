@@ -6,7 +6,7 @@ from map_preset_loader import list_available_presets, get_map_display_name
 
 
 def main():
-    print("Transit Game - Headless Mode")
+    print("GoCommuter - Headless Mode")
     print("Available maps:", list_available_presets())
     for name in list_available_presets():
         display = get_map_display_name(name) or name

@@ -397,7 +397,7 @@ def _write_default_ruleset_files(dest: Path, name: str) -> None:
         else:
             (dest / src_name).write_text(f"# {src_name}\n\nEdit this file for ruleset '{name}'.\n", encoding="utf-8")
     (dest / "ruleset.json").write_text(
-        json.dumps({"name": name, "description": "Default TransitGame ruleset."}, indent=2),
+        json.dumps({"name": name, "description": "Default GoCommuter ruleset."}, indent=2),
         encoding="utf-8",
     )
     _migrate_ruleset_json_catalog(dest)

@@ -2266,6 +2266,103 @@ class TestQTFunctions(unittest.TestCase):
         self.assertGreaterEqual(len(pending[0]['points']), 2)
         self.assertNotEqual(built[0]['points'], pending[0]['points'])
 
+    def test_build_map_lines_overlay_open_end_extension_no_loop(self):
+        """Pending end-extension overlay must not include a segment back to route start."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(["P1"], 50, 50, 50000, map_preset_name="standard")
+        player = ops.get_players()[0]
+        line = ops.game.create_line("Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)])
+        player.acquire_line(line)
+        ops.game.get_map().add_line(line)
+        ops.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 5.0), (25.0, 8.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+
+        w = MainWindow.__new__(MainWindow)
+        w.operations = ops
+        lines_data = w._build_map_lines_overlay_data(ops.get_map())
+        pending = [
+            entry for entry in lines_data
+            if entry.get('name') == 'Main' and entry.get('under_construction')
+        ]
+        self.assertEqual(len(pending), 1)
+        pts = pending[0]['points']
+        self.assertGreaterEqual(len(pts), 2)
+        self.assertNotEqual(pts[0], pts[-1])
+
+    def test_build_map_lines_overlay_splits_at_gap(self):
+        """Split line with gap must render two solid polylines, no diagonal chord."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(["P1"], 50, 50, 50000, map_preset_name="standard")
+        player = ops.get_players()[0]
+        gap_route = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0), (16.0, 10.0), (17.0, 10.0)]
+        line = ops.game.create_line("Interborough", player, gap_route)
+        player.acquire_line(line)
+        ops.game.get_map().add_line(line)
+
+        w = MainWindow.__new__(MainWindow)
+        w.operations = ops
+        lines_data = w._build_map_lines_overlay_data(ops.get_map())
+        built = [
+            entry for entry in lines_data
+            if entry.get('name') == 'Interborough' and not entry.get('under_construction')
+        ]
+        self.assertEqual(len(built), 2)
+        for entry in built:
+            self.assertGreaterEqual(len(entry['points']), 2)
+
+    def test_build_map_lines_overlay_incomplete_bridge_segment(self):
+        """Incomplete bridge segment shows dashed; built ends stay separate."""
+        from operations import Operations
+        from qt_networked import MainWindow
+
+        ops = Operations(["P1"], 50, 50, 50000, map_preset_name="standard")
+        player = ops.get_players()[0]
+        route = [
+            (10.0, 10.0), (11.0, 10.0), (12.0, 10.0),
+            (13.0, 10.0), (14.0, 10.0), (15.0, 10.0),
+            (16.0, 10.0), (17.0, 10.0),
+        ]
+        line = ops.game.create_line("Bridge Line", player, route)
+        player.acquire_line(line)
+        ops.game.get_map().add_line(line)
+        ops.add_to_build_queue(
+            'line',
+            {
+                'name': 'Bridge Line',
+                'points': [(12.0, 10.0), (13.0, 10.0), (14.0, 10.0), (15.0, 10.0)],
+                'segment_index': 2,
+                'total_segments': 4,
+                'elevation_levels': ['street', 'street', 'street'],
+            },
+            player,
+            0,
+        )
+
+        w = MainWindow.__new__(MainWindow)
+        w.operations = ops
+        lines_data = w._build_map_lines_overlay_data(ops.get_map())
+        bridge_entries = [e for e in lines_data if e.get('name') == 'Bridge Line']
+        built = [e for e in bridge_entries if not e.get('under_construction')]
+        pending = [e for e in bridge_entries if e.get('under_construction')]
+        self.assertEqual(len(built), 2)
+        self.assertEqual(len(pending), 1)
+
     def test_ai_progress_schedules_map_refresh_during_end_year(self):
         """AI line builds schedule debounced map refresh even during end-year sequence."""
         from qt_networked import MainWindow
@@ -2332,6 +2429,12 @@ class TestHumanLineCreationUI(unittest.TestCase):
             self.assertIn("marker.on('click', function(ev)", html)
             self.assertIn("removeLinePointAtIndex(marker._linePointIndex)", html)
             self.assertIn("removeExtendPointAtIndex(marker._extendPointIndex)", html)
+            self.assertIn("resolveExtensionAttachEndpoints", html)
+            self.assertIn("extensionAttachStart", html)
+            self.assertIn("updateCreatePreviewLine", html)
+            self.assertIn("updateExtendPreviewLine", html)
+            self.assertIn("extensionAttachFromEnd", html)
+            self.assertIn("extendFromEnd: window.extensionAttachFromEnd", html)
             # Middle-click still supports proximity removal on the map.
             self.assertIn("findNearestRoutePointIndex", html)
         finally:

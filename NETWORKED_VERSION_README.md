@@ -1,4 +1,4 @@
-# Networked Version of TransitGame
+# Networked Version of GoCommuter
 
 ## Overview
 

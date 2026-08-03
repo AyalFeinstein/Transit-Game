@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Game server for TransitGame multiplayer networking
+Game server for GoCommuter multiplayer networking
 Uses aiohttp + python-socketio for WebSocket-based communication
 """
 import asyncio
@@ -82,7 +82,7 @@ async def connect(sid, environ):
     """Handle client connection"""
     print(f"Client connected: {sid}")
     connected_clients.add(sid)
-    await sio.emit('connected', {'message': 'Connected to TransitGame server'}, room=sid)
+    await sio.emit('connected', {'message': 'Connected to GoCommuter server'}, room=sid)
     # Send current game settings to new client
     await sio.emit('settings_updated', game_settings, room=sid)
 
@@ -937,7 +937,7 @@ if __name__ == '__main__':
     # Default port
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     
-    print(f"Starting TransitGame server on port {port}")
+    print(f"Starting GoCommuter server on port {port}")
     print("Server will accept connections from clients")
     print(f"Server listening on all interfaces (0.0.0.0:{port})")
     print(f"Connect from other devices using: http://<server_ip>:{port}")

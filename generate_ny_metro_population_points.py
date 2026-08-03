@@ -477,7 +477,7 @@ def _overpass_natural_water_elements() -> list[dict]:
     for url in endpoints:
         try:
             req = urllib.request.Request(
-                url, data=data, headers={"User-Agent": "TransitGame/1.0"},
+                url, data=data, headers={"User-Agent": "GoCommuter/1.0"},
             )
             with urllib.request.urlopen(req, timeout=150) as resp:
                 payload = json.load(resp)

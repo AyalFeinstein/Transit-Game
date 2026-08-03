@@ -155,6 +155,8 @@ SCHEDULE_OPERATING_COST_PER_TRAIN_HOUR = 0.004
 
 # Applied to all construction costs (line creation, extension, stations, upgrades, ferries).
 CONSTRUCTION_COST_MULTIPLIER = 2.0
+# Default line-revenue multiplier for new games (1.0 = full fare revenue; lower = tighter economy).
+DEFAULT_PROFIT_MARGIN = 0.75
 
 # Schedule / traversal physics (hours added per station stop; terminal turnaround per round trip).
 STATION_DWELL_MINUTES_PER_STOP = 1.5
@@ -172,7 +174,7 @@ MIN_TRAIN_TURN_RADIUS_GRID = 0.035
 ROUTE_TURN_CHECK_MIN_SEGMENT_GRID = 0.025
 
 # Stations placed in water must be within this distance of land (meters).
-STATION_MAX_WATER_DISTANCE_TO_LAND_M = 30.0
+STATION_MAX_DISTANCE_FROM_LAND_M = 60.0
 # Ferry routes and terminals may be on land but must stay within this distance of water (meters).
 FERRY_MAX_DISTANCE_FROM_WATER_M = 100.0
 

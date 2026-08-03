@@ -622,7 +622,7 @@ class OSMTileSystem:
         # For other cases (skip_osm=True), return False to be conservative
         return False
 
-    def is_point_near_land(self, x: float, y: float, max_distance_m: float = 30.0, skip_osm: bool = False) -> bool:
+    def is_point_near_land(self, x: float, y: float, max_distance_m: float = 60.0, skip_osm: bool = False) -> bool:
         """True if the point is on land or within max_distance_m of a non-water tile."""
         in_water = False
         try:

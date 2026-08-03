@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Main entry point for networked Railroad Baron (alias for main.py)"""
+"""Main entry point for networked GoCommuter (alias for main.py)"""
 import sys
 from PyQt6.QtWidgets import QApplication, QDialog
 from qt_networked import NetworkedMainWindow, GameModeDialog, MainWindow

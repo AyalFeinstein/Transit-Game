@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Client-side networking module for TransitGame
+Client-side networking module for GoCommuter
 Handles connection to game server and message passing
 """
 import asyncio

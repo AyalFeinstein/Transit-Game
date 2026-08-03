@@ -1,7 +1,7 @@
-# Transit Game Rules
+# GoCommuter Rules
 
 ## Introduction and overview
-Transit Game is a strategic transportation simulation where you build and operate transit lines for profit. You connect population and demand with stations and rolling stock, manage money, workers, government, and events, and try to stay solvent to the end of the timeline. The default campaign spans **1830–2050**, so technology, competition, and costs evolve across the full modern transit era.
+GoCommuter is a strategic transportation simulation where you build and operate transit lines for profit. You connect population and demand with stations and rolling stock, manage money, workers, government, and events, and try to stay solvent to the end of the timeline. The default campaign spans **1830–2050**, so technology, competition, and costs evolve across the full modern transit era.
 
 ## Objective
 Build profitable transit lines by connecting population centers with stations and operating trainsets. Manage your finances, workers, and infrastructure to maximize profits while avoiding bankruptcy.

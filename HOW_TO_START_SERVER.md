@@ -1,8 +1,8 @@
-# How to Start the TransitGame Server
+# How to Start the GoCommuter Server
 
 ## Quick Start
 
-1. **Open a terminal** in the TransitGame directory
+1. **Open a terminal** in the project directory
 
 2. **Start the server:**
    ```bash
@@ -16,7 +16,7 @@
 
 3. **You should see:**
    ```
-   Starting TransitGame server on port 8080
+   Starting GoCommuter server on port 8080
    Server will accept connections from clients
    ```
 

@@ -1,7 +1,7 @@
 # Test Suite Summary
 
 ## Overview
-Comprehensive unit tests have been created to verify all recent changes and critical functionality in the TransitGame codebase.
+Comprehensive unit tests have been created to verify all recent changes and critical functionality in the GoCommuter codebase.
 
 ## Test Files Created
 

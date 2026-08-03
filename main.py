@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Main entry point for Railroad Baron - uses qt_networked for local and networked play"""
+"""Main entry point for GoCommuter - uses qt_networked for local and networked play"""
 import logging
 import os
 import sys
 
 
 def _configure_logging() -> None:
-    """Enable console logging; use TRANSITGAME_LOG_LEVEL=DEBUG (default when --debug)."""
+    """Enable console logging; use GOCOMMUTER_LOG_LEVEL=DEBUG (default when --debug)."""
     if '--debug' in sys.argv:
         sys.argv = [a for a in sys.argv if a != '--debug']
-        os.environ.setdefault('TRANSITGAME_LOG_LEVEL', 'DEBUG')
-    level_name = os.environ.get('TRANSITGAME_LOG_LEVEL', 'INFO').upper()
+        os.environ.setdefault('GOCOMMUTER_LOG_LEVEL', 'DEBUG')
+    level_name = os.environ.get(
+        'GOCOMMUTER_LOG_LEVEL',
+        os.environ.get('TRANSITGAME_LOG_LEVEL', 'INFO'),
+    ).upper()
     level = getattr(logging, level_name, logging.INFO)
     if not logging.root.handlers:
         logging.basicConfig(

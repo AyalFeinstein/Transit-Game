@@ -68,7 +68,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QColor, QPalette, QPainter, QPen, QBrush, QFont, QAction, QPixmap, QIcon
 from PyQt6.QtCore import Qt, QRectF, QPointF, QObject, QEvent
 from operations import Operations
-from game_presets import STARTING_MONEY
+from game_presets import DEFAULT_PROFIT_MARGIN, STARTING_MONEY
 from inflation_utils import get_inflation_factor
 # Vehicle imports removed - using dynamic registry system instead
 from vehicle import Locomotive, Railcar, Trainset, Ferry, Bus
@@ -308,7 +308,7 @@ def _install_osm_tile_interceptor():
 
 def _get_map_html_file_path(player_id: int) -> Path:
     """Return path for map HTML file. Loading from local file enables OSM tile requests (LocalContentCanAccessRemoteUrls)."""
-    return Path(tempfile.gettempdir()) / f"transitgame_map_{player_id}.html"
+    return Path(tempfile.gettempdir()) / f"gocommuter_map_{player_id}.html"
 
 
 def _write_map_html_for_osm(player_id: int, html_content: str) -> Path | None:
@@ -316,7 +316,7 @@ def _write_map_html_for_osm(player_id: int, html_content: str) -> Path | None:
     Always use file-based load so OSM tiles display; never fall back to setHtml which blocks tiles."""
     for path in [
         _get_map_html_file_path(player_id),
-        Path(__file__).resolve().parent / f"transitgame_map_{player_id}.html",
+        Path(__file__).resolve().parent / f"gocommuter_map_{player_id}.html",
     ]:
         try:
             path.write_text(html_content, encoding="utf-8")
@@ -347,7 +347,7 @@ def _create_map_web_view_profile():
     """Create a QWebEngineProfile configured for map tile loading. Profile must exist before any load."""
     if not WEBENGINE_AVAILABLE or QWebEngineProfile is None:
         return None
-    profile = QWebEngineProfile("TransitGameMap", None)  # Named profile for persistent cache
+    profile = QWebEngineProfile("GoCommuterMap", None)  # Named profile for persistent cache
     profile.setHttpUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     profile.setHttpAcceptLanguage("en-US,en;q=0.9")
     if OSMUrlRequestInterceptor is not None:
@@ -713,7 +713,7 @@ class GovernmentChamberWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Railroad Baron")
+        self.setWindowTitle("GoCommuter")
         apply_application_logo(self)
         self.setGeometry(100, 100, 800, 600)
         # Constrain window to never extend beyond screen
@@ -1726,10 +1726,13 @@ class MainWindow(QMainWindow):
         self.profit_margin_spin = QDoubleSpinBox()
         self.profit_margin_spin.setMinimum(0.25)
         self.profit_margin_spin.setMaximum(5.0)
-        self.profit_margin_spin.setValue(1.0)
+        from game_presets import DEFAULT_PROFIT_MARGIN as _DEFAULT_PROFIT_MARGIN
+        self.profit_margin_spin.setValue(_DEFAULT_PROFIT_MARGIN)
         self.profit_margin_spin.setSingleStep(0.25)
         self.profit_margin_spin.setDecimals(2)
-        self.profit_margin_spin.setToolTip("Multiplier applied to line revenue (1.0 = default). Lower = harder economy.")
+        self.profit_margin_spin.setToolTip(
+            f"Multiplier applied to line revenue ({_DEFAULT_PROFIT_MARGIN} = default). Lower = harder economy."
+        )
         profit_margin_layout.addWidget(self.profit_margin_spin)
         game_settings_layout.addLayout(profit_margin_layout)
         game_settings_layout.addWidget(QLabel("Mergers:"))
@@ -2007,7 +2010,7 @@ class MainWindow(QMainWindow):
         merge_ai_human_enabled = getattr(self, 'merge_ai_human_checkbox', None) and self.merge_ai_human_checkbox.isChecked()
         merge_human_human_enabled = getattr(self, 'merge_human_human_checkbox', None) and self.merge_human_human_checkbox.isChecked()
         inflation_rate = self.inflation_rate_spin.value() if hasattr(self, 'inflation_rate_spin') else 1.0
-        profit_margin = self.profit_margin_spin.value() if hasattr(self, 'profit_margin_spin') else 1.0
+        profit_margin = self.profit_margin_spin.value() if hasattr(self, 'profit_margin_spin') else DEFAULT_PROFIT_MARGIN
         ai_min_population = self.ai_min_population_spin.value() if hasattr(self, 'ai_min_population_spin') else 100
         self.start_game_with_players(
             names, map_width, map_height, starting_money, worker_replenishment_rate,
@@ -2047,7 +2050,7 @@ class MainWindow(QMainWindow):
         self.get_player_info_button.clicked.connect(self.on_player_info_button_clicked)
         self.info_layout.addWidget(self.get_player_info_button)
 
-    def start_game_with_players(self, player_names: list[str], map_width: int = 100, map_height: int = 100, starting_money: int = 50000, worker_replenishment_rate: float = 1.0, natural_disaster_frequency: float = 1.0, marketplace_years_visible: int = None, line_build_speed_multiplier: float = None, construction_cost_multiplier: float = None, marketplace_bulk_discount_percent: float = None, marketplace_bulk_discount_threshold: int = None, marketplace_railcars_per_player_factor: float = None, ai_player_indices: list[int] = None, ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, ai_watch_enabled: bool = False, ai_debug_notifications_enabled: bool = True, random_ai_spawn_enabled: bool = True, random_ai_spawn_interval_years: int = 30, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = 1.0, default_ai_difficulty_for_spawns: str = None, ai_min_population: int = 100, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None, war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None):
+    def start_game_with_players(self, player_names: list[str], map_width: int = 100, map_height: int = 100, starting_money: int = 50000, worker_replenishment_rate: float = 1.0, natural_disaster_frequency: float = 1.0, marketplace_years_visible: int = None, line_build_speed_multiplier: float = None, construction_cost_multiplier: float = None, marketplace_bulk_discount_percent: float = None, marketplace_bulk_discount_threshold: int = None, marketplace_railcars_per_player_factor: float = None, ai_player_indices: list[int] = None, ai_focus_per_player: dict = None, ai_difficulty_per_player: dict = None, ai_watch_enabled: bool = False, ai_debug_notifications_enabled: bool = True, random_ai_spawn_enabled: bool = True, random_ai_spawn_interval_years: int = 30, merge_enabled: bool = True, merge_ai_ai_enabled: bool = True, merge_ai_human_enabled: bool = True, merge_human_human_enabled: bool = True, inflation_rate: float = 1.0, profit_margin: float = DEFAULT_PROFIT_MARGIN, default_ai_difficulty_for_spawns: str = None, ai_min_population: int = 100, merge_ai_healthy_profit_threshold_pct: float = 25.0, merge_ai_reject_chance_pct: float = 90.0, merge_ai_min_turns_to_live_for_accept: int = 10, merge_ai_min_years_before_consider: int = None, merge_ai_auto_fail_first_n_years: int = None, war_start_chance_per_year: float = None, war_end_chance_per_year: float = None, war_worker_draft_chance_per_year: float = None, war_new_worker_cost_multiplier: float = None):
         # Map selection from dynamic preset discovery (map type combo)
         combo_index = self.map_type_combo.currentIndex()
         map_preset_name = self._map_preset_names[combo_index] if combo_index < len(self._map_preset_names) else "standard"
@@ -2782,7 +2785,7 @@ class MainWindow(QMainWindow):
             return spin
 
         inflation_spin = _add_double_row(economy_layout, "Inflation rate:", current.get('inflation_rate', 1.0), 0.25, 3.0, 0.25)
-        profit_spin = _add_double_row(economy_layout, "Profit margin:", current.get('profit_margin', 1.0), 0.25, 5.0, 0.25)
+        profit_spin = _add_double_row(economy_layout, "Profit margin:", current.get('profit_margin', DEFAULT_PROFIT_MARGIN), 0.25, 5.0, 0.25)
         replen_spin = _add_double_row(economy_layout, "Worker replenishment:", current.get('worker_replenishment_rate', 1.0), 0.1, 5.0, 0.1, 1)
         disaster_spin = _add_double_row(economy_layout, "Disaster frequency:", current.get('natural_disaster_frequency', 1.0), 0.1, 5.0, 0.1, 1)
         build_speed_spin = _add_double_row(economy_layout, "Line build speed:", current.get('line_build_speed_multiplier', 1.0), 0.5, 5.0, 0.1, 1)
@@ -4721,29 +4724,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "A line must have at least 2 points")
                 return
 
-            segment_specs = self.operations.get_line_creation_elevation_specs(points)
-            elevation_levels = self._prompt_route_elevation_levels(
-                segment_specs, parent=points_dialog,
-            )
-            if elevation_levels is None:
-                return
-
             try:
-                cost_info = self.operations.calculate_line_cost(points, elevation_levels)
-            except Exception as e:
-                QMessageBox.warning(self, "Error", str(e))
-                return
-
-            reply = QMessageBox.question(self, "Confirm Line Creation",
-                                         f"Creating this line will cost ${cost_info['cost']} (distance: {cost_info['length']:.2f} units). Proceed?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
-            try:
-                result = self.operations.create_line_complete(line_name, points, current_player, elevation_levels)
-                if result and result.get('success') is False:
-                    QMessageBox.warning(self, "Cannot Create Line", result.get('error_message', 'Unknown error'))
+                result = self._human_create_line_with_elevation_prompt(
+                    line_name, points, current_player, parent=points_dialog,
+                )
+                if result is None or result.get('success') is False:
                     return
                 self.check_and_eliminate_player(current_player)
                 self.add_message(f"Line '{line_name}' construction started.")
@@ -4827,6 +4812,8 @@ class MainWindow(QMainWindow):
         is_bus_line: bool = False,
         parent=None,
         title: str = "Select Elevation Levels",
+        initial_elevation_levels: list = None,
+        invalid_segment_indices: set = None,
     ):
         """Prompt for one elevation per spec. Returns list or None if cancelled."""
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QHBoxLayout, QComboBox, QPushButton, QScrollArea, QWidget
@@ -4834,13 +4821,20 @@ class MainWindow(QMainWindow):
 
         if not segment_specs:
             return []
+        invalid = set(invalid_segment_indices or [])
         dlg_parent = parent if parent is not None else self
         elev_dlg = QDialog(dlg_parent)
         elev_dlg.setWindowTitle(title)
         elev_dlg.setGeometry(300, 300, 400, min(600, 180 + len(segment_specs) * 50))
         elev_layout = QVBoxLayout()
         elev_layout.addWidget(QLabel(f"Select elevation for each of {len(segment_specs)} segment(s):"))
-        elev_layout.addWidget(QLabel("Over-water segments: above-ground or underground only (default above-ground)."))
+        if invalid:
+            elev_layout.addWidget(QLabel(
+                "Highlighted segment(s) must follow streets at street/above-ground level, "
+                "or use underground to tunnel off-road."
+            ))
+        else:
+            elev_layout.addWidget(QLabel("Over-water segments: above-ground or underground only (default above-ground)."))
         all_row = QHBoxLayout()
         all_row.addWidget(QLabel("Apply to all:"))
         all_combo = QComboBox()
@@ -4870,14 +4864,23 @@ class MainWindow(QMainWindow):
         elev_scroll.setWidget(elev_widget)
         elev_layout.addWidget(elev_scroll)
 
-        for spec in segment_specs:
-            elev_widget_layout.addWidget(QLabel(spec['label']))
+        for i, spec in enumerate(segment_specs):
+            label_text = spec['label']
+            if i in invalid:
+                label_text += " — off-road at street/above-ground (use underground or reroute)"
+            elev_widget_layout.addWidget(QLabel(label_text))
             choices, default = self.operations.get_segment_elevation_options(
                 spec['p1'], spec['p2'], is_bus_line=is_bus_line,
             )
             combo = QComboBox()
             combo.addItems(choices)
-            combo.setCurrentText(default if default in choices else choices[0])
+            initial = None
+            if initial_elevation_levels and i < len(initial_elevation_levels):
+                initial = initial_elevation_levels[i]
+            if initial and initial in choices:
+                combo.setCurrentText(initial)
+            else:
+                combo.setCurrentText(default if default in choices else choices[0])
             elev_widget_layout.addWidget(combo)
             elevation_combos.append(combo)
 
@@ -4894,6 +4897,148 @@ class MainWindow(QMainWindow):
         if elev_dlg.exec() != QDialog.DialogCode.Accepted:
             return None
         return [combo.currentText() for combo in elevation_combos]
+
+    def _is_street_elevation_validation_error(self, error_message: str) -> bool:
+        msg = (error_message or '').lower()
+        return (
+            'not on a road' in msg
+            or 'follow streets' in msg
+            or 'street network' in msg
+            or 'leaves the street' in msg
+        )
+
+    def _human_create_line_with_elevation_prompt(
+        self,
+        line_name: str,
+        points: list,
+        player,
+        *,
+        is_ferry_line: bool = False,
+        is_bus_line: bool = False,
+        parent=None,
+    ):
+        """Prompt elevations and create a line; preserve per-segment choices on street errors."""
+        from PyQt6.QtWidgets import QMessageBox
+
+        dlg_parent = parent if parent is not None else self
+        initial_elevations = None
+        invalid_indices = set()
+        while True:
+            if is_ferry_line:
+                elevation_levels = ['water'] * (len(points) - 1)
+            else:
+                segment_specs = self.operations.get_line_creation_elevation_specs(points)
+                elevation_levels = self._prompt_route_elevation_levels(
+                    segment_specs,
+                    is_bus_line=is_bus_line,
+                    parent=dlg_parent,
+                    initial_elevation_levels=initial_elevations,
+                    invalid_segment_indices=invalid_indices or None,
+                )
+                if elevation_levels is None:
+                    return None
+            try:
+                cost_info = self.operations.calculate_line_cost(
+                    points,
+                    list(elevation_levels),
+                    is_bus_line=is_bus_line,
+                    is_ferry_line=is_ferry_line,
+                )
+            except Exception as e:
+                QMessageBox.warning(dlg_parent, "Error", str(e))
+                return None
+
+            reply = QMessageBox.question(
+                dlg_parent, "Confirm Line Creation",
+                f"Creating this line will cost ${cost_info['cost']} "
+                f"(distance: {cost_info['length']:.2f} units). Proceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return None
+
+            result = self.operations.create_line_complete(
+                line_name, points, player, list(elevation_levels),
+                is_ferry_line=is_ferry_line, is_bus_line=is_bus_line, cost_info=cost_info,
+            )
+            if not result or result.get('success') is not False:
+                return result
+            error_message = result.get('error_message', 'Unknown error')
+            if self._is_street_elevation_validation_error(error_message):
+                invalid_indices = set(result.get('invalid_segment_indices') or [])
+                initial_elevations = list(elevation_levels)
+                QMessageBox.warning(dlg_parent, "Cannot Create Line", error_message)
+                continue
+            QMessageBox.warning(dlg_parent, "Cannot Create Line", error_message)
+            return result
+
+    def _human_extend_line_with_elevation_prompt(
+        self,
+        line_name: str,
+        player,
+        new_points: list,
+        extend_from_end: bool,
+        *,
+        is_ferry_line: bool = False,
+        is_bus_line: bool = False,
+        parent=None,
+    ):
+        """Prompt elevations and extend a line; preserve per-segment choices on street errors."""
+        from PyQt6.QtWidgets import QMessageBox
+
+        dlg_parent = parent if parent is not None else self
+        initial_elevations = None
+        invalid_indices = set()
+        while True:
+            if is_ferry_line:
+                segment_specs = self.operations.get_extension_elevation_specs(
+                    line_name, new_points, extend_from_end,
+                )
+                elevation_levels = ['water'] * len(segment_specs)
+            else:
+                segment_specs = self.operations.get_extension_elevation_specs(
+                    line_name, new_points, extend_from_end,
+                )
+                elevation_levels = self._prompt_route_elevation_levels(
+                    segment_specs,
+                    is_bus_line=is_bus_line,
+                    parent=dlg_parent,
+                    initial_elevation_levels=initial_elevations,
+                    invalid_segment_indices=invalid_indices or None,
+                )
+                if elevation_levels is None:
+                    return None
+            try:
+                cost_info = self.operations.calculate_extend_cost(
+                    line_name, new_points, extend_from_end, list(elevation_levels),
+                )
+            except Exception as e:
+                QMessageBox.warning(dlg_parent, "Error", str(e))
+                return None
+
+            reply = QMessageBox.question(
+                dlg_parent, "Confirm Line Extension",
+                f"Extending this line will cost ${cost_info['cost']} "
+                f"(distance: {cost_info['length']:.2f} units). Proceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return None
+
+            result = self.operations.extend_line_complete(
+                line_name, player, new_points, extend_from_end,
+                list(elevation_levels), cost_info=cost_info,
+            )
+            if not result or result.get('success') is not False:
+                return result
+            error_message = result.get('error_message', 'Unknown error')
+            if self._is_street_elevation_validation_error(error_message):
+                invalid_indices = set(result.get('invalid_segment_indices') or [])
+                initial_elevations = list(elevation_levels)
+                QMessageBox.warning(dlg_parent, "Cannot Extend Line", error_message)
+                continue
+            QMessageBox.warning(dlg_parent, "Cannot Extend Line", error_message)
+            return result
 
     def refresh_all_displays(self):
         """Refresh all UI displays. Uses assigned_player for government when in network mode."""
@@ -6625,32 +6770,14 @@ class MainWindow(QMainWindow):
                     line_name, new_points[0],
                 )
 
-                segment_specs = self.operations.get_extension_elevation_specs(
-                    line_name, new_points, extend_from_end,
-                )
-                elevation_levels = self._prompt_route_elevation_levels(
-                    segment_specs, parent=dlg,
-                )
-                if elevation_levels is None:
-                    return
-                
+                is_ferry_line, is_bus_line = self.operations.get_line_build_type_flags(line_name)
                 try:
-                    cost_info = self.operations.calculate_extend_cost(line_name, new_points, extend_from_end, elevation_levels)
-                except Exception as e:
-                    QMessageBox.warning(dlg, "Error", str(e))
-                    return
-                
-                reply = QMessageBox.question(dlg, "Confirm Line Extension",
-                                            f"Extending this line will cost ${cost_info['cost']} (distance: {cost_info['length']:.2f} units). Proceed?",
-                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-                
-                try:
-                    result = self.operations.extend_line_complete(
+                    result = self._human_extend_line_with_elevation_prompt(
                         line_name, current_player, new_points, extend_from_end,
-                        elevation_levels, cost_info=cost_info,
+                        is_ferry_line=is_ferry_line, is_bus_line=is_bus_line, parent=dlg,
                     )
+                    if result is None or result.get('success') is False:
+                        return
                     self.check_and_eliminate_player(current_player)
                     QMessageBox.information(dlg, "Line Extension Started", 
                         f"Extension of line '{result['line_name']}' has been started.\n"
@@ -8584,6 +8711,79 @@ class MainWindow(QMainWindow):
                                 sell_line_combo.addItem(line_name, line)
                                 sell_entire_names_set.add(line_name)
 
+    def _grid_point_to_map_latlon(self, x: float, y: float, game_map) -> list | None:
+        """Convert one grid point to [lat, lon] for map overlay / extension preview."""
+        import math
+        from map_preset_loader import get_map_bounds, get_default_center_lat, get_default_center_lon
+
+        map_width_val = game_map.width if getattr(game_map, 'width', None) else 50
+        map_height_val = game_map.height if getattr(game_map, 'height', None) else 50
+        grid_size = max(map_width_val, map_height_val)
+        preset_name = getattr(game_map, 'map_preset_name', None)
+        preset_bounds = get_map_bounds(preset_name) if preset_name else None
+        use_preset_bounds = preset_bounds and all(
+            k in preset_bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon')
+        )
+        center_lat = (
+            game_map.map_center_lat
+            if hasattr(game_map, 'map_center_lat') and game_map.map_center_lat is not None
+            else get_default_center_lat(preset_name)
+        )
+        center_lon = (
+            game_map.map_center_lon
+            if hasattr(game_map, 'map_center_lon') and game_map.map_center_lon is not None
+            else get_default_center_lon(preset_name)
+        )
+        if use_preset_bounds:
+            preset_min_lat = preset_bounds['min_lat']
+            preset_max_lat = preset_bounds['max_lat']
+            preset_min_lon = preset_bounds['min_lon']
+            preset_max_lon = preset_bounds['max_lon']
+            preset_lat_scale = (preset_max_lat - preset_min_lat) / map_height_val if map_height_val > 0 else 0
+            preset_lon_scale = (preset_max_lon - preset_min_lon) / map_width_val if map_width_val > 0 else 0
+            lat = preset_min_lat + y * preset_lat_scale
+            lon = preset_min_lon + x * preset_lon_scale
+        else:
+            lon_deg_per_km = 111.0 * math.cos(math.radians(center_lat)) or 111.0
+            lat_km = y - grid_size // 2
+            lon_km = x - grid_size // 2
+            lat = center_lat + (lat_km / 111.0)
+            lon = center_lon + (lon_km / lon_deg_per_km)
+        return [lat, lon]
+
+    def _extension_attach_latlon_endpoints(self, line_name: str, game_map) -> tuple[list | None, list | None]:
+        """Lat/lon attach endpoints for extension preview (combined built + pending route)."""
+        if not self.operations or not line_name:
+            return (None, None)
+        start, end = self.operations.get_extension_attach_endpoints(line_name)
+        if start is None or end is None:
+            return (None, None)
+        attach_start = self._grid_point_to_map_latlon(start[0], start[1], game_map)
+        attach_end = self._grid_point_to_map_latlon(end[0], end[1], game_map)
+        return (attach_start, attach_end)
+
+    def _apply_extension_attach_endpoints_to_line_entry(self, entry: dict, line_name: str, game_map) -> None:
+        """Add attach_start/attach_end (lat/lon) from combined route for extension preview."""
+        attach_start, attach_end = self._extension_attach_latlon_endpoints(line_name, game_map)
+        if attach_start and attach_end:
+            entry['attach_start'] = attach_start
+            entry['attach_end'] = attach_end
+
+    def _grid_route_to_map_line_points(self, route, game_map, min_lat, max_lat, min_lon, max_lon) -> list:
+        """Convert a grid-coordinate route to clipped [lat, lon] points for map overlay."""
+        line_points = []
+        for point in route:
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                x, y = float(point[0]), float(point[1])
+            elif hasattr(point, 'x') and hasattr(point, 'y'):
+                x, y = float(point.x), float(point.y)
+            else:
+                continue
+            latlon = self._grid_point_to_map_latlon(x, y, game_map)
+            if latlon and min_lat <= latlon[0] <= max_lat and min_lon <= latlon[1] <= max_lon:
+                line_points.append(latlon)
+        return line_points
+
     def _build_map_lines_overlay_data(self, game_map) -> list:
         """Build line overlay data for lightweight map refresh after line creation."""
         import math
@@ -8609,161 +8809,40 @@ class MainWindow(QMainWindow):
             min_lon, max_lon = center_lon - 0.5, center_lon + 0.5
 
         lines_data = []
-        map_width_val = game_map.width if getattr(game_map, 'width', None) else 50
-        map_height_val = game_map.height if getattr(game_map, 'height', None) else 50
-        grid_size = max(map_width_val, map_height_val)
-        use_preset_bounds = preset_bounds and all(
-            k in preset_bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon')
-        )
-        if use_preset_bounds:
-            preset_min_lat = preset_bounds['min_lat']
-            preset_max_lat = preset_bounds['max_lat']
-            preset_min_lon = preset_bounds['min_lon']
-            preset_max_lon = preset_bounds['max_lon']
-            preset_lat_scale = (preset_max_lat - preset_min_lat) / map_height_val if map_height_val > 0 else 0
-            preset_lon_scale = (preset_max_lon - preset_min_lon) / map_width_val if map_width_val > 0 else 0
-        else:
-            lon_deg_per_km = 111.0 * math.cos(math.radians(center_lat)) or 111.0
+        if self.operations is None:
+            return lines_data
 
-        if hasattr(game_map, 'lines') and game_map.lines and grid_size > 0:
-            for line_name, line in game_map.lines.items():
-                if not hasattr(line, 'get_route'):
-                    continue
-                route = line.get_route()
-                if not route:
-                    continue
-                line_points = []
-                for point in route:
-                    if isinstance(point, (list, tuple)) and len(point) >= 2:
-                        x, y = float(point[0]), float(point[1])
-                    elif hasattr(point, 'x') and hasattr(point, 'y'):
-                        x, y = float(point.x), float(point.y)
-                    else:
-                        continue
-                    if use_preset_bounds:
-                        lat = preset_min_lat + y * preset_lat_scale
-                        lon = preset_min_lon + x * preset_lon_scale
-                    else:
-                        lat_km = y - grid_size // 2
-                        lon_km = x - grid_size // 2
-                        lat = center_lat + (lat_km / 111.0)
-                        lon = center_lon + (lon_km / lon_deg_per_km)
-                    if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                        line_points.append([lat, lon])
-                if len(line_points) >= 2:
-                    owner = self.operations.get_line_owner(line) if self.operations else None
-                    if owner is None or (self.operations and self.operations.is_player_eliminated(owner)):
-                        owner_id = -1
-                    else:
-                        owner_id = self.operations.get_player_id(owner)
-                    line_type = 'train'
-                    try:
-                        from line import Ferry, Bus
-                        if isinstance(line, Ferry):
-                            line_type = 'ferry'
-                        elif isinstance(line, Bus):
-                            line_type = 'bus'
-                    except Exception:
-                        pass
-                    lines_data.append({
-                        'name': line_name,
-                        'points': line_points,
-                        'under_construction': False,
-                        'owner_id': owner_id,
-                        'line_type': line_type,
-                    })
-
-        if grid_size > 0 and self.operations is not None:
-            line_builds_by_name = {}
-            for build in self.operations.get_build_queue():
-                if build.get('type') != 'line':
-                    continue
-                build_data = build.get('data', {})
-                line_name = build_data.get('name')
-                points = build_data.get('points', [])
-                if not line_name or not points:
-                    continue
-                line_points = []
-                for point in points:
-                    if isinstance(point, (list, tuple)) and len(point) >= 2:
-                        x, y = float(point[0]), float(point[1])
-                    elif hasattr(point, 'x') and hasattr(point, 'y'):
-                        x, y = float(point.x), float(point.y)
-                    else:
-                        continue
-                    if use_preset_bounds:
-                        lat = preset_min_lat + y * preset_lat_scale
-                        lon = preset_min_lon + x * preset_lon_scale
-                    else:
-                        lat_km = y - grid_size // 2
-                        lon_km = x - grid_size // 2
-                        lat = center_lat + (lat_km / 111.0)
-                        lon = center_lon + (lon_km / lon_deg_per_km)
-                    if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                        line_points.append([lat, lon])
-                if len(line_points) >= 2:
-                    seg_idx = build_data.get('segment_index', 0)
-                    if line_name not in line_builds_by_name:
-                        lt = 'ferry' if build_data.get('is_ferry_line') else (
-                            'bus' if build_data.get('is_bus_line') else 'train'
-                        )
-                        line_builds_by_name[line_name] = {
-                            'segments': [],
-                            'player': build.get('player'),
-                            'line_type': lt,
-                        }
-                    line_builds_by_name[line_name]['segments'].append((seg_idx, line_points))
-            for line_name, info in line_builds_by_name.items():
-                segments = sorted(info['segments'], key=lambda x: x[0])
-                merged = []
-                for _idx, pts in segments:
-                    for p in pts:
-                        if not merged or merged[-1] != p:
-                            merged.append(p)
-                if len(merged) >= 2:
-                    build_player = info.get('player')
-                    owner_id = self.operations.get_player_id(build_player) if build_player else -1
-                    lines_data.append({
-                        'name': line_name,
-                        'points': merged,
-                        'under_construction': True,
-                        'owner_id': owner_id,
-                        'line_type': info.get('line_type', 'train'),
-                    })
-
-        if grid_size > 0 and self.operations is not None:
-            for ext_info in self.operations.get_pending_line_extension_routes():
-                ext_route = ext_info.get('points') or []
-                if len(ext_route) < 2:
-                    continue
-                line_points = []
-                for point in ext_route:
-                    if isinstance(point, (list, tuple)) and len(point) >= 2:
-                        x, y = float(point[0]), float(point[1])
-                    elif hasattr(point, 'x') and hasattr(point, 'y'):
-                        x, y = float(point.x), float(point.y)
-                    else:
-                        continue
-                    if use_preset_bounds:
-                        lat = preset_min_lat + y * preset_lat_scale
-                        lon = preset_min_lon + x * preset_lon_scale
-                    else:
-                        lat_km = y - grid_size // 2
-                        lon_km = x - grid_size // 2
-                        lat = center_lat + (lat_km / 111.0)
-                        lon = center_lon + (lon_km / lon_deg_per_km)
-                    if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                        line_points.append([lat, lon])
-                if len(line_points) >= 2:
-                    ext_player = ext_info.get('player')
-                    owner_id = self.operations.get_player_id(ext_player) if ext_player else -1
-                    lines_data.append({
-                        'name': ext_info.get('line_name', ''),
-                        'points': line_points,
-                        'under_construction': True,
-                        'owner_id': owner_id,
-                        'line_type': ext_info.get('line_type', 'train'),
-                    })
+        attach_endpoints_applied = set()
+        for entry in self.operations.get_lines_for_map_display():
+            route = entry.get('points') or []
+            if len(route) < 2:
+                continue
+            line_points = self._grid_route_to_map_line_points(
+                route, game_map, min_lat, max_lat, min_lon, max_lon,
+            )
+            if len(line_points) < 2:
+                continue
+            player = entry.get('player')
+            if player is None or self.operations.is_player_eliminated(player):
+                owner_id = -1
+            else:
+                owner_id = self.operations.get_player_id(player)
+            line_name = entry.get('name', '')
+            overlay = {
+                'name': line_name,
+                'points': line_points,
+                'under_construction': bool(entry.get('under_construction')),
+                'owner_id': owner_id,
+                'line_type': entry.get('line_type', 'train'),
+            }
+            lines_data.append(overlay)
+            if (
+                line_name
+                and not overlay['under_construction']
+                and line_name not in attach_endpoints_applied
+            ):
+                self._apply_extension_attach_endpoints_to_line_entry(overlay, line_name, game_map)
+                attach_endpoints_applied.add(line_name)
         return lines_data
 
     def _build_map_stations_overlay_data(self, game_map) -> list:
@@ -9604,39 +9683,6 @@ class MainWindow(QMainWindow):
                         is_ferry_line = (selected_type == 'Ferry Line')
                         is_bus_line = (selected_type == 'Bus Line')
 
-                        if is_ferry_line:
-                            elevation_levels = ['water'] * (len(grid_points) - 1)
-                        else:
-                            segment_specs = self.operations.get_line_creation_elevation_specs(grid_points)
-                            elevation_levels = self._prompt_route_elevation_levels(
-                                segment_specs, is_bus_line=is_bus_line,
-                            )
-                            if elevation_levels is None:
-                                _reenable_finish()
-                                return
-
-                        try:
-                            cost_info = self.operations.calculate_line_cost(
-                                grid_points,
-                                elevation_levels,
-                                is_bus_line=is_bus_line,
-                                is_ferry_line=is_ferry_line,
-                            )
-                        except Exception as e:
-                            QMessageBox.warning(self, "Error", str(e))
-                            _reenable_finish()
-                            return
-
-                        reply = QMessageBox.question(
-                            self, "Confirm Line Creation",
-                            f"Creating this line will cost ${cost_info['cost']} "
-                            f"(distance: {cost_info['length']:.2f} units). Proceed?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        )
-                        if reply != QMessageBox.StandardButton.Yes:
-                            _reenable_finish()
-                            return
-
                         line_creation_timeout_timer = None
 
                         def handle_line_creation_result(res=None, err_occurred=False, err_msg=""):
@@ -9726,14 +9772,14 @@ class MainWindow(QMainWindow):
                             fl_btn = current_player_tabs_dict.get('finish_line_btn')
                             if fl_btn:
                                 fl_btn.setEnabled(False)
-                            # Run on the GUI thread: Operations/map state is not thread-safe and
-                            # background create_line_complete has caused process aborts.
                             try:
-                                res = self.operations.create_line_complete(
-                                    line_name, grid_points, current_player, elevation_levels,
+                                res = self._human_create_line_with_elevation_prompt(
+                                    line_name, grid_points, current_player,
                                     is_ferry_line=is_ferry_line, is_bus_line=is_bus_line,
-                                    cost_info=cost_info,
                                 )
+                                if res is None:
+                                    _reenable_finish()
+                                    return
                                 handle_line_creation_result(res, False, "")
                             except Exception as e:
                                 import traceback
@@ -9792,7 +9838,12 @@ class MainWindow(QMainWindow):
                 page = self._safe_get_webview_page(web_view)
                 if page:
                     import json
-                    js_code = f"window.startLineExtension({json.dumps(selected_line)});"
+                    game_map = self.operations.get_map()
+                    attach_start, attach_end = self._extension_attach_latlon_endpoints(selected_line, game_map)
+                    js_code = (
+                        f"window.startLineExtension({json.dumps(selected_line)}, "
+                        f"{json.dumps(attach_start)}, {json.dumps(attach_end)});"
+                    )
                     page.runJavaScript(js_code)
                     self._set_line_extension_active(current_player_tabs_dict, True)
                     
@@ -9875,6 +9926,13 @@ class MainWindow(QMainWindow):
                                 QMessageBox.warning(self, "Error", "Failed to extend line.")
                                 _reenable_finish_extend()
                                 return
+                            if result.get('success') is False:
+                                QMessageBox.warning(
+                                    self, "Cannot Extend Line",
+                                    result.get('error_message', 'Unknown error'),
+                                )
+                                _reenable_finish_extend()
+                                return
 
                             self.add_message(f"Line '{selected_line}' extension started.")
                             QMessageBox.information(
@@ -9937,48 +9995,7 @@ class MainWindow(QMainWindow):
                                     selected_line, grid_points[0],
                                 )
 
-                            segment_specs = self.operations.get_extension_elevation_specs(
-                                selected_line, grid_points, extend_from_end,
-                            )
                             is_ferry_line, is_bus_line = self.operations.get_line_build_type_flags(selected_line)
-                            if is_ferry_line:
-                                elevation_levels = ['water'] * len(segment_specs)
-                            else:
-                                elevation_levels = self._prompt_route_elevation_levels(
-                                    segment_specs, is_bus_line=is_bus_line,
-                                )
-                            if elevation_levels is None:
-                                _reenable_finish_extend()
-                                return
-
-                            try:
-                                app = QApplication.instance()
-                                if app:
-                                    app.processEvents()
-                                cost_info = self.operations.calculate_extend_cost(
-                                    selected_line, grid_points, extend_from_end, elevation_levels,
-                                )
-                                if app:
-                                    app.processEvents()
-                            except Exception as e:
-                                QMessageBox.warning(self, "Error", str(e))
-                                _reenable_finish_extend()
-                                return
-
-                            if not cost_info:
-                                QMessageBox.warning(self, "Error", "Failed to calculate extension cost.")
-                                _reenable_finish_extend()
-                                return
-
-                            reply = QMessageBox.question(
-                                self, "Confirm Line Extension",
-                                f"Extending this line will cost ${cost_info['cost']} "
-                                f"(distance: {cost_info['length']:.2f} units). Proceed?",
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                            )
-                            if reply != QMessageBox.StandardButton.Yes:
-                                _reenable_finish_extend()
-                                return
 
                             num_segments = max(1, len(grid_points))
                             extension_timeout_timer = None
@@ -9997,14 +10014,16 @@ class MainWindow(QMainWindow):
                                 if app:
                                     app.processEvents()
                                 try:
-                                    ext_result = self.operations.extend_line_complete(
-                                        selected_line, current_player, grid_points,
-                                        extend_from_end, elevation_levels,
-                                        cost_info=cost_info,
+                                    ext_result = self._human_extend_line_with_elevation_prompt(
+                                        selected_line, current_player, grid_points, extend_from_end,
+                                        is_ferry_line=is_ferry_line, is_bus_line=is_bus_line,
                                     )
                                     _clear_extension_timeout()
                                     if app:
                                         app.processEvents()
+                                    if ext_result is None:
+                                        _reenable_finish_extend()
+                                        return
                                     _finish_extension_ui(ext_result)
                                 except Exception as e:
                                     _clear_extension_timeout()
@@ -11166,148 +11185,13 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             lon_deg_per_km = 111.0 * math.cos(math.radians(center_lat))
             if lon_deg_per_km == 0:
                 lon_deg_per_km = 111.0
-        
-        if hasattr(game_map, 'lines') and game_map.lines and grid_size > 0:
-            # OPTIMIZATION: Process events periodically during line processing to prevent UI freeze
-            line_items = list(game_map.lines.items())
-            for line_idx, (line_name, line) in enumerate(line_items):
-                if hasattr(line, 'get_route'):
-                    route = line.get_route()
-                    if route:
-                        line_points = []
-                        for point in route:
-                            # Handle both tuple/list coordinates and GridPoint objects
-                            if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                x, y = float(point[0]), float(point[1])
-                            elif hasattr(point, 'x') and hasattr(point, 'y'):
-                                # GridPoint object
-                                x, y = float(point.x), float(point.y)
-                            else:
-                                continue
-                            
-                            # Convert grid coordinates to lat/lon using pre-calculated constants
-                            if use_preset_bounds:
-                                lat = preset_min_lat + y * preset_lat_scale
-                                lon = preset_min_lon + x * preset_lon_scale
-                            else:
-                                lat_km = (y - grid_size // 2)
-                                lon_km = (x - grid_size // 2)
-                                lat = center_lat + (lat_km / 111.0)
-                                lon = center_lon + (lon_km / lon_deg_per_km)
-                            if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                                line_points.append([lat, lon])
-                        if len(line_points) >= 2:
-                            owner = self.operations.get_line_owner(line) if self.operations else None
-                            if owner is None or (self.operations and self.operations.is_player_eliminated(owner)):
-                                owner_id = -1
-                            else:
-                                owner_id = self.operations.get_player_id(owner)
-                            line_type = 'train'
-                            try:
-                                from line import Ferry, Bus
-                                if isinstance(line, Ferry):
-                                    line_type = 'ferry'
-                                elif isinstance(line, Bus):
-                                    line_type = 'bus'
-                            except Exception:
-                                pass
-                            lines_data.append({'name': line_name, 'points': line_points, 'under_construction': False, 'owner_id': owner_id, 'line_type': line_type})
-                if line_idx > 0 and line_idx % 10 == 0:
-                    QApplication.processEvents()
-                    if time.time() > deadline:
-                        logger.warning("Map HTML generation aborted during lines (timeout)")
-                        return self._generate_osm_map_html_timeout_placeholder()
-        
-        if grid_size > 0:
-            build_queue = []
-            if self.operations is not None:
-                build_queue = self.operations.get_build_queue()
-            # Group line builds by name and merge segments so label shows at line ends, not segment ends
-            line_builds_by_name = {}
-            for build_idx, build in enumerate(build_queue):
-                if build.get('type') == 'line':
-                    build_data = build.get('data', {})
-                    line_name = build_data.get('name')
-                    if not line_name:
-                        continue
-                    points = build_data.get('points', [])
-                    if not points:
-                        continue
-                    line_points = []
-                    for point in points:
-                        if isinstance(point, (list, tuple)) and len(point) >= 2:
-                            x, y = float(point[0]), float(point[1])
-                        elif hasattr(point, 'x') and hasattr(point, 'y'):
-                            x, y = float(point.x), float(point.y)
-                        else:
-                            continue
-                        if use_preset_bounds:
-                            lat = preset_min_lat + y * preset_lat_scale
-                            lon = preset_min_lon + x * preset_lon_scale
-                        else:
-                            lat_km = (y - grid_size // 2)
-                            lon_km = (x - grid_size // 2)
-                            lat = center_lat + (lat_km / 111.0)
-                            lon = center_lon + (lon_km / lon_deg_per_km)
-                        if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                            line_points.append([lat, lon])
-                    if len(line_points) >= 2:
-                        seg_idx = build_data.get('segment_index', 0)
-                        if line_name not in line_builds_by_name:
-                            lt = 'ferry' if build_data.get('is_ferry_line') else ('bus' if build_data.get('is_bus_line') else 'train')
-                            line_builds_by_name[line_name] = {'segments': [], 'player': build.get('player'), 'line_type': lt}
-                        line_builds_by_name[line_name]['segments'].append((seg_idx, line_points))
-                if build_idx > 0 and build_idx % 5 == 0:
-                    QApplication.processEvents()
-                    if time.time() > deadline:
-                        logger.warning("Map HTML generation aborted during build queue (timeout)")
-                        return self._generate_osm_map_html_timeout_placeholder()
-            # Merge segments per line and add one polyline per line (label at line ends only)
-            for line_name, info in line_builds_by_name.items():
-                segments = sorted(info['segments'], key=lambda x: x[0])
-                merged = []
-                for _idx, pts in segments:
-                    for p in pts:
-                        if not merged or merged[-1] != p:
-                            merged.append(p)
-                if len(merged) >= 2:
-                    build_player = info.get('player')
-                    owner_id = self.operations.get_player_id(build_player) if build_player and self.operations else -1
-                    line_type = info.get('line_type', 'train')
-                    lines_data.append({'name': line_name, 'points': merged, 'under_construction': True, 'owner_id': owner_id, 'line_type': line_type})
-            if self.operations is not None:
-                for ext_info in self.operations.get_pending_line_extension_routes():
-                    ext_route = ext_info.get('points') or []
-                    if len(ext_route) < 2:
-                        continue
-                    line_points = []
-                    for point in ext_route:
-                        if isinstance(point, (list, tuple)) and len(point) >= 2:
-                            x, y = float(point[0]), float(point[1])
-                        elif hasattr(point, 'x') and hasattr(point, 'y'):
-                            x, y = float(point.x), float(point.y)
-                        else:
-                            continue
-                        if use_preset_bounds:
-                            lat = preset_min_lat + y * preset_lat_scale
-                            lon = preset_min_lon + x * preset_lon_scale
-                        else:
-                            lat_km = (y - grid_size // 2)
-                            lon_km = (x - grid_size // 2)
-                            lat = center_lat + (lat_km / 111.0)
-                            lon = center_lon + (lon_km / lon_deg_per_km)
-                        if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
-                            line_points.append([lat, lon])
-                    if len(line_points) >= 2:
-                        ext_player = ext_info.get('player')
-                        owner_id = self.operations.get_player_id(ext_player) if ext_player else -1
-                        lines_data.append({
-                            'name': ext_info.get('line_name', ''),
-                            'points': line_points,
-                            'under_construction': True,
-                            'owner_id': owner_id,
-                            'line_type': ext_info.get('line_type', 'train'),
-                        })
+
+        if grid_size > 0 and self.operations is not None:
+            lines_data = self._build_map_lines_overlay_data(game_map)
+            QApplication.processEvents()
+            if time.time() > deadline:
+                logger.warning("Map HTML generation aborted during lines (timeout)")
+                return self._generate_osm_map_html_timeout_placeholder()
         
         if time.time() > deadline:
             logger.warning("Map HTML generation aborted before stations (timeout)")
@@ -11501,7 +11385,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>Railroad Baron Map</title>
+    <title>GoCommuter Map</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         {leaflet_css}
@@ -11930,10 +11814,32 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                         layer._linePointIndex--;
                     }}
                 }});
+                updateCreatePreviewLine();
                 var event = new CustomEvent('mapPointClicked', {{
                     detail: {{ count: clickedPoints.length }}
                 }});
                 window.dispatchEvent(event);
+            }}
+
+            window.createPreviewLine = null;
+
+            function updateCreatePreviewLine() {{
+                if (window.createPreviewLine) {{
+                    mapInstance.removeLayer(window.createPreviewLine);
+                    window.createPreviewLine = null;
+                }}
+                if (!isCreatingLine || clickedPoints.length < 2) {{
+                    return;
+                }}
+                var previewPoints = clickedPoints.map(function(point) {{
+                    return [point[0], point[1]];
+                }});
+                window.createPreviewLine = L.polyline(previewPoints, {{
+                    color: '#0066ff',
+                    weight: 4,
+                    opacity: 0.7,
+                    dashArray: '10, 5'
+                }}).addTo(mapInstance);
             }}
 
             function addLinePoint(lat, lng) {{
@@ -11952,6 +11858,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     L.DomEvent.stopPropagation(ev);
                     removeLinePointAtIndex(marker._linePointIndex);
                 }});
+                updateCreatePreviewLine();
                 var event = new CustomEvent('mapPointClicked', {{
                     detail: {{ count: clickedPoints.length }}
                 }});
@@ -12030,6 +11937,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             window.startLineCreation = function() {{
                 isCreatingLine = true;
                 clickedPoints = [];
+                updateCreatePreviewLine();
             }};
             
             // Do not clear isCreatingLine here — Python cancels only after success or Cancel.
@@ -12041,6 +11949,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             window.cancelLineCreation = function() {{
                 isCreatingLine = false;
                 clickedPoints = [];
+                updateCreatePreviewLine();
                 // Remove markers
                 mapInstance.eachLayer(function(layer) {{
                     if (layer instanceof L.Marker && layer.options.icon && 
@@ -12055,6 +11964,41 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             window.extendingLineName = null;
             window.extendClickedPoints = [];
             window.extendPreviewLine = null;
+            window.extensionAttachStart = null;
+            window.extensionAttachEnd = null;
+            window.extensionAttachFromEnd = null;
+
+            function resolveExtensionAttachEndpoints(lineName) {{
+                if (window.extensionAttachStart && window.extensionAttachEnd) {{
+                    return {{
+                        start: window.extensionAttachStart,
+                        end: window.extensionAttachEnd,
+                    }};
+                }}
+                var attachStart = null;
+                var attachEnd = null;
+                var builtLine = null;
+                linesData.forEach(function(line) {{
+                    if (line.name !== lineName) {{
+                        return;
+                    }}
+                    if (line.attach_start && line.attach_end) {{
+                        attachStart = line.attach_start;
+                        attachEnd = line.attach_end;
+                    }}
+                    if (!line.under_construction) {{
+                        builtLine = line;
+                    }}
+                }});
+                if (attachStart && attachEnd) {{
+                    return {{ start: attachStart, end: attachEnd }};
+                }}
+                if (builtLine && builtLine.points && builtLine.points.length > 0) {{
+                    var pts = builtLine.points;
+                    return {{ start: pts[0], end: pts[pts.length - 1] }};
+                }}
+                return null;
+            }}
             
             function updateExtendPreviewLine() {{
                 // Remove existing preview line
@@ -12068,29 +12012,26 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     return;
                 }}
                 
-                var lineToExtend = null;
-                linesData.forEach(function(line) {{
-                    if (line.name === extendingLineName) {{
-                        lineToExtend = line;
-                    }}
-                }});
-                
-                if (!lineToExtend || !lineToExtend.points || lineToExtend.points.length === 0) {{
+                var attach = resolveExtensionAttachEndpoints(extendingLineName);
+                if (!attach) {{
                     return;
                 }}
                 
-                var existingPts = lineToExtend.points;
-                var startExisting = existingPts[0];
-                var endExisting = existingPts[existingPts.length - 1];
-                var attachFromEnd = true;
-                if (extendClickedPoints.length > 0) {{
+                var startExisting = attach.start;
+                var endExisting = attach.end;
+                var attachFromEnd = window.extensionAttachFromEnd;
+                if (attachFromEnd === null && extendClickedPoints.length > 0) {{
                     var click = extendClickedPoints[0];
                     var dStart = Math.hypot(click[0] - startExisting[0], click[1] - startExisting[1]);
                     var dEnd = Math.hypot(click[0] - endExisting[0], click[1] - endExisting[1]);
                     attachFromEnd = dEnd <= dStart;
+                    window.extensionAttachFromEnd = attachFromEnd;
+                }}
+                if (attachFromEnd === null) {{
+                    attachFromEnd = true;
                 }}
                 
-                // Build preview points: attach end of combined line + all extend points
+                // Build preview points: attach end of combined line + all extend points in click order
                 var previewPoints = [];
                 if (attachFromEnd) {{
                     previewPoints.push([endExisting[0], endExisting[1]]);
@@ -12101,7 +12042,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     previewPoints.push([point[0], point[1]]);
                 }});
                 
-                // Draw dotted preview line
+                // Draw dotted preview line (open polyline only — never connect last point back to start)
                 if (previewPoints.length > 1) {{
                     window.extendPreviewLine = L.polyline(previewPoints, {{
                         color: '#ff6600',
@@ -12112,23 +12053,34 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 }}
             }};
             
-            window.startLineExtension = function(lineName) {{
+            window.startLineExtension = function(lineName, attachStart, attachEnd) {{
                 isExtendingLine = true;
                 extendingLineName = lineName;
                 extendClickedPoints = [];
+                window.extensionAttachFromEnd = null;
+                window.extensionAttachStart = attachStart || null;
+                window.extensionAttachEnd = attachEnd || null;
                 // Initialize preview line
                 updateExtendPreviewLine();
             }};
             
             // Keep extension mode until Python confirms success or Cancel.
             window.finishLineExtension = function() {{
-                return extendClickedPoints.slice();
+                return {{
+                    points: extendClickedPoints.slice(),
+                    extendFromEnd: window.extensionAttachFromEnd !== null
+                        ? window.extensionAttachFromEnd
+                        : true,
+                }};
             }};
             
             window.cancelLineExtension = function() {{
                 isExtendingLine = false;
                 extendClickedPoints = [];
                 extendingLineName = null;
+                window.extensionAttachStart = null;
+                window.extensionAttachEnd = null;
+                window.extensionAttachFromEnd = null;
                 // Remove preview line
                 if (window.extendPreviewLine) {{
                     mapInstance.removeLayer(window.extendPreviewLine);
@@ -13634,7 +13586,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
 
 #!/usr/bin/env python3
 """
-Networked version of TransitGame UI
+Networked version of GoCommuter UI
 Merges qt.py with networking functionality
 """
 import sys
@@ -14151,7 +14103,7 @@ class GameModeDialog(QDialog):
         super().__init__(parent)
         from ruleset_loader import ensure_rulesets_layout, get_active_ruleset
         ensure_rulesets_layout()
-        self.setWindowTitle("Railroad Baron - Choose Game Mode")
+        self.setWindowTitle("GoCommuter - Choose Game Mode")
         apply_application_logo(self)
         self.setGeometry(300, 300, 520, 640)
         self.setModal(True)
@@ -14172,7 +14124,7 @@ class GameModeDialog(QDialog):
                 splash_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 layout.addWidget(splash_label)
         
-        title = QLabel("Welcome to Railroad Baron!")
+        title = QLabel("Welcome to GoCommuter!")
         title.setStyleSheet("font-size: 18px; font-weight: bold;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
@@ -15223,7 +15175,7 @@ class NetworkedMainWindow(MainWindow):
         # Create new gameplay window BEFORE closing old one (to keep references alive)
         try:
             new_window = MainWindow()
-            new_window.setWindowTitle("Railroad Baron - Networked")
+            new_window.setWindowTitle("GoCommuter - Networked")
             new_window.setGeometry(100, 100, 800, 600)
             new_window.start_networked_game(
                 game=game,

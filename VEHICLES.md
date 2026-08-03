@@ -1,6 +1,6 @@
 # Vehicle Details
 
-This document describes all available vehicles in the Transit Game, organized by category.
+This document describes all available vehicles in GoCommuter, organized by category.
 
 ## Vehicle Attributes
 

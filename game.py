@@ -23,7 +23,7 @@ class Game:
                  merge_ai_human_enabled: bool = True,
                  merge_human_human_enabled: bool = True,
                  inflation_rate: float = 1.0,
-                 profit_margin: float = 1.0,
+                 profit_margin: float = None,
                  random_ai_spawn_interval_years: int = 30,
                  default_ai_difficulty_for_spawns: str = 'hard',
                  ai_min_population: int = 100,
@@ -67,6 +67,9 @@ class Game:
         self.merge_ai_human_enabled = merge_ai_human_enabled
         self.merge_human_human_enabled = merge_human_human_enabled
         self.inflation_rate = max(0.1, min(5.0, inflation_rate))
+        from game_presets import DEFAULT_PROFIT_MARGIN
+        if profit_margin is None:
+            profit_margin = DEFAULT_PROFIT_MARGIN
         self.profit_margin = max(0.25, min(5.0, profit_margin))
         self.random_ai_spawn_interval_years = max(5, min(200, random_ai_spawn_interval_years))
         self.default_ai_difficulty_for_spawns = default_ai_difficulty_for_spawns if default_ai_difficulty_for_spawns in ('easy', 'medium', 'hard') else 'hard'

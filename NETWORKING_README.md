@@ -1,6 +1,6 @@
-# TransitGame Networking Guide
+# GoCommuter Networking Guide
 
-This guide explains how to use the networking features to play TransitGame multiplayer over a network.
+This guide explains how to use the networking features to play GoCommuter multiplayer over a network.
 
 ## Overview
 

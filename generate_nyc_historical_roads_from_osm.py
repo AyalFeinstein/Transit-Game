@@ -14,7 +14,7 @@ try:
     from osm_integration import _OVERPASS_HEADERS
 except ImportError:
     _OVERPASS_HEADERS = {
-        'User-Agent': 'TransitGame/1.0 (OpenStreetMap data consumer)',
+        'User-Agent': 'GoCommuter/1.0 (OpenStreetMap data consumer)',
         'Accept': 'application/json',
     }
 

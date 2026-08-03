@@ -1,4 +1,4 @@
-"""Unit and integration tests for TransitGame networking."""
+"""Unit and integration tests for GoCommuter networking."""
 import base64
 import importlib.util
 import os

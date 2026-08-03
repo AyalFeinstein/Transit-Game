@@ -17,7 +17,7 @@ from game_presets import (
     LINE_NIMBY_ELEVATION_CHANCE_MULTIPLIER,
     LINE_NIMBY_LAWSUIT_BASE_CHANCE,
     STARTING_MONEY,
-    STATION_MAX_WATER_DISTANCE_TO_LAND_M,
+    STATION_MAX_DISTANCE_FROM_LAND_M,
 )
 
 # NIMBY line-build excuses (noise / property / environment).

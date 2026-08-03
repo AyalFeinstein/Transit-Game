@@ -32,8 +32,8 @@ class RightOfWay:
 
     def extend_route_from_beginning(self,
                               additional_points: list[GridPoint]):
-        # Skip last point if it duplicates route start (avoids duplicate connection point)
-        pts = list(additional_points)
+        # Clicks are in outward order (first adjacent to route start); prepend reversed.
+        pts = list(reversed(additional_points or []))
         if pts and self.route:
             last_pt = pts[-1]
             first_route = self.route[0]
@@ -46,16 +46,27 @@ class RightOfWay:
 
     def extend_route_from_end(self,
                               additional_points: list[GridPoint]):
-        # Skip first point if it duplicates route end (avoids duplicate connection point)
-        if additional_points and self.route:
-            first = additional_points[0]
+        pts = list(additional_points or [])
+        if pts and self.route:
+            first = pts[0]
             last = self.route[-1]
             if (hasattr(first, '__len__') and hasattr(last, '__len__') and
                 len(first) >= 2 and len(last) >= 2 and
                 abs(float(first[0]) - float(last[0])) < 0.01 and
                 abs(float(first[1]) - float(last[1])) < 0.01):
-                additional_points = list(additional_points)[1:]
-        self.route.extend(additional_points)
+                pts = pts[1:]
+            # Never auto-close the route by connecting the new tip back to the start.
+            route_start = self.route[0]
+            tip = pts[-1]
+            if (hasattr(tip, '__len__') and hasattr(route_start, '__len__') and
+                len(tip) >= 2 and len(route_start) >= 2 and
+                abs(float(tip[0]) - float(route_start[0])) < 0.01 and
+                abs(float(tip[1]) - float(route_start[1])) < 0.01 and
+                (len(self.route) < 2 or not (
+                    abs(float(tip[0]) - float(last[0])) < 0.01 and
+                    abs(float(tip[1]) - float(last[1])) < 0.01))):
+                pts = pts[:-1]
+        self.route.extend(pts)
 
 class Line(RightOfWay):
     def __init__(self,

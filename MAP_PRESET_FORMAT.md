@@ -1,6 +1,6 @@
 # Map Preset Format
 
-Map presets allow adding new maps to TransitGame without modifying core files. Add a `map_presets_<name>.py` file to the TransitGame directory and it will be discovered automatically.
+Map presets allow adding new maps to GoCommuter without modifying core files. Add a `map_presets_<name>.py` file to the project directory and it will be discovered automatically.
 
 ## File Naming
 

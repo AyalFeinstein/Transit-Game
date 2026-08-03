@@ -1,4 +1,4 @@
-"""OpenStreetMap integration for transit game map and line creation"""
+"""OpenStreetMap integration for GoCommuter map and line creation"""
 import time
 from typing import List, Tuple, Optional, Dict
 
@@ -7,7 +7,7 @@ import requests
 # Overpass usage policy: identify the application; avoid generic library UA (often blocked / 403).
 _OVERPASS_HEADERS = {
     'User-Agent': (
-        'TransitGame/1.0 (OpenStreetMap data consumer; '
+        'GoCommuter/1.0 (OpenStreetMap data consumer; '
         '+https://wiki.openstreetmap.org/wiki/Overpass_API ; '
         'respects Overpass usage policy)'
     ),

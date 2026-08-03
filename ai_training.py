@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI Training Program - Trains AIs on how to win the Transit Game.
+AI Training Program - Trains AIs on how to win GoCommuter.
 
 Runs many AI-vs-AI games, records which strategies win, and outputs learned insights.
 Use: python ai_training.py [--games N] [--end-year Y] [--map MAP]
@@ -448,7 +448,7 @@ def run_training(num_games: int = 20, end_year: int = 1860, map_preset: str = "s
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train AI players on how to win the Transit Game")
+    parser = argparse.ArgumentParser(description="Train AI players on how to win GoCommuter")
     parser.add_argument("--games", type=int, default=20, help="Number of training games (default: 20)")
     parser.add_argument("--end-year", type=int, default=1860, help="End year for each game (default: 1860)")
     parser.add_argument("--map", type=str, default="nyc", help="Map preset: standard, nyc, ny_metro (default: nyc)")

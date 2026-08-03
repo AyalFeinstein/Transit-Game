@@ -1,4 +1,4 @@
-"""Map presets and configuration for Transit Game.
+"""Map presets and configuration for GoCommuter.
 All hard-coded map settings should be defined here."""
 
 # NYC Proper bounds (excludes New Jersey, most of Long Island, etc.)

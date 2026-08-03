@@ -17,7 +17,7 @@ from game_presets import (
     LINE_NIMBY_ELEVATION_CHANCE_MULTIPLIER,
     LINE_NIMBY_LAWSUIT_BASE_CHANCE,
     STARTING_MONEY,
-    STATION_MAX_WATER_DISTANCE_TO_LAND_M,
+    STATION_MAX_DISTANCE_FROM_LAND_M,
     FERRY_MAX_DISTANCE_FROM_WATER_M,
 )
 
@@ -627,6 +627,26 @@ def _normalize_route_elevation_levels(
     return elev[:n]
 
 
+def _collect_route_elevation_levels_from_build_queue(line_name: str, build_queue: list) -> list:
+    """Per-segment elevations from in-progress line build jobs, in route order."""
+    name_cf = (line_name or '').strip().casefold()
+    segments = []
+    for build in build_queue or []:
+        if build.get('type') != 'line':
+            continue
+        data = build.get('data') or {}
+        if (data.get('name') or '').strip().casefold() != name_cf:
+            continue
+        seg_idx = int(data.get('segment_index', 0) or 0)
+        elevs = list(data.get('elevation_levels') or [])
+        segments.append((seg_idx, elevs))
+    segments.sort(key=lambda t: t[0])
+    combined = []
+    for _idx, elevs in segments:
+        combined.extend(elevs)
+    return combined
+
+
 def _merged_route_elevation_levels(
     line,
     merged_points: list,
@@ -635,15 +655,21 @@ def _merged_route_elevation_levels(
     extension_elevation_levels: list = None,
     *,
     is_bus_line: bool = False,
+    existing_route: list = None,
+    existing_elevation_levels: list = None,
 ) -> list:
     """Elevation per segment for a line plus extension (for street-alignment validation)."""
     n = max(0, len(merged_points) - 1)
     if n <= 0:
         return []
     default = 'street' if is_bus_line else 'above_ground'
-    old_route = list(line.get_route() or []) if line and hasattr(line, 'get_route') else []
+    if line and hasattr(line, 'get_route'):
+        old_route = list(line.get_route() or [])
+        old_elevs = list(getattr(line, 'elevation_levels', None) or [])
+    else:
+        old_route = list(existing_route or [])
+        old_elevs = list(existing_elevation_levels or [])
     n_old = max(0, len(old_route) - 1)
-    old_elevs = list(getattr(line, 'elevation_levels', None) or [])
     if len(old_elevs) < n_old:
         old_elevs = old_elevs + [default] * (n_old - len(old_elevs))
     old_elevs = old_elevs[:n_old]
@@ -1207,6 +1233,10 @@ def _validate_route_streets_on_land(
     seg_elevs = _normalize_route_elevation_levels(
         points, elevation_levels, is_bus_line=is_bus_line, is_ferry_line=is_ferry_line,
     )
+    if seg_elevs and not any(
+        _segment_elevation_requires_street_alignment(elev) for elev in seg_elevs
+    ):
+        return {'success': True}
 
     def _segment_requires_streets(seg_idx: int) -> bool:
         elev = seg_elevs[seg_idx] if seg_idx < len(seg_elevs) else default_elev
@@ -1360,19 +1390,32 @@ def _extension_attach_from_closest_end(route: list, click_point) -> bool:
     return end_d <= start_d
 
 
+def _extension_points_in_route_order(additional_points: list, extend_from_end: bool) -> list:
+    """Map click order to route order (first click adjacent to attach end).
+
+    End extensions append clicks as clicked. Beginning extensions prepend with the
+    last click as the new route tip, so click order is reversed along the line.
+    """
+    pts = list(additional_points or [])
+    if extend_from_end:
+        return pts
+    return list(reversed(pts))
+
+
 def _ai_merged_line_route(existing_route: list, additional_points: list, extend_from_end: bool) -> list:
     """Full polyline after an extension (for backtracking / street validation).
 
-    Segments are: existing_end→first new point, then between each new point in order
-    (or last new point→existing_start when extending from the beginning).
+    Segments are: existing_end→first click, then between each click in order
+    (or existing_start→first click outward when extending from the beginning).
     """
     if not existing_route:
-        return list(additional_points or [])
+        return _extension_points_in_route_order(additional_points, extend_from_end)
     if not additional_points:
         return list(existing_route)
+    ordered = _extension_points_in_route_order(additional_points, extend_from_end)
     if extend_from_end:
-        return list(existing_route) + list(additional_points)
-    return list(additional_points) + list(existing_route)
+        return list(existing_route) + ordered
+    return ordered + list(existing_route)
 
 
 def _normalize_route_point(p) -> tuple:

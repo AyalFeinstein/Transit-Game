@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Local game saves
+savegames/
+
+# Profiling scripts
+profile_*.py
+
+# AI / training artifacts
+AI_*.md
+ai_training_insights.json
+ai_recovered.pyc
+
+# Backup / monolith copies
+operations_monolith_backup.py
+
+# Test / generated binary artifacts
+*.pkl
+nyc_road_spatial_index_corrupt_test.pkl

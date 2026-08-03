@@ -1,4 +1,4 @@
-# Networking dependencies for TransitGame
+# Networking dependencies for GoCommuter
 # Install with: pip install -r requirements_network.txt
 
 # WebSocket and async HTTP server

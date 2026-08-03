@@ -1558,12 +1558,18 @@ class TestRightOfWay(unittest.TestCase):
         self.right_of_way.extend_route_from_end([(3, 3), (4, 4)])
         self.assertEqual(len(self.right_of_way), initial_length + 2)
         self.assertEqual(self.right_of_way.get_route()[-1], (4, 4))
+
+    def test_extend_route_from_end_drops_auto_loop_closer(self):
+        """End extension must not auto-connect the new tip back to route start."""
+        self.right_of_way.extend_route_from_end([(3, 3), (0, 0)])
+        route = self.right_of_way.get_route()
+        self.assertEqual(route[-1], (3, 3))
+        self.assertNotEqual(route[-1], route[0])
     
     def test_extend_route_from_beginning(self):
         """Test extending route from beginning"""
         initial_length = len(self.right_of_way)
-        self.right_of_way.extend_route_from_beginning([(-1, -1), (0, 0)])
-        # The extend method adds all points, so length increases by 2
+        self.right_of_way.extend_route_from_beginning([(-1, -1), (-0.5, -0.5)])
         self.assertEqual(len(self.right_of_way), initial_length + 2)
         self.assertEqual(self.right_of_way.get_route()[0], (-1, -1))
 
@@ -1671,6 +1677,77 @@ class TestLine(unittest.TestCase):
 
         ui.unassign_trainset_complete(ts2)
         self.assertLess(line.schedule['peak'], max_peak)
+
+    def test_enforce_all_line_schedule_limits_clamps_excess(self):
+        """Year-end sweep clamps peak/off_peak/night when schedule exceeds max."""
+        from vehicle import Trainset, Locomotive, Railcar
+        from map import Map
+        from game import Game
+        from timeline import Timeline
+        from marketplace import Marketplace
+
+        loco = Locomotive("Test Loco", 1830, 30, 100, "Wood", 50, 100)
+        ts = Trainset(locomotive=loco, cars=[Railcar("Car", 1830, 50, 20)])
+        player = Player(0, 10000, [], "Test Player")
+        line = Line("Year End Line", 1, self.route, player, [ts])
+        ts.assign_to_line("Year End Line")
+        max_peak = line.get_max_frequency_per_hour('peak')
+        max_off_peak = line.get_max_frequency_per_hour('off_peak')
+        max_night = line.get_max_frequency_per_hour('night')
+        line.schedule = {
+            'peak': max_peak + 50.0,
+            'off_peak': max_off_peak + 30.0,
+            'night': max_night + 10.0,
+        }
+
+        game_map = Map(width=100, height=100, use_osm=False)
+        game = Game(
+            players=[player],
+            game_map=game_map,
+            timeline=Timeline(1830, 2000),
+            marketplace=Marketplace(),
+        )
+        ui = Operations(["Test Player"], use_osm=False)
+        ui.game = game
+        game_map.add_line(line)
+        player.acquire_line(line)
+
+        changed = ui.enforce_all_line_schedule_limits()
+        self.assertIn("Year End Line", changed)
+        self.assertEqual(line.schedule['peak'], max_peak)
+        self.assertEqual(line.schedule['off_peak'], max_off_peak)
+        self.assertEqual(line.schedule['night'], max_night)
+
+    def test_advance_year_clamps_excess_schedule(self):
+        """advance_year_complete clamps schedules that exceed physical max."""
+        from vehicle import Trainset, Locomotive, Railcar
+        from map import Map
+        from game import Game
+        from timeline import Timeline
+        from marketplace import Marketplace
+
+        loco = Locomotive("Test Loco", 1830, 30, 100, "Wood", 50, 100)
+        ts = Trainset(locomotive=loco, cars=[Railcar("Car", 1830, 50, 20)])
+        player = Player(0, 100000, [], "Test Player")
+        line = Line("Advance Year Line", 1, self.route, player, [ts])
+        ts.assign_to_line("Advance Year Line")
+        max_peak = line.get_max_frequency_per_hour('peak')
+        line.schedule = {'peak': max_peak + 100.0, 'off_peak': 0.0, 'night': 0.0}
+
+        game_map = Map(width=100, height=100, use_osm=False)
+        game = Game(
+            players=[player],
+            game_map=game_map,
+            timeline=Timeline(1830, 2000),
+            marketplace=Marketplace(),
+        )
+        ui = Operations(["Test Player"], use_osm=False)
+        ui.game = game
+        game_map.add_line(line)
+        player.acquire_line(line)
+
+        ui.advance_year_complete(1830)
+        self.assertEqual(line.schedule['peak'], max_peak)
 
     def test_zero_schedule_yields_zero_trains_per_year(self):
         """All-zero timetable means no annual train trips and no schedule operating cost."""
@@ -2587,6 +2664,65 @@ class TestExtensionClosestEnd(unittest.TestCase):
         self.assertEqual(combined[-1], (30.0, 0.0))
         self.assertTrue(ui.extension_attach_from_closest_end("Main", (29.0, 0.0)))
 
+    def test_get_extension_attach_endpoints_uses_combined_route(self):
+        """Attach endpoints reflect pending extensions, not just the built line."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        start, end = ui.get_extension_attach_endpoints("Main")
+        self.assertEqual(start, (0.0, 0.0))
+        self.assertEqual(end, (20.0, 0.0))
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        start, end = ui.get_extension_attach_endpoints("Main")
+        self.assertEqual(start, (0.0, 0.0))
+        self.assertEqual(end, (25.0, 0.0))
+
+    def test_extension_auto_attach_from_start_with_pending_end_extension(self):
+        """First click near the original start attaches from start, not the pending tip."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        start, end = ui.get_extension_attach_endpoints("Main")
+        self.assertEqual(start, (0.0, 0.0))
+        self.assertEqual(end, (25.0, 0.0))
+        self.assertFalse(ui.extension_attach_from_closest_end("Main", (1.0, 0.0)))
+        self.assertTrue(ui.extension_attach_from_closest_end("Main", (24.0, 0.0)))
+
     def test_ai_merged_line_route_includes_all_extension_points(self):
         from operations import _ai_merged_line_route
 
@@ -2595,7 +2731,167 @@ class TestExtensionClosestEnd(unittest.TestCase):
         merged = _ai_merged_line_route(route, add, extend_from_end=True)
         self.assertEqual(merged, route + add)
         merged_start = _ai_merged_line_route(route, add, extend_from_end=False)
-        self.assertEqual(merged_start, add + route)
+        self.assertEqual(merged_start, [(25.0, 2.0), (22.0, 1.0)] + route)
+
+    def test_extension_from_end_preserves_click_order(self):
+        """Closer first click then farther second — route must not visit farther point first."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        closer = (22.0, 0.0)
+        farther = (25.0, 3.0)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [closer, farther],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street', 'street'],
+            },
+            player,
+            0,
+        )
+        pending = ui.get_pending_line_extension_routes()
+        self.assertEqual(len(pending), 1)
+        pts = pending[0]['points']
+        self.assertEqual(pts[0], (20.0, 0.0))
+        self.assertEqual(pts[1], closer)
+        self.assertEqual(pts[2], farther)
+        self.assertEqual(pts[-1], farther)
+
+        ui.extend_line_route_from_end(line, [closer, farther])
+        route = ui.get_line_route(line)
+        self.assertEqual(route[-2], closer)
+        self.assertEqual(route[-1], farther)
+
+    def test_extension_from_start_preserves_click_order_in_display(self):
+        """Beginning extension: attach → first click → last click (not far point then back)."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        closer = (2.0, 0.0)
+        farther = (-3.0, 0.0)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [closer, farther],
+                'extend_from_end': False,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street', 'street'],
+            },
+            player,
+            0,
+        )
+        pending = ui.get_pending_line_extension_routes()
+        self.assertEqual(len(pending), 1)
+        pts = pending[0]['points']
+        self.assertEqual(pts[0], (0.0, 0.0))
+        self.assertEqual(pts[1], closer)
+        self.assertEqual(pts[2], farther)
+
+        ui.extend_line_route_from_beginning(line, [closer, farther])
+        route = ui.get_line_route(line)
+        self.assertEqual(route[0], farther)
+        self.assertEqual(route[1], closer)
+        self.assertEqual(route[2], (0.0, 0.0))
+
+    def test_pending_end_extension_never_connects_to_route_start(self):
+        """End extension display must not draw a closing segment back to route start."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 5.0), (25.0, 8.0)],
+                'extend_from_end': True,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        pending = ui.get_pending_line_extension_routes()
+        self.assertEqual(len(pending), 1)
+        pts = pending[0]['points']
+        self.assertEqual(pts[0], (20.0, 0.0))
+        self.assertEqual(pts[-1], (25.0, 8.0))
+        self.assertNotEqual(pts[-1], pts[0])
+        self.assertNotIn((0.0, 0.0), pts[1:])
+
+    def test_pending_mixed_direction_extensions_use_separate_polylines(self):
+        """Start and end extensions on one line must not share one display polyline."""
+        ui = Operations(["P1"], 50, 50, 50000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line = ui.game.create_line(
+            "Main", player, [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0)],
+        )
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(-2.0, 0.0), (-4.0, 0.0)],
+                'extend_from_end': False,
+                'extension_order': 0,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        ui.add_to_build_queue(
+            'line_extension',
+            {
+                'line_name': 'Main',
+                'points': [(22.0, 0.0), (25.0, 0.0)],
+                'extend_from_end': True,
+                'extension_order': 1,
+                'segment_index': 0,
+                'total_segments': 1,
+                'elevation_levels': ['street'],
+            },
+            player,
+            0,
+        )
+        pending = ui.get_pending_line_extension_routes()
+        self.assertEqual(len(pending), 2)
+        end_ext = [p for p in pending if p.get('extend_from_end')][0]
+        self.assertEqual(end_ext['points'][0], (20.0, 0.0))
+        self.assertEqual(end_ext['points'][-1], (25.0, 0.0))
+        self.assertNotEqual(end_ext['points'][-1], (0.0, 0.0))
+
+    def test_open_polyline_display_points_strips_loop_closer(self):
+        from operations import _open_polyline_display_points
+
+        closed = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 0.0)]
+        self.assertEqual(
+            _open_polyline_display_points(closed),
+            [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)],
+        )
 
 
     def test_get_segment_elevation_options_water_defaults_above_ground(self):
@@ -2614,6 +2910,141 @@ class TestExtensionClosestEnd(unittest.TestCase):
             choices, default = ui.get_segment_elevation_options((0.0, 0.0), (1.0, 0.0), is_bus_line=True)
         self.assertIn('street', choices)
         self.assertEqual(default, 'street')
+
+    def test_street_validation_failure_preserves_elevation_levels(self):
+        from operations import Operations
+        from unittest.mock import patch
+
+        ui = Operations(['Human'], 50, 50, 500000, 1.0, map_preset_name='nyc')
+        player = ui.get_players()[0]
+        points = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0)]
+        elevation_levels = ['street', 'above_ground']
+        original = list(elevation_levels)
+        with patch('operations._route_land_segment_follows_street', return_value=False):
+            with patch('operations._route_segment_is_water_crossing', return_value=False):
+                with patch('operations._straight_connector_valid_at_route_index', return_value=False):
+                    cost_info = ui.calculate_line_cost(points, elevation_levels)
+                    result = ui.create_line_complete(
+                        'PreserveTest', points, player,
+                        elevation_levels=elevation_levels, cost_info=cost_info,
+                    )
+        self.assertEqual(result.get('success'), False)
+        self.assertEqual(elevation_levels, original)
+        self.assertEqual(cost_info['elevation_levels'], original)
+        self.assertIsNot(cost_info['elevation_levels'], elevation_levels)
+
+    def test_invalid_street_aligned_segment_indices_offroad_only(self):
+        from operations import _invalid_street_aligned_segment_indices
+        from map import Map
+        from unittest.mock import patch
+
+        game_map = Map(width=50, height=50, map_preset_name='nyc', use_osm=False)
+        points = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
+
+        with patch('operations._route_land_segment_follows_street', return_value=False):
+            with patch('operations._route_segment_is_water_crossing', return_value=False):
+                with patch('operations._straight_connector_valid_at_route_index', return_value=False):
+                    invalid = _invalid_street_aligned_segment_indices(
+                        points, game_map, 1850,
+                        elevation_levels=['street', 'underground'],
+                    )
+        self.assertEqual(invalid, [0])
+
+    def test_all_underground_route_skips_street_validation(self):
+        from operations import _validate_route_streets_on_land
+        from unittest.mock import patch
+
+        ui = Operations(['Human'], 50, 50, 500000, 1.0, map_preset_name='nyc')
+        player = ui.get_players()[0]
+        points = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0)]
+        elev = ['underground', 'underground']
+
+        with patch('operations._route_land_segment_follows_street', return_value=False):
+            with patch('operations._route_segment_is_water_crossing', return_value=False):
+                with patch('operations._straight_connector_valid_at_route_index', return_value=False):
+                    result = _validate_route_streets_on_land(
+                        points, ui.game.get_map(), 1850, elevation_levels=elev,
+                    )
+                    self.assertTrue(result.get('success'))
+                    cost = ui.calculate_line_cost(points, elev)
+                    created = ui.create_line_complete(
+                        'AllUnder', points, player, elevation_levels=elev, cost_info=cost,
+                    )
+        self.assertNotEqual(created.get('success'), False)
+
+    def test_all_underground_extension_skips_street_validation(self):
+        from unittest.mock import patch
+
+        ui = Operations(['Human'], 50, 50, 500000, 1.0, map_preset_name='nyc')
+        player = ui.get_players()[0]
+        points = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0)]
+        elev = ['underground', 'underground']
+        ext_pts = [(13.0, 10.0), (14.0, 10.0)]
+        ext_elev = ['underground', 'underground']
+
+        with patch('operations._route_land_segment_follows_street', return_value=False):
+            with patch('operations._route_segment_is_water_crossing', return_value=False):
+                with patch('operations._straight_connector_valid_at_route_index', return_value=False):
+                    cost = ui.calculate_line_cost(points, elev)
+                    ui.create_line_complete(
+                        'SubExt', points, player, elevation_levels=elev, cost_info=cost,
+                    )
+                    ext_cost = ui.calculate_extend_cost('SubExt', ext_pts, True, ext_elev)
+                    result = ui.extend_line_complete(
+                        'SubExt', player, ext_pts, True,
+                        elevation_levels=ext_elev, cost_info=ext_cost,
+                    )
+        self.assertNotEqual(result.get('success'), False)
+
+    def test_default_profit_margin_applied_to_new_games(self):
+        from game_presets import DEFAULT_PROFIT_MARGIN
+
+        ui = Operations(['Human'], 50, 50, 50000, 1.0)
+        self.assertEqual(ui.game.profit_margin, DEFAULT_PROFIT_MARGIN)
+        self.assertEqual(DEFAULT_PROFIT_MARGIN, 0.75)
+
+    def test_create_line_street_failure_reports_invalid_segments(self):
+        from operations import Operations
+        from unittest.mock import patch
+
+        ui = Operations(['Human'], 50, 50, 500000, 1.0, map_preset_name='nyc')
+        player = ui.get_players()[0]
+        points = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0)]
+        elev = ['street', 'street']
+        with patch('operations._route_land_segment_follows_street', return_value=False):
+            with patch('operations._route_segment_is_water_crossing', return_value=False):
+                with patch('operations._straight_connector_valid_at_route_index', return_value=False):
+                    cost_info = ui.calculate_line_cost(points, elev)
+                    result = ui.create_line_complete(
+                        'FailTest', points, player, elevation_levels=elev, cost_info=cost_info,
+                    )
+        self.assertEqual(result.get('success'), False)
+        self.assertIn('invalid_segment_indices', result)
+        self.assertEqual(result['invalid_segment_indices'], [0, 1])
+        self.assertEqual(elev, ['street', 'street'])
+
+    def test_mixed_elevations_preserved_in_build_queue(self):
+        from operations import Operations
+        from unittest.mock import patch
+
+        ui = Operations(['Human'], 50, 50, 500000, 1.0, map_preset_name='nyc')
+        player = ui.get_players()[0]
+        points = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0)]
+        elev = ['street', 'underground']
+
+        def follows_street(_map, x1, y1, x2, y2, _year, **kwargs):
+            return x1 < 10.5
+
+        with patch('operations._route_land_segment_follows_street', side_effect=follows_street):
+            with patch('operations._route_segment_is_water_crossing', return_value=False):
+                with patch('operations._straight_connector_valid_at_route_index', return_value=False):
+                    cost_info = ui.calculate_line_cost(points, list(elev))
+                    result = ui.create_line_complete(
+                        'Mixed', points, player, elevation_levels=list(elev), cost_info=cost_info,
+                    )
+        self.assertNotEqual(result.get('success'), False)
+        queued_elevs = [b['data'].get('elevation_levels') for b in ui.get_build_queue()]
+        self.assertTrue(any(e == ['street', 'underground'] for e in queued_elevs))
 
     def test_route_segment_is_water_crossing_any_endpoint_in_water(self):
         from operations import _route_segment_is_water_crossing
@@ -3076,6 +3507,10 @@ class TestDisasterSegmentBlocking(unittest.TestCase):
     
     def setUp(self):
         self._app = _ensure_app()
+
+    def _mark_segment_destroyed(self, line, segment_points):
+        from operations import _mark_line_edges_destroyed
+        _mark_line_edges_destroyed(line, segment_points)
     
     def test_destroyed_segment_prevents_route(self):
         """Test that a destroyed segment prevents travel over that segment"""
@@ -3115,19 +3550,9 @@ class TestDisasterSegmentBlocking(unittest.TestCase):
         route_time_before = ui.calculate_train_route_time(start_station, end_station, line, trainset)
         self.assertIsNotNone(route_time_before, "Route should work before damage")
         
-        # Simulate disaster damage - damage middle segment
-        # Add damaged segment to build queue (simulating disaster)
+        # Simulate disaster damage - destroy middle segment (no auto-repair queue)
         damaged_segment = [(12, 10), (13, 10)]
-        segment_data = {
-            'name': line.name,
-            'points': damaged_segment,
-            'segment_index': 2,
-            'total_segments': 4,
-            'disaster_repair': True,
-            'disaster_type': 'Earthquake',
-            'repair_cost': 100
-        }
-        ui.add_to_build_queue('line', segment_data, player, 0)
+        self._mark_segment_destroyed(line, damaged_segment)
         
         # Now route should be blocked
         route_time_after = ui.calculate_train_route_time(start_station, end_station, line, trainset)
@@ -3179,16 +3604,7 @@ class TestDisasterSegmentBlocking(unittest.TestCase):
         
         # Damage middle segment
         damaged_segment = [(11, 10), (12, 10)]
-        segment_data = {
-            'name': line.name,
-            'points': damaged_segment,
-            'segment_index': 1,
-            'total_segments': 3,
-            'disaster_repair': True,
-            'disaster_type': 'Fire',
-            'repair_cost': 100
-        }
-        ui.add_to_build_queue('line', segment_data, player, 0)
+        self._mark_segment_destroyed(line, damaged_segment)
         
         # Calculate ridership after damage
         ui.invalidate_ridership_cache()
@@ -3237,16 +3653,7 @@ class TestDisasterSegmentBlocking(unittest.TestCase):
         
         # Damage middle segment (between station2 and station3)
         damaged_segment = [(12, 10), (13, 10)]
-        segment_data = {
-            'name': line.name,
-            'points': damaged_segment,
-            'segment_index': 2,
-            'total_segments': 4,
-            'disaster_repair': True,
-            'disaster_type': 'Tornado',
-            'repair_cost': 100
-        }
-        ui.add_to_build_queue('line', segment_data, player, 0)
+        self._mark_segment_destroyed(line, damaged_segment)
         
         # Route from station1 to station2 should work (before damage)
         from vehicle_presets import get_vehicle_registry
@@ -3273,6 +3680,271 @@ class TestDisasterSegmentBlocking(unittest.TestCase):
         walking_route = ui.find_fastest_route((10, 10), (14, 10))
         self.assertEqual(walking_route.get('method'), 'walk', 
                         "Walking route should be available when train route is blocked")
+
+    def test_disaster_does_not_auto_queue_repair_jobs(self):
+        """Natural disaster must not enqueue automatic connector/repair builds."""
+        from events import NaturalDisasterEvent
+        from operations import _get_line_destroyed_edges
+        from unittest.mock import patch
+
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line_points = [(10, 10), (11, 10), (12, 10), (13, 10), (14, 10)]
+        elevation_levels = ['street'] * (len(line_points) - 1)
+        ui.create_line_complete("Disaster Line", line_points, player, elevation_levels)
+
+        year = ui.get_year()
+        while len(ui.get_build_queue()) > 0:
+            result = ui.advance_year_complete(year)
+            year = result.get('new_year', year + 1)
+
+        line = ui.get_map_lines()["Disaster Line"]
+        disaster = NaturalDisasterEvent(1830, "Earthquake")
+
+        def _sample(population, k):
+            if population and hasattr(population[0], 'get_route'):
+                return [population[0]]
+            return [1]
+
+        with patch('random.sample', side_effect=_sample):
+            with patch('random.uniform', return_value=0.2):
+                ui.apply_natural_disaster_damage(disaster, 1830)
+
+        repair_jobs = [
+            b for b in ui.get_build_queue()
+            if b.get('type') == 'line' and (b.get('data') or {}).get('disaster_repair')
+        ]
+        self.assertEqual(repair_jobs, [], "Disaster must not auto-queue repair jobs")
+        self.assertTrue(ui.line_is_operationally_split(line))
+        self.assertGreater(len(_get_line_destroyed_edges(line)), 0)
+
+    def test_disaster_split_persists_after_year_advance(self):
+        """Split from disaster stays until player rebuilds."""
+        from events import NaturalDisasterEvent
+        from unittest.mock import patch
+        from operations import _get_line_destroyed_edges
+
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line_points = [(10, 10), (11, 10), (12, 10), (13, 10), (14, 10)]
+        elevation_levels = ['street'] * (len(line_points) - 1)
+        ui.create_line_complete("Split Line", line_points, player, elevation_levels)
+
+        year = ui.get_year()
+        while len(ui.get_build_queue()) > 0:
+            result = ui.advance_year_complete(year)
+            year = result.get('new_year', year + 1)
+
+        line = ui.get_map_lines()["Split Line"]
+        disaster = NaturalDisasterEvent(1830, "Tornado")
+
+        def _sample(population, k):
+            if population and hasattr(population[0], 'get_route'):
+                return [population[0]]
+            return [2]
+
+        with patch('random.sample', side_effect=_sample):
+            with patch('random.uniform', return_value=0.2):
+                ui.apply_natural_disaster_damage(disaster, 1830)
+
+        self.assertTrue(ui.line_is_operationally_split(line))
+
+        for _ in range(5):
+            result = ui.advance_year_complete(ui.get_year())
+            ui.process_build_queue()
+
+        self.assertTrue(ui.line_is_operationally_split(line))
+        self.assertGreater(len(_get_line_destroyed_edges(line)), 0)
+
+    def test_manual_rebuild_clears_destroyed_edge(self):
+        """Player-initiated segment build reconnects destroyed portions."""
+        from operations import _get_line_destroyed_edges
+
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        line_points = [(10, 10), (11, 10), (12, 10), (13, 10)]
+        elevation_levels = ['street'] * (len(line_points) - 1)
+        ui.create_line_complete("Repair Line", line_points, player, elevation_levels)
+
+        year = ui.get_year()
+        while len(ui.get_build_queue()) > 0:
+            result = ui.advance_year_complete(year)
+            year = result.get('new_year', year + 1)
+
+        line = ui.get_map_lines()["Repair Line"]
+        damaged_segment = [(11, 10), (12, 10)]
+        self._mark_segment_destroyed(line, damaged_segment)
+        self.assertTrue(ui.line_is_operationally_split(line))
+
+        segment_data = {
+            'name': line.name,
+            'points': damaged_segment,
+            'segment_index': 1,
+            'total_segments': 3,
+            'elevation_levels': ['street'],
+        }
+        ui.add_to_build_queue('line', segment_data, player, 1)
+
+        while len(ui.get_build_queue()) > 0:
+            ui.process_build_queue()
+
+        self.assertFalse(ui.line_is_operationally_split(line))
+        self.assertEqual(len(_get_line_destroyed_edges(line)), 0)
+
+
+class TestIncompleteSegmentLineSplit(unittest.TestCase):
+    """Lines split by incomplete construction operate as separate route portions."""
+
+    def setUp(self):
+        self._app = _ensure_app()
+
+    def _make_trainset(self):
+        from vehicle_presets import get_vehicle_registry
+        from vehicle import Trainset, Locomotive, Railcar
+        from resource import Wood
+
+        registry = get_vehicle_registry()
+        loco = None
+        for candidate, _year in registry.get_locomotives_by_year():
+            if getattr(candidate, 'can_have_railcars', False):
+                loco = candidate
+                break
+        if loco is None:
+            loco = Locomotive(
+                "Test Loco", fuel=Wood(), miles_per_unit=10.0, top_speed=30.0, average_speed=30.0,
+            )
+            loco.can_have_railcars = True
+        return Trainset(loco, [Railcar("Coach", 0, 60, 20)])
+
+    def test_get_line_operational_route_portions_detects_gap(self):
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        gap_route = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0), (16.0, 10.0), (17.0, 10.0)]
+        line = ui.game.create_line("Gap Line", player, gap_route)
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+
+        portions = ui.get_line_operational_route_portions(line)
+        self.assertEqual(len(portions), 2)
+        self.assertTrue(ui.line_is_operationally_split(line))
+        self.assertEqual(portions[0][0], (10.0, 10.0))
+        self.assertEqual(portions[0][-1], (12.0, 10.0))
+        self.assertEqual(portions[1][0], (16.0, 10.0))
+        self.assertEqual(portions[1][-1], (17.0, 10.0))
+
+    def test_incomplete_middle_segment_blocks_cross_gap_travel(self):
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        route = [
+            (10.0, 10.0), (11.0, 10.0), (12.0, 10.0),
+            (13.0, 10.0), (14.0, 10.0), (15.0, 10.0),
+            (16.0, 10.0), (17.0, 10.0),
+        ]
+        line = ui.game.create_line("Split Line", player, route)
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        trainset = self._make_trainset()
+        line.vehicles = [trainset]
+
+        west_a = Station("WestA", 10.0, 10.0)
+        west_b = Station("WestB", 12.0, 10.0)
+        east_a = Station("EastA", 15.0, 10.0)
+        east_b = Station("EastB", 17.0, 10.0)
+        for st in (west_a, west_b, east_a, east_b):
+            line.add_station(st)
+
+        ui.add_to_build_queue(
+            'line',
+            {
+                'name': line.name,
+                'points': [(12.0, 10.0), (13.0, 10.0), (14.0, 10.0), (15.0, 10.0)],
+                'segment_index': 2,
+                'total_segments': 4,
+                'elevation_levels': ['street', 'street', 'street'],
+            },
+            player,
+            0,
+        )
+
+        self.assertIsNotNone(ui.calculate_train_route_time(west_a, west_b, line, trainset))
+        self.assertIsNotNone(ui.calculate_train_route_time(east_a, east_b, line, trainset))
+        self.assertIsNone(ui.calculate_train_route_time(west_a, east_b, line, trainset))
+        self.assertFalse(ui.stations_on_same_operational_portion(line, west_a, east_b))
+
+    def test_continuous_line_is_single_operational_portion(self):
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        route = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0), (13.0, 10.0)]
+        line = ui.game.create_line("Connected Line", player, route)
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+
+        self.assertEqual(len(ui.get_line_operational_route_portions(line)), 1)
+        self.assertFalse(ui.line_is_operationally_split(line))
+
+    def test_get_lines_for_map_display_splits_at_gap(self):
+        """Map display must not draw a chord across route gaps."""
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        gap_route = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0), (16.0, 10.0), (17.0, 10.0)]
+        line = ui.game.create_line("Interborough", player, gap_route)
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+
+        entries = ui.get_lines_for_map_display()
+        built = [e for e in entries if e['name'] == 'Interborough' and not e['under_construction']]
+        self.assertEqual(len(built), 2)
+        self.assertEqual(built[0]['points'][0], (10.0, 10.0))
+        self.assertEqual(built[0]['points'][-1], (12.0, 10.0))
+        self.assertEqual(built[1]['points'][0], (16.0, 10.0))
+        self.assertEqual(built[1]['points'][-1], (17.0, 10.0))
+
+    def test_get_lines_for_map_display_incomplete_segment_separate(self):
+        """Incomplete middle segment renders as its own under-construction polyline."""
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        route = [
+            (10.0, 10.0), (11.0, 10.0), (12.0, 10.0),
+            (13.0, 10.0), (14.0, 10.0), (15.0, 10.0),
+            (16.0, 10.0), (17.0, 10.0),
+        ]
+        line = ui.game.create_line("Bridge Line", player, route)
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        ui.add_to_build_queue(
+            'line',
+            {
+                'name': line.name,
+                'points': [(12.0, 10.0), (13.0, 10.0), (14.0, 10.0), (15.0, 10.0)],
+                'segment_index': 2,
+                'total_segments': 4,
+                'elevation_levels': ['street', 'street', 'street'],
+            },
+            player,
+            0,
+        )
+
+        entries = ui.get_lines_for_map_display()
+        built = [e for e in entries if e['name'] == 'Bridge Line' and not e['under_construction']]
+        pending = [e for e in entries if e['name'] == 'Bridge Line' and e['under_construction']]
+        self.assertEqual(len(built), 2)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['points'][0], (12.0, 10.0))
+        self.assertEqual(pending[0]['points'][-1], (15.0, 10.0))
+
+    def test_split_line_service_frequency_sums_portions(self):
+        ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
+        player = ui.get_players()[0]
+        gap_route = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0), (20.0, 10.0), (21.0, 10.0)]
+        line = ui.game.create_line("Freq Line", player, gap_route)
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+        line.vehicles = [self._make_trainset()]
+        line.schedule = {'peak': 2.0, 'off_peak': 2.0, 'night': 2.0}
+
+        single_freq = int(line.service_frequency_per_year(trainset_avg_speed=30) or 0)
+        effective_freq = ui.get_line_effective_service_frequency_per_year(line, 30)
+        self.assertGreater(effective_freq, single_freq)
 
 import unittest
 from operations import Operations
@@ -5043,6 +5715,89 @@ class TestFerryWaterDetectionHelpers(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ops._validate_ferry_route([(45.0, 45.0), (46.0, 45.0)])
+
+
+class TestStationLandDistanceValidation(unittest.TestCase):
+    """Stations in water must be within STATION_MAX_DISTANCE_FROM_LAND_M of land."""
+
+    def setUp(self):
+        from game_presets import STATION_MAX_DISTANCE_FROM_LAND_M
+        self.max_m = STATION_MAX_DISTANCE_FROM_LAND_M
+        self.ops = Operations(
+            ["P1"], map_width=50, map_height=50, starting_money=50000,
+            map_preset_name="nyc", use_osm=True,
+        )
+        self.game_map = self.ops.get_map()
+
+    def test_station_land_distance_constant_is_60m(self):
+        self.assertEqual(self.max_m, 60.0)
+
+    def test_station_on_land_passes_water_check(self):
+        tile_system = self.game_map.tile_system
+        if not tile_system:
+            self.skipTest("Tile system not available")
+        original = tile_system.is_point_in_water
+
+        def mock_on_land(x, y, skip_osm=True):
+            return False
+
+        tile_system.is_point_in_water = mock_on_land
+        try:
+            self.ops._require_station_not_in_deep_water(self.game_map, 10.0, 10.0)
+        finally:
+            tile_system.is_point_in_water = original
+
+    def test_station_in_water_near_land_passes(self):
+        tile_system = self.game_map.tile_system
+        if not tile_system:
+            self.skipTest("Tile system not available")
+        original_in_water = tile_system.is_point_in_water
+        original_near_land = tile_system.is_point_near_land
+        captured = {}
+
+        def mock_in_water(x, y, skip_osm=True):
+            return True
+
+        def mock_near_land(x, y, max_distance_m, skip_osm=True):
+            captured['max_distance_m'] = max_distance_m
+            return True
+
+        tile_system.is_point_in_water = mock_in_water
+        tile_system.is_point_near_land = mock_near_land
+        try:
+            self.ops._require_station_not_in_deep_water(self.game_map, 10.0, 10.0)
+            self.assertEqual(captured.get('max_distance_m'), self.max_m)
+        finally:
+            tile_system.is_point_in_water = original_in_water
+            tile_system.is_point_near_land = original_near_land
+
+    def test_station_in_deep_water_rejected(self):
+        tile_system = self.game_map.tile_system
+        if not tile_system:
+            self.skipTest("Tile system not available")
+        original_in_water = tile_system.is_point_in_water
+        original_near_land = tile_system.is_point_near_land
+
+        def mock_in_water(x, y, skip_osm=True):
+            return True
+
+        def mock_not_near_land(x, y, max_distance_m, skip_osm=True):
+            return False
+
+        tile_system.is_point_in_water = mock_in_water
+        tile_system.is_point_near_land = mock_not_near_land
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                self.ops._require_station_not_in_deep_water(self.game_map, 10.0, 10.0)
+            self.assertIn("60 m from land", str(ctx.exception))
+        finally:
+            tile_system.is_point_in_water = original_in_water
+            tile_system.is_point_near_land = original_near_land
+
+    def test_station_water_check_skipped_without_water_preset(self):
+        from map import Map
+        land_map = Map(width=50, height=50, use_osm=False, map_preset_name="standard")
+        self.ops._require_station_not_in_deep_water(land_map, 10.0, 10.0)
 
 
 class TestAISplitRouteAtWater(unittest.TestCase):

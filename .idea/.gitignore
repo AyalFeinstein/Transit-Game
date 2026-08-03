@@ -1,0 +1,11 @@
+test.*
+./__pycache__/*
+.cursorrules/*
+add.*
+generate.*
+regenerate.*
+remove.*
+./savegames/*
+nyc_historical_roads_osm_generated.json.*
+.gitignore.*
+.__pycache__*

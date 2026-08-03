@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Message protocol definitions for TransitGame networking
+Message protocol definitions for GoCommuter networking
 Defines the structure of messages sent between client and server
 """
 

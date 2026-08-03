@@ -15,7 +15,7 @@ class NetworkSetupWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TransitGame - Network Setup")
+        self.setWindowTitle("GoCommuter - Network Setup")
         self.setGeometry(100, 100, 500, 400)
         
         # Network client
