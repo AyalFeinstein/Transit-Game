@@ -1727,31 +1727,38 @@ class TestUIFunctions(unittest.TestCase):
         self.assertGreater(len(build_queue), 0)
     
     def test_natural_disaster_damages_line_segments(self):
-        """Test that natural disasters add damaged segments to build queue"""
-        from operations import Operations
+        """Natural disasters mark destroyed edges without auto-queuing repair builds."""
+        from operations import Operations, _get_line_destroyed_edges
         from events import NaturalDisasterEvent
-        
+        from unittest.mock import patch
+
         ui = Operations(["Player1"], 50, 50, 20000, 1.0, 1.0)
         player = ui.get_players()[0]
-        
-        # Create a completed line
-        points = [(10, 10), (11, 10), (12, 10), (13, 10)]
-        ui.create_line_complete("Test Line", points, player)
-        
-        # Process build queue to complete the line
-        ui.process_build_queue()
-        
+
+        route = [(10.0, 10.0), (11.0, 10.0), (12.0, 10.0), (13.0, 10.0)]
+        line = ui.game.create_line("Test Line", player, route)
+        player.acquire_line(line)
+        ui.game.get_map().add_line(line)
+
         initial_queue_size = len(ui.get_build_queue())
-        
-        # Create a natural disaster
         disaster = NaturalDisasterEvent(1830, "Earthquake")
-        
-        # Apply disaster damage
-        ui.apply_natural_disaster_damage(disaster, 1830)
-        
-        # Check that damaged segments were added to build queue
-        final_queue_size = len(ui.get_build_queue())
-        self.assertGreaterEqual(final_queue_size, initial_queue_size)
+
+        def _sample(population, k):
+            if population and hasattr(population[0], 'get_route'):
+                return [population[0]]
+            return [1]
+
+        with patch('random.sample', side_effect=_sample):
+            with patch('random.uniform', return_value=0.2):
+                ui.apply_natural_disaster_damage(disaster, 1830)
+
+        self.assertEqual(len(ui.get_build_queue()), initial_queue_size)
+        repair_jobs = [
+            b for b in ui.get_build_queue()
+            if b.get('type') == 'line' and (b.get('data') or {}).get('disaster_repair')
+        ]
+        self.assertEqual(repair_jobs, [])
+        self.assertGreater(len(_get_line_destroyed_edges(line)), 0)
     
     def test_vehicle_registry_integration(self):
         """Test that UI properly uses vehicle registry"""
