@@ -1,0 +1,13 @@
+# Requirements for GoCommuter
+# Core dependencies
+PyQt6>=6.0.0
+PyQt6-WebEngine>=6.0.0
+
+# Optional: OpenStreetMap integration
+# Install with: pip install requests
+requests>=2.25.0
+
+# Optional: Faster JSON for OSM roads (5x faster than stdlib)
+# Install with: pip install orjson
+orjson>=3.9.0
+

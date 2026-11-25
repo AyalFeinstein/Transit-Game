@@ -1,0 +1,9 @@
+1. All game logic should always be in operations.py, not qt_networked.py
+2. In qt_networked.py, the PC version and networked version should use the same code. (There should be very little branching between versions.)
+3. There should never be redundant code.
+4. Tests should always be written as unit tests in seperate files from the main code.
+5. There should be no need to update qt.py in the future, as it should not be used because the code uses the qt_networked.py code.
+6. The user should be able to create new OSM maps without modifying any current files
+7. Do not create new unit test files. Use preexisting ones.
+8. Core files (operations.py, map.py, game.py, ai.py, map_preset_loader.py) must not contain hardcoded references to specific map presets (e.g. nyc, ny_metro). Use map_preset_loader, preset discovery, and preset-provided functions. Map-specific logic belongs in map_presets_*.py files.
+9. AI thinking logic can be in ai.py instead of operations.py
