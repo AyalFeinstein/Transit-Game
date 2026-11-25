@@ -411,10 +411,39 @@ def get_water_mask():
     return WATER_MASK
 
 
+# Small boosts to yearly population growth in Brooklyn and Queens while they grew fastest.
+# Areas are lat/lon boxes that together cover each borough's land (rough at the borders).
+_BROOKLYN_AREAS = (
+    {'min_lat': 40.57, 'max_lat': 40.68, 'min_lon': -74.04, 'max_lon': -73.86},   # south and east
+    {'min_lat': 40.68, 'max_lat': 40.70, 'min_lon': -74.00, 'max_lon': -73.90},   # Brooklyn Heights to Bushwick
+    {'min_lat': 40.70, 'max_lat': 40.735, 'min_lon': -73.965, 'max_lon': -73.90},  # Williamsburg, Greenpoint
+)
+_QUEENS_AREAS = (
+    {'min_lat': 40.735, 'max_lat': 40.765, 'min_lon': -73.958, 'max_lon': -73.70},  # Long Island City east
+    {'min_lat': 40.765, 'max_lat': 40.80, 'min_lon': -73.935, 'max_lon': -73.70},   # Astoria to Bayside
+    {'min_lat': 40.68, 'max_lat': 40.735, 'min_lon': -73.90, 'max_lon': -73.70},    # Ridgewood to Queens Village
+    {'min_lat': 40.54, 'max_lat': 40.68, 'min_lon': -73.86, 'max_lon': -73.70},     # Jamaica, Rockaways
+)
+# (name, first year, last year, areas, extra yearly growth, description)
+AREA_GROWTH_BONUSES = (
+    ("Brooklyn Ferry Suburbs", 1835, 1860, _BROOKLYN_AREAS, 0.015,
+     "Steam ferries make Brooklyn a commuter town for Manhattan."),
+    ("Brooklyn Bridge Growth", 1883, 1898, _BROOKLYN_AREAS, 0.01,
+     "The Brooklyn Bridge draws new residents across the East River."),
+    ("Brooklyn Subway Era", 1905, 1930, _BROOKLYN_AREAS, 0.01,
+     "New bridges and subway lines fill in Brooklyn's outer neighbourhoods."),
+    ("Queens Bridge and Subway Boom", 1909, 1932, _QUEENS_AREAS, 0.015,
+     "The Queensboro Bridge and new subway lines open Queens to development."),
+    ("Queens Postwar Suburbs", 1946, 1965, _QUEENS_AREAS, 0.01,
+     "Postwar housing spreads across eastern Queens."),
+)
+
+
 def get_events() -> list:
-    """Historical events for this map."""
+    """Historical events for this map: the city's, plus Brooklyn and Queens growth periods."""
+    from events import AreaGrowthBonusEvent
     from nyc_events import get_nyc_events
-    return get_nyc_events()
+    return get_nyc_events() + [AreaGrowthBonusEvent(*bonus) for bonus in AREA_GROWTH_BONUSES]
 
 
 def get_road_utils():

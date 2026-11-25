@@ -320,10 +320,13 @@ class Map:
         rate = max(0.0, min(1.0, float(rate)))
         return int(pop * rate)
     
-    def update_population_over_time(self, current_year: int, event_population_change: float = 0.0):
+    def update_population_over_time(self, current_year: int, event_population_change: float = 0.0,
+                                    area_population_changes: dict = None):
         """Update population levels based on the current year.
         Population grows over time, with some locations growing faster than others.
-        event_population_change: additional percentage change from events (e.g., 0.05 for 5% increase)"""
+        event_population_change: additional percentage change from events (e.g., 0.05 for 5% increase)
+        area_population_changes: {event name: area change} from the game's events (extra growth
+        in some boroughs or boxes); looked up from the game when not given."""
         import random
         
         # Get population settings from preset or use standard
@@ -401,8 +404,9 @@ class Map:
         event_multiplier = (1.0 + event_population_change) if event_population_change != 0.0 else 1.0
 
         # Get area-specific population changes from events (if preset map)
-        area_population_changes = {}
-        if self.map_preset_name and self.map_preset_name != DEFAULT_PRESET_NAME:
+        if area_population_changes is None:
+            area_population_changes = {}
+        if not area_population_changes and self.map_preset_name and self.map_preset_name != DEFAULT_PRESET_NAME:
             try:
                 if hasattr(self, '_game') and hasattr(self._game, 'event_system'):
                     event_effects = self._game.event_system.get_combined_effects(current_year)
@@ -458,6 +462,11 @@ class Map:
                         # Check if point is in affected borough
                         point_borough = point_area_map.get((x, y), {}).get('borough', 'Unknown')
                         if point_borough in area_change['boroughs']:
+                            area_multiplier *= (1.0 + area_change['change_percent'])
+                    elif 'bounds_list' in area_change:
+                        # Several boxes (an area that is not a rectangle): inside any one counts once
+                        if any(b['min_lat'] <= lat <= b['max_lat'] and b['min_lon'] <= lon <= b['max_lon']
+                               for b in area_change['bounds_list']):
                             area_multiplier *= (1.0 + area_change['change_percent'])
                     elif 'bounds' in area_change:
                         # Check if point is in affected bounds

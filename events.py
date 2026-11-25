@@ -18,6 +18,28 @@ class GameEvent:
         return {}
 
 
+class AreaGrowthBonusEvent(GameEvent):
+    """Extra yearly population growth inside some areas between two years (inclusive).
+
+    ``areas`` is a sequence of lat/lon boxes (dicts with min_lat, max_lat, min_lon, max_lon);
+    a place inside any of them grows ``bonus`` faster each year (0.01 = 1% more). Maps list
+    these in their own files (see a preset's ``get_events``).
+    """
+    def __init__(self, name: str, start_year: int, end_year: int, areas, bonus: float, description: str = ""):
+        super().__init__(name=name, year=int(start_year), description=description or name)
+        self.end_year = int(end_year)
+        self.areas = tuple(dict(a) for a in areas)
+        self.bonus = float(bonus)
+
+    def get_effect(self, current_year: int) -> dict:
+        if not (self.year <= current_year <= self.end_year):
+            return {}
+        return {
+            'area_population_change': {'bounds_list': self.areas, 'change_percent': self.bonus},
+            'description': f"{self.name}: {self.bonus * 100:.1f}% extra yearly growth",
+        }
+
+
 class AutomobileInventionEvent(GameEvent):
     """The invention of the automobile, which gradually reduces train profits"""
     def __init__(self):
