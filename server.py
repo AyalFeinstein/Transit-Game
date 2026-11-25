@@ -3,16 +3,13 @@
 Game server for GoCommuter multiplayer networking
 Uses aiohttp + python-socketio for WebSocket-based communication
 """
-import asyncio
-import json
 import pickle
 import base64
-from typing import Dict, Optional
+from typing import Dict
 from aiohttp import web
 import socketio
-from operations import setup_game, Operations
+from operations import Operations
 from game import Game
-from player import Player
 
 # Create Socket.IO server
 sio = socketio.AsyncServer(cors_allowed_origins="*", async_mode='aiohttp')
@@ -20,7 +17,7 @@ app = web.Application()
 sio.attach(app)
 
 # Game session management
-game_sessions: Dict[str, Dict] = {}  # session_id -> {game: Game, ui: Operations, players: {sid: player_id}, current_turn: int}
+game_sessions: Dict[str, Dict] = {}  # session_id -> {game, ui: Operations, players: {sid: player_id}, ...}
 
 # Game settings (shared across all clients)
 game_settings = {
@@ -34,54 +31,83 @@ game_settings = {
 
 
 def serialize_game_state(game: Game) -> dict:
-    """Serialize game state to JSON-serializable format"""
-    try:
-        print(f"Serializing game state: game type={type(game)}, year={game.get_year()}, players={len(game.get_players())}")
-        
-        # For now, use pickle + base64 for complex objects
-        # Use protocol 4 for better compatibility (protocol 5 requires Python 3.8+)
-        # In production, you'd want a more efficient serialization
-        game_data = pickle.dumps(game, protocol=4)
-        print(f"Pickled game data: {len(game_data)} bytes")
-        
-        # Encode to base64 for JSON transmission
-        game_data_b64 = base64.b64encode(game_data).decode('utf-8')
-        print(f"Base64 encoded: {len(game_data_b64)} characters")
-        
-        result = {
-            'game_data': game_data_b64,
-            'year': game.get_year(),
-            'is_playing': game.is_playing,
-            'num_players': len(game.get_players()),
-            'active_players': len(game.get_active_players())
-        }
-        
-        print(f"Serialized state keys: {list(result.keys())}, game_data length: {len(result['game_data'])}")
-        return result
-    except (pickle.PicklingError, TypeError) as e:
-        print(f"Pickling error serializing game state: {e}")
-        print(f"Game type: {type(game)}")
-        print(f"Game attributes: {dir(game)}")
-        import traceback
-        traceback.print_exc()
-        raise
-    except Exception as e:
-        print(f"Unexpected error serializing game state: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    """Game state message: the pickled Game (base64) plus a few summary fields."""
+    game_data = pickle.dumps(game, protocol=4)
+    return {
+        'game_data': base64.b64encode(game_data).decode('utf-8'),
+        'year': game.get_year(),
+        'is_playing': game.is_playing,
+        'num_players': len(game.get_players()),
+        'active_players': len(game.get_active_players()),
+    }
 
 
+def _operations_init_parameters() -> frozenset:
+    import inspect
+    params = inspect.signature(Operations.__init__).parameters
+    return frozenset(name for name in params if name not in ('self', 'player_names'))
+
+
+def build_operations(player_names: list, operations_kwargs: dict) -> Operations:
+    """Operations for a new networked game from a client's setup settings (unknown keys ignored)."""
+    allowed = _operations_init_parameters()
+    kwargs = {k: v for k, v in (operations_kwargs or {}).items() if k in allowed}
+    # JSON turns int dict keys into strings
+    for key in ('ai_focus_per_player', 'ai_difficulty_per_player', 'ai_specialty_per_player'):
+        if isinstance(kwargs.get(key), dict):
+            kwargs[key] = {int(k): v for k, v in kwargs[key].items()}
+    if 'inflation_rate' in kwargs:
+        from inflation_utils import set_inflation_rate_multiplier
+        set_inflation_rate_multiplier(kwargs['inflation_rate'])
+    return Operations(list(player_names), **kwargs)
+
+
+def human_seats(game: Game) -> list[int]:
+    """Player indices that connected clients play (everyone who is not an AI)."""
+    return [i for i, p in enumerate(game.get_players()) if not getattr(p, 'is_ai', False)]
+
+
+async def start_session(creator_sid: str, player_names: list, operations_kwargs: dict, client_sids: list) -> str:
+    """Create a game, seat ``client_sids`` in the human seats and send each its game_created."""
+    ui = build_operations(player_names, operations_kwargs)
+    game = ui.get_game()
+    seats = human_seats(game)
+    players = dict(zip(client_sids, seats))
+    import uuid
+    session_id = str(uuid.uuid4())
+    game_sessions[session_id] = {
+        'game': game,
+        'ui': ui,
+        'players': players,
+        'player_names': [p.get_name() for p in game.get_players()],
+        'end_year_ready': set(),
+        'creator_sid': creator_sid,
+    }
+    state = serialize_game_state(game)
+    names = game_sessions[session_id]['player_names']
+    all_players = [{'player_id': pid, 'player_name': names[pid], 'connected': True} for pid in players.values()]
+    for client_sid, player_id in players.items():
+        await sio.enter_room(client_sid, session_id)
+        await sio.emit('game_created', {
+            'session_id': session_id,
+            'player_id': player_id,
+            'player_name': names[player_id],
+            'game_state': state,
+            'all_players': all_players,
+        }, room=client_sid)
+    print(f"Game {session_id} started: {len(players)} connected player(s), "
+          f"{len(names) - len(seats)} AI, map {operations_kwargs.get('map_preset_name') or 'default'}")
+    return session_id
 
 
 # Track all connected clients globally
-connected_clients = set()
+connected_clients: Dict[str, bool] = {}  # sid -> True, in connection order
 
 @sio.event
 async def connect(sid, environ):
     """Handle client connection"""
     print(f"Client connected: {sid}")
-    connected_clients.add(sid)
+    connected_clients[sid] = True
     await sio.emit('connected', {'message': 'Connected to GoCommuter server'}, room=sid)
     # Send current game settings to new client
     await sio.emit('settings_updated', game_settings, room=sid)
@@ -91,7 +117,7 @@ async def connect(sid, environ):
 async def disconnect(sid):
     """Handle client disconnection"""
     print(f"Client disconnected: {sid}")
-    connected_clients.discard(sid)
+    connected_clients.pop(sid, None)
     # Remove player from any game sessions
     for session_id, session in list(game_sessions.items()):
         if sid in session['players']:
@@ -109,70 +135,26 @@ async def disconnect(sid):
             break
 
 
-@sio.event
-async def create_game(sid, data):
-    """Create a new game session and automatically assign all connected players"""
-    try:
-        player_names = data.get('player_names', [])
-        map_width = data.get('map_width', 100)
-        map_height = data.get('map_height', 75)
-        starting_money = data.get('starting_money', 50000)
-        worker_replenishment_rate = data.get('worker_replenishment_rate', 1.0)
-        
-        if len(player_names) < 2:
-            await sio.emit('error', {'message': 'Need at least 2 players'}, room=sid)
-            return
-        
-        # Get all currently connected clients
-        # Limit to number of player names available
-        num_players = len(player_names)
-        connected_sessions = list(connected_clients)[:num_players]
-        
-        if len(connected_sessions) < 2:
-            await sio.emit('error', {'message': 'Not enough players connected. Need at least 2 players connected to server.'}, room=sid)
-            return
-        
-        # Create game via Operations (single source of truth)
-        ai_player_indices = data.get('ai_player_indices') or []
-        ui = Operations(player_names, map_width, map_height, starting_money, worker_replenishment_rate, ai_player_indices=ai_player_indices)
-        game = ui.get_game()
-        
-        import uuid
-        session_id = str(uuid.uuid4())
-        
-        players_dict = {}
-        for i, client_sid in enumerate(connected_sessions):
-            players_dict[client_sid] = i
-        
-        game_sessions[session_id] = {
-            'game': game,
-            'ui': ui,
-            'players': players_dict,
-            'current_turn': 0,  
-            'player_names': player_names,
-            'end_year_ready': set(),
-            'creator_sid': sid,
-        }
-        
-        for client_sid, player_id in players_dict.items():
-            await sio.enter_room(client_sid, session_id)
-            
-            await sio.emit('game_created', {
-                'session_id': session_id,
-                'player_id': player_id,
-                'player_name': player_names[player_id],
-                'game_state': serialize_game_state(game),
-                'all_players': [{'player_id': pid, 'player_name': player_names[pid], 'connected': True} 
-                               for pid in range(len(connected_sessions))]
-            }, room=client_sid)
-        
-        print(f"Game created: {session_id} by {sid} with {len(connected_sessions)} connected players")
-        
-    except Exception as e:
-        print(f"Error creating game: {e}")
-        import traceback
-        traceback.print_exc()
-        await sio.emit('error', {'message': str(e)}, room=sid)
+async def _start_for_connected_clients(sid, player_names: list, operations_kwargs: dict):
+    if len(player_names) < 2:
+        await sio.emit('error', {'message': 'Need at least 2 players'}, room=sid)
+        return
+    ai_indices = set(operations_kwargs.get('ai_player_indices') or [])
+    seat_count = sum(1 for i in range(len(player_names)) if i not in ai_indices)
+    seated = {c for session in game_sessions.values() for c in session['players']}
+    clients = [c for c in connected_clients if c not in seated]
+    if not clients:
+        await sio.emit('error', {'message': 'No players connected'}, room=sid)
+        return
+    if len(clients) > seat_count:
+        await sio.emit('error', {
+            'message': f'{len(clients)} players are connected but the game has only {seat_count} human seat(s). '
+                       'Add players or reduce the number of AI players.',
+        }, room=sid)
+        return
+    # The client starting the game takes the first seat.
+    clients.sort(key=lambda c: c != sid)
+    await start_session(sid, player_names, operations_kwargs, clients)
 
 
 @sio.event
@@ -190,7 +172,7 @@ async def join_game(sid, data):
         player_names = session['player_names']
         
         connected_player_ids = set(session['players'].values())
-        available_slots = [i for i in range(len(player_names)) if i not in connected_player_ids]
+        available_slots = [i for i in human_seats(game) if i not in connected_player_ids]
         
         if not available_slots:
             await sio.emit('error', {'message': 'Game is full'}, room=sid)
@@ -246,7 +228,7 @@ async def get_game_state(sid, data):
 
 @sio.event
 async def player_action(sid, data):
-    """Handle player action (build line, buy trainset, advance year, etc.)"""
+    """A player's action: an Operations call (operations_call) or being ready to end the year (end_year)."""
     try:
         session_id = data.get('session_id')
         action_type = data.get('action_type')
@@ -267,33 +249,17 @@ async def player_action(sid, data):
         ui = session['ui']
         player = game.get_players()[player_id]
         
-        # No turn-based restrictions - all players act simultaneously
-        
-        # Process action
-        result = {'success': False, 'message': 'Unknown action'}
-        
-        if action_type == 'build_line':
-            # action_data: {'name': str, 'points': list, 'construction_workers': int}
-            result = await handle_build_line(ui, player, action_data)
-            
-        elif action_type == 'buy_trainset':
-            # action_data: {'item_id': str or index}
-            result = await handle_buy_trainset(ui, player, action_data)
-            
-        elif action_type == 'assign_trainset':
-            # action_data: {'trainset_index': int, 'line_name': str}
-            result = await handle_assign_trainset(ui, player, action_data)
-            
+        # All players act simultaneously (no turns).
+        if action_type == 'operations_call':
+            # action_data: network_rpc.encode_operations_call(...) - any game-changing Operations call
+            result = handle_operations_call(ui, player, action_data)
+
         elif action_type == 'end_year':
-            # Track that this player is ready to end the year
-            active_players = game.get_active_players()
-            active_player_ids = {i for i, p in enumerate(game.get_players()) if not p.is_eliminated}
-            
-            # Initialize end_year_ready if it doesn't exist (for backwards compatibility)
-            if 'end_year_ready' not in session:
-                session['end_year_ready'] = set()
-            
-            # Add this player to the ready set
+            # The year ends once every connected, living human is ready (the server runs the AIs).
+            players = game.get_players()
+            active_player_ids = {
+                pid for pid in session['players'].values() if not players[pid].is_eliminated
+            }
             session['end_year_ready'].add(player_id)
             
             # Check if all active players are ready
@@ -331,43 +297,18 @@ async def player_action(sid, data):
                     'ready_players': [session['player_names'][pid] for pid in session['end_year_ready']]
                 }, room=session_id)
         
-        elif action_type == 'advance_year':
-            # Legacy support - redirect to end_year
-            result = {'success': False, 'message': 'Use "end_year" action instead'}
-            
-        elif action_type == 'rent_workers':
-            # action_data: {'worker_type_name': str, 'quantity': int}
-            result = await handle_rent_workers(ui, player, action_data, game)
-            
-        elif action_type == 'sell_trainset':
-            # action_data: {'trainset_index': int}
-            result = await handle_sell_trainset(ui, player, action_data)
-            
-        elif action_type == 'end_turn':
-            # No longer needed in simultaneous play mode
-            result = {'success': False, 'message': 'Turn-based mode is disabled - use "end_year" instead'}
-            
         else:
             result = {'success': False, 'message': f'Unknown action type: {action_type}'}
         
-        # Broadcast updated game state to all players (ALWAYS broadcast to keep marketplace in sync)
-        # Even if action failed, we still broadcast to ensure all clients have latest state
-        if result.get('success'):
-            # Broadcast game state to keep all clients synchronized (especially marketplace stock)
-            await sio.emit('game_state', {
-                'game_state': serialize_game_state(game),
-                'action_result': result
-            }, room=session_id)
-        else:
-            # Still broadcast game state even on failure to keep marketplace in sync
-            # (in case stock changed due to another player's action)
-            await sio.emit('game_state', {
-                'game_state': serialize_game_state(game),
-                'action_result': result
-            }, room=session_id)
-            # Also send failure notification to the requesting client
+        # Everyone gets the new state after every action (even a failed one: the state is still
+        # the latest); the acting client is also told about a failure.
+        await sio.emit('game_state', {
+            'game_state': serialize_game_state(game),
+            'action_result': result,
+        }, room=session_id)
+        if not result.get('success'):
             await sio.emit('action_failed', result, room=sid)
-        
+
     except Exception as e:
         print(f"Error processing action: {e}")
         import traceback
@@ -375,294 +316,38 @@ async def player_action(sid, data):
         await sio.emit('error', {'message': str(e)}, room=sid)
 
 
-async def handle_build_line(ui, player, action_data):
-    """Handle build line action"""
+# Operations calls that address the shared build queue by index (first args).
+BUILD_QUEUE_METHODS = frozenset({'cancel_build', 'assign_workers_to_build', 'reorder_build_queue'})
+
+
+def handle_operations_call(ui, player, action_data):
+    """Run a client's Operations call on the server's game, as that client's player."""
+    from network_rpc import decode_operations_call, lines_in_call, players_in_call
     try:
-        name = action_data.get('name')
-        points = action_data.get('points')
-        construction_workers = action_data.get('construction_workers', 0)
-        
-        if not name or not points:
-            return {'success': False, 'message': 'Missing name or points'}
-        
-        if len(points) < 2:
-            return {'success': False, 'message': 'Line must have at least 2 points'}
-        
-        # Call UI method to build line
-        result = ui.create_line_complete(name, points, player)
-        return {
-            'success': True,
-            'message': f"Line '{name}' construction started",
-            'cost': result.get('cost', 0),
-            'build_time': result.get('build_time', 0)
-        }
-    except ValueError as e:
-        return {'success': False, 'message': str(e)}
+        method, args, kwargs = decode_operations_call(ui.get_game(), action_data)
     except Exception as e:
-        print(f"Error in handle_build_line: {e}")
-        import traceback
-        traceback.print_exc()
-        return {'success': False, 'message': str(e)}
-
-
-async def handle_buy_trainset(ui, player, action_data):
-    """Handle buy trainset/vehicle action with quantity checking"""
+        return {'success': False, 'message': f'Rejected action: {e}'}
+    # A player may only act for themselves (the first player argument is the one acting)
+    # and only change their own lines when no player is named.
+    acting = players_in_call(args, kwargs)
+    if acting and acting[0] is not player:
+        return {'success': False, 'message': f'{method}: you can only act for your own company'}
+    if not acting:
+        for line in lines_in_call(args, kwargs):
+            if getattr(line, 'owner', player) is not player:
+                return {'success': False, 'message': f'{method}: {line.name} is not your line'}
+    if method in BUILD_QUEUE_METHODS:
+        queue = ui.get_game().build_queue
+        index = args[0] if args else None
+        if not isinstance(index, int) or not (0 <= index < len(queue)) or queue[index].get('player') is not player:
+            return {'success': False, 'message': f'{method}: not one of your constructions'}
     try:
-        # item_id is marketplace index
-        item_index = action_data.get('item_id')
-        if item_index is None:
-            return {'success': False, 'message': 'Missing item_id'}
-        
-        try:
-            item_index = int(item_index)
-        except (ValueError, TypeError):
-            return {'success': False, 'message': 'Invalid item_id format'}
-        
-        # Get marketplace items
-        marketplace = ui.game.get_marketplace()
-        sale_items = marketplace.get_available_items(ui.game.get_year())
-        
-        if not sale_items or item_index < 0 or item_index >= len(sale_items):
-            return {'success': False, 'message': 'Invalid item index'}
-        
-        sale_item = sale_items[item_index]
-        current_year = ui.game.get_year()
-        
-        # Check quantity BEFORE purchase
-        quantity_before = sale_item.get_quantity_available()
-        if quantity_before <= 0:
-            return {'success': False, 'message': 'Item is out of stock'}
-        
-        # Determine if this is a line or vehicle
-        from line import Line
-        vehicle_or_line = sale_item.get_item()
-        is_line = isinstance(vehicle_or_line, Line)
-        
-        # Get item identifier for tracking
-        if is_line:
-            item_name = vehicle_or_line.name
-        else:
-            from vehicle import Trainset
-            if isinstance(vehicle_or_line, Trainset):
-                item_name = vehicle_or_line.locomotive.name if hasattr(vehicle_or_line, 'locomotive') and vehicle_or_line.locomotive else "Unknown"
-            else:
-                item_name = getattr(vehicle_or_line, 'name', 'Unknown')
-        
-        # Purchase the item using the appropriate UI method
-        try:
-            if is_line:
-                # Handle line purchase
-                result_line = ui.buy_line_by_purchase(sale_item, player)
-                if result_line:
-                    line_name = sale_item.get_item().name
-                    # Check quantity AFTER purchase
-                    quantity_after = sale_item.get_quantity_available()
-                    result = {
-                        'success': True,
-                        'message': f'Purchased line {line_name} for ${sale_item.get_price()}',
-                        'remaining_money': player.get_money(),
-                        'item_name': line_name,
-                        'item_type': 'line',
-                        'quantity_before': quantity_before,
-                        'quantity_after': quantity_after
-                    }
-                else:
-                    result = {'success': False, 'message': 'Failed to purchase line - insufficient funds or other error'}
-            else:
-                # Handle vehicle purchase
-                purchase_result = ui.buy_vehicle_complete(sale_item, player, current_year)
-                # Find the SaleItem again to check quantity after purchase
-                # It might have been removed or quantity changed
-                quantity_after = 0
-                target_list = marketplace.available_lines if is_line else marketplace.available_vehicles
-                for si in target_list:
-                    si_item = si.get_item()
-                    if (si_item == vehicle_or_line or 
-                        (hasattr(si_item, 'name') and hasattr(vehicle_or_line, 'name') and 
-                         si_item.name == vehicle_or_line.name and type(si_item) == type(vehicle_or_line))):
-                        quantity_after = si.get_quantity_available()
-                        break
-                
-                result = {
-                    'success': True,
-                    'message': f'Purchased {purchase_result.get("item_name", "item")} for ${purchase_result.get("price", 0)}',
-                    'remaining_money': purchase_result.get('remaining_money', 0),
-                    'item_name': purchase_result.get('item_name', item_name),
-                    'item_type': 'vehicle',
-                    'quantity_before': quantity_before,
-                    'quantity_after': quantity_after
-                }
-            
-            # Return the result (either line or vehicle purchase)
-            return result
-        except ValueError as e:
-            return {'success': False, 'message': str(e)}
-        except Exception as e:
-            print(f"Error purchasing item: {e}")
-            import traceback
-            traceback.print_exc()
-            return {'success': False, 'message': str(e)}
-    except Exception as e:
-        print(f"Error in handle_buy_trainset: {e}")
-        import traceback
-        traceback.print_exc()
+        outcome = getattr(ui, method)(*args, **kwargs)
+    except (ValueError, KeyError, IndexError) as e:
         return {'success': False, 'message': str(e)}
-
-
-async def handle_assign_trainset(ui, player, action_data):
-    """Handle assign trainset to line action"""
-    try:
-        trainset_index = action_data.get('trainset_index')
-        line_name = action_data.get('line_name')
-        
-        if trainset_index is None or not line_name:
-            return {'success': False, 'message': 'Missing trainset_index or line_name'}
-        
-        # Get player's unassigned trainsets
-        unassigned = ui.get_unassigned_trainsets(player)
-        if not unassigned or trainset_index < 0 or trainset_index >= len(unassigned):
-            return {'success': False, 'message': 'Invalid trainset index'}
-        
-        trainset = unassigned[trainset_index]
-        
-        # Assign trainset to line
-        try:
-            ui.assign_trainset_to_line(trainset, line_name)
-            return {
-                'success': True,
-                'message': f'Trainset assigned to line {line_name}'
-            }
-        except Exception as e:
-            return {'success': False, 'message': str(e)}
-    except Exception as e:
-        print(f"Error in handle_assign_trainset: {e}")
-        import traceback
-        traceback.print_exc()
-        return {'success': False, 'message': str(e)}
-
-
-async def handle_sell_trainset(ui, player, action_data):
-    """Handle sell trainset for half price action"""
-    try:
-        trainset_index = action_data.get('trainset_index')
-        
-        if trainset_index is None:
-            return {'success': False, 'message': 'Missing trainset_index'}
-        
-        try:
-            trainset_index = int(trainset_index)
-        except (ValueError, TypeError):
-            return {'success': False, 'message': 'Invalid trainset_index format'}
-        
-        # Get player's trainsets
-        trainsets = ui.get_player_trainsets(player)
-        if not trainsets or trainset_index < 0 or trainset_index >= len(trainsets):
-            return {'success': False, 'message': 'Invalid trainset index'}
-        
-        trainset = trainsets[trainset_index]
-        
-        # Sell trainset using UI method
-        try:
-            result = ui.sell_trainset_for_half_price(trainset, player)
-            return {
-                'success': True,
-                'message': f'Trainset sold for ${result.get("sale_price", 0)}',
-                'sale_price': result.get('sale_price', 0),
-                'new_money': result.get('new_money', 0)
-            }
-        except ValueError as e:
-            return {'success': False, 'message': str(e)}
-        except Exception as e:
-            print(f"Error selling trainset: {e}")
-            import traceback
-            traceback.print_exc()
-            return {'success': False, 'message': str(e)}
-    except Exception as e:
-        print(f"Error in handle_sell_trainset: {e}")
-        import traceback
-        traceback.print_exc()
-        return {'success': False, 'message': str(e)}
-
-
-async def handle_rent_workers(ui, player, action_data, game):
-    """Handle rent workers action with quantity checking"""
-    try:
-        worker_type_name = action_data.get('worker_type_name')
-        quantity = action_data.get('quantity')
-        
-        if worker_type_name is None or quantity is None:
-            return {'success': False, 'message': 'Missing worker_type_name or quantity'}
-        
-        try:
-            quantity = int(quantity)
-        except (ValueError, TypeError):
-            return {'success': False, 'message': 'Invalid quantity format'}
-        
-        if quantity <= 0:
-            return {'success': False, 'message': 'Quantity must be positive'}
-        
-        marketplace = ui.game.get_marketplace()
-        current_year = ui.game.get_year()
-        
-        # Check worker supply BEFORE rental
-        supply_before = marketplace.get_worker_supply(worker_type_name)
-        if supply_before < quantity:
-            return {'success': False, 'message': f'Not enough {worker_type_name} available. Only {supply_before} available, requested {quantity}'}
-        
-        # Import worker types
-        from worker import ENGINEER, CONSTRUCTION_WORKER, LAWYER
-        worker_map = {
-            'Engineer': ENGINEER,
-            'Construction Worker': CONSTRUCTION_WORKER,
-            'Lawyer': LAWYER
-        }
-        
-        worker_type = worker_map.get(worker_type_name)
-        if not worker_type:
-            return {'success': False, 'message': f'Unknown worker type: {worker_type_name}'}
-        
-        # Calculate cost
-        try:
-            cost = ui.calculate_worker_rental_cost(worker_type, quantity, current_year)
-        except:
-            # Fallback cost calculation
-            base_cost = 100 * quantity
-            cost = base_cost
-        
-        # Check if player can afford
-        if ui.get_player_money(player) < cost:
-            return {'success': False, 'message': f'Cannot afford to rent {quantity} {worker_type_name}. Cost: ${cost}, have: ${ui.get_player_money(player)}'}
-        
-        # Rent the workers using UI method
-        try:
-            ui.rent_workers_for_player(player, worker_type, quantity, current_year)
-        except ValueError as e:
-            return {'success': False, 'message': str(e)}
-        
-        # Deduct marketplace supply
-        marketplace.deduct_worker_supply(worker_type_name, quantity)
-        
-        # Deduct player money
-        ui.deduct_player_money(player, cost)
-        
-        # Check supply AFTER rental
-        supply_after = marketplace.get_worker_supply(worker_type_name)
-        
-        return {
-            'success': True,
-            'message': f'Rented {quantity} {worker_type_name} for ${cost}',
-            'worker_type_name': worker_type_name,
-            'quantity': quantity,
-            'cost': cost,
-            'remaining_money': ui.get_player_money(player),
-            'supply_before': supply_before,
-            'supply_after': supply_after
-        }
-    except Exception as e:
-        print(f"Error renting workers: {e}")
-        import traceback
-        traceback.print_exc()
-        return {'success': False, 'message': str(e)}
+    if isinstance(outcome, dict) and outcome.get('success') is False:
+        return {'success': False, 'message': outcome.get('error_message') or outcome.get('message') or f'{method} failed'}
+    return {'success': True, 'method': method}
 
 
 async def handle_advance_year(ui, game):
@@ -821,101 +506,22 @@ async def update_setting(sid, data):
 
 @sio.event
 async def start_game(sid, data):
-    """Start game on server - creates game for all connected players"""
+    """Start a game for every connected client with the starting client's settings."""
     try:
-        # Use current game settings
-        player_names = game_settings.get('player_names', ['Player1', 'Player2'])
-        map_width = game_settings.get('map_width', 100)
-        map_height = game_settings.get('map_height', 75)
-        starting_money = game_settings.get('starting_money', 50000)
-        worker_replenishment_rate = game_settings.get('worker_replenishment_rate', 1.0)
-        
-        # Get all currently connected clients
-        num_players = len(connected_clients)
-        if num_players < 2:
-            await sio.emit('error', {'message': 'Need at least 2 players connected to start game'}, room=sid)
-            return
-        
-        # Limit player names to number of connected clients
-        actual_player_names = player_names[:num_players]
-        # Pad with default names if needed
-        while len(actual_player_names) < num_players:
-            actual_player_names.append(f"Player{len(actual_player_names) + 1}")
-        
-        # Create game via Operations (single source of truth)
-        ai_player_indices = (data or {}).get('ai_player_indices') or []
-        ui = Operations(actual_player_names, map_width, map_height, starting_money, worker_replenishment_rate, ai_player_indices=ai_player_indices)
-        game = ui.get_game()
-        
-        # Generate session ID
-        import uuid
-        session_id = str(uuid.uuid4())
-        
-        # Store session - assign all connected clients to player slots
-        players_dict = {}
-        for i, client_sid in enumerate(list(connected_clients)):
-            players_dict[client_sid] = i
-        
-        game_sessions[session_id] = {
-            'game': game,
-            'ui': ui,
-            'players': players_dict,
-            'current_turn': 0,  # Keep for compatibility, but not used
-            'player_names': actual_player_names,
-            'end_year_ready': set(),  # Track which players have pressed "end year"
-            'creator_sid': sid,
+        data = data or {}
+        player_names = data.get('player_names') or game_settings.get('player_names', ['Player1', 'Player2'])
+        from map_preset_loader import get_new_game_default_preset
+        operations_kwargs = data.get('operations_kwargs') or {
+            'map_preset_name': get_new_game_default_preset(),
+            'map_width': game_settings.get('map_width', 100),
+            'map_height': game_settings.get('map_height', 75),
+            'starting_money': game_settings.get('starting_money', 50000),
+            'worker_replenishment_rate': game_settings.get('worker_replenishment_rate', 1.0),
         }
-        
-        # Serialize game state once for all clients
-        try:
-            serialized_game_state = serialize_game_state(game)
-            print(f"Game state serialized successfully: {len(serialized_game_state.get('game_data', ''))} bytes")
-        except Exception as e:
-            print(f"Error serializing game state: {e}")
-            import traceback
-            traceback.print_exc()
-            # Notify all connected clients of the error
-            error_msg = f'Failed to serialize game state: {str(e)}'
-            for client_sid in connected_clients:
-                await sio.emit('error', {'message': error_msg}, room=client_sid)
-            return
-        
-        # Add all connected clients to the session room and notify them
-        for client_sid, player_id in players_dict.items():
-            await sio.enter_room(client_sid, session_id)
-            
-            # Send game created event to each client with their assigned player info
-            try:
-                # Split the data to avoid potential size issues
-                # Send game_state separately if it's too large
-                game_data_size = len(serialized_game_state.get('game_data', ''))
-                print(f"Sending game_created to client {client_sid[:8]}... (game_data size: {game_data_size} chars)")
-                
-                emit_data = {
-                    'session_id': session_id,
-                    'player_id': player_id,
-                    'player_name': actual_player_names[player_id],
-                    'game_state': serialized_game_state,
-                    'all_players': [{'player_id': pid, 'player_name': actual_player_names[pid], 'connected': True} 
-                                   for pid in range(len(players_dict))]
-                }
-                
-                await sio.emit('game_created', emit_data, room=client_sid)
-                print(f"Successfully sent game_created to client {client_sid[:8]}")
-            except Exception as e:
-                print(f"Error sending game_created to client {client_sid}: {e}")
-                import traceback
-                traceback.print_exc()
-                # Try to send error to client
-                try:
-                    await sio.emit('error', {'message': f'Failed to send game data: {str(e)}'}, room=client_sid)
-                except:
-                    pass
-        
-        print(f"Game started: {session_id} with {len(players_dict)} connected players")
-        
+        if 'ai_player_indices' in data:
+            operations_kwargs = {**operations_kwargs, 'ai_player_indices': data.get('ai_player_indices') or []}
+        await _start_for_connected_clients(sid, list(player_names), operations_kwargs)
     except Exception as e:
-        print(f"Error starting game: {e}")
         import traceback
         traceback.print_exc()
         await sio.emit('error', {'message': str(e)}, room=sid)

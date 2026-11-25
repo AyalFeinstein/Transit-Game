@@ -3,7 +3,7 @@ from typing import Dict
 
 class WorkerType:
     """Represents a type of worker"""
-    def __init__(self, name: str, base_salary: int, description: str = ""):
+    def __init__(self, name: str, base_salary: float, description: str = ""):
         self.name = name
         self.base_salary = base_salary
         self.description = description
@@ -17,16 +17,31 @@ class WorkerType:
         """Get the current salary multiplier"""
         return self.salary_multiplier
     
+    def __setstate__(self, state):
+        # Saved games keep their own copy of each worker type; take the current base salary.
+        self.__dict__.update(state)
+        current = BASE_SALARIES.get(self.__dict__.get('name'))
+        if current is not None:
+            self.base_salary = current
+
     def get_yearly_cost(self, current_year: int = 1830) -> int:
         """Calculate yearly cost with inflation and salary multiplier (same 1×–10× calendar curve as marketplace)."""
         from inflation_utils import get_inflation_factor
         inflation_factor = get_inflation_factor(current_year, max_factor=10.0)
         return int(self.base_salary * inflation_factor * self.salary_multiplier)
 
-ENGINEER = WorkerType("Engineer", base_salary=500, description="Required to operate trainsets")
-CONSTRUCTION_WORKER = WorkerType("Construction Worker", base_salary=500, description="Required to build lines and stations")
-MAINTENANCE_WORKER = WorkerType("Maintenance Worker", base_salary=125, description="Improves quality of lines and stations")
-LAWYER = WorkerType("Lawyer", base_salary=1000, description="Helps win lawsuits")
+# Base yearly salary per worker type (1830 money, before inflation and the salary multiplier).
+BASE_SALARIES = {
+    "Engineer": 281.25,
+    "Construction Worker": 281.25,
+    "Maintenance Worker": 70.3125,
+    "Lawyer": 562.5,
+}
+
+ENGINEER = WorkerType("Engineer", base_salary=BASE_SALARIES["Engineer"], description="Required to operate trainsets")
+CONSTRUCTION_WORKER = WorkerType("Construction Worker", base_salary=BASE_SALARIES["Construction Worker"], description="Required to build lines and stations")
+MAINTENANCE_WORKER = WorkerType("Maintenance Worker", base_salary=BASE_SALARIES["Maintenance Worker"], description="Improves quality of lines and stations")
+LAWYER = WorkerType("Lawyer", base_salary=BASE_SALARIES["Lawyer"], description="Helps win lawsuits")
 
 class WorkerRental:
     """Represents a player's rental of workers"""
@@ -80,11 +95,18 @@ class WorkerRental:
         # Calculate how much underpaid workers are
         underpayment = self.demanded_multiplier - current_multiplier
         
-        # Strike happens only if underpaid by at least 0.5x
-        if (underpayment >= 0.5 and 
-            self.strike_turns_remaining == 0):
+        # Strike happens only if underpaid by at least 0.5x, and only after the player was
+        # warned at an earlier year end (a warning always comes first, with a year to respond).
+        warned_year = getattr(self, 'strike_warned_year', None)
+        if underpayment < 0.5:
+            self.strike_warned_year = None  # paid enough: the threat is withdrawn
+        elif (self.strike_turns_remaining == 0 and warned_year is not None
+              and warned_year < current_year - 1):
+            # The year end that gave the warning reports the old year and advances workers
+            # with the new one, so the warning must be at least one full year old.
             # Workers go on strike!
             self.strike_turns_remaining = random.randint(1, 5)
+            self.strike_warned_year = None
     
     def will_strike_next_turn(self, current_year: int) -> bool:
         """Check if workers will go on strike next turn (before advancing)"""

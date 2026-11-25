@@ -78,13 +78,16 @@ self.network_client.game_state_received.connect(self.on_game_state_received)
 self.network_client.error_received.connect(self.on_error)
 ```
 
-4. **Send actions when player performs them:**
+4. **Forward the player's actions to the server.** Once the game window has its
+   `Operations`, every game-changing call it makes is replayed on the server:
 ```python
-# When player builds a line
-self.network_client.build_line(name="Line1", points=[(10, 10), (20, 20)])
-
-# When player advances year
-self.network_client.advance_year()
+from network_rpc import install_network_operations
+install_network_operations(
+    self.operations,
+    lambda message: self.network_client.send_action('operations_call', message),
+)
+# Ending the year is a vote: the year advances when every connected human is ready
+self.network_client.end_year()
 ```
 
 5. **Update UI when game state is received:**
@@ -97,53 +100,44 @@ def on_game_state_received(self, data):
 
 ## Game Flow
 
-1. **Server Setup**: One player starts the server
-2. **Create Game**: First player creates a game session with player names
-3. **Join Game**: Other players join using the session ID
-4. **Play**: Players take turns performing actions
-5. **Synchronization**: Server broadcasts game state after each action
+1. **Server Setup**: One player starts the server (or "Start Local Server" in the lobby)
+2. **Connect**: Every player connects from the Network Settings tab
+3. **Start**: One player presses Start Game; the server builds the game from that player's
+   settings (map, money, AI players, ...) and seats each connected client in a human seat.
+   Free human seats can be taken later with the session ID ("Join Game").
+4. **Play**: Everyone acts at the same time; AI players run on the server
+5. **Synchronization**: The server broadcasts the game state after each action
 
-## Available Actions
+## Actions
 
-The following actions can be sent to the server:
-
-- `build_line(name, points, construction_workers)`: Build a new transit line
-- `buy_trainset(item_id)`: Buy a trainset from marketplace
-- `assign_trainset(trainset_index, line_name)`: Assign trainset to line
-- `advance_year()`: Advance the game year (ends turn)
-- `end_turn()`: End current turn without advancing year
+Client UI code calls `Operations` methods exactly as in local play. The methods listed in
+`network_rpc.NETWORK_OPERATIONS` (building, buying, selling, schedules, workers, lawsuits,
+...) run locally for immediate feedback and are sent to the server, which runs them on its
+own game as the sending player and rejects acting for another company. Game objects in the
+arguments (players, lines, stations, vehicles, marketplace listings) are sent as references.
 
 ## Message Protocol
 
-Messages follow this structure:
-
-**Client → Server:**
+**Client → Server** (`player_action`):
 ```python
 {
     'session_id': 'uuid-string',
-    'action_type': 'build_line',
-    'action_data': {
-        'name': 'Line1',
-        'points': [(10, 10), (20, 20)],
-        'construction_workers': 2
-    }
+    'action_type': 'operations_call',          # or 'end_year'
+    'action_data': {'method': 'create_line_complete', 'call': '<encoded arguments>'},
 }
 ```
 
-**Server → Client:**
+**Server → Client** (`game_state`, after every action):
 ```python
 {
     'game_state': {
         'game_data': 'base64-encoded-pickled-game',
         'year': 1830,
-        'is_playing': True,
-        'num_players': 2,
-        'active_players': 2
+        'is_playing': False,
+        'num_players': 3,
+        'active_players': 3
     },
-    'action_result': {
-        'success': True,
-        'message': 'Line built successfully'
-    }
+    'action_result': {'success': True, 'method': 'create_line_complete'}
 }
 ```
 
@@ -170,15 +164,8 @@ client = NetworkClient("http://your-server-ip:8080")
 
 ### Adding New Actions
 
-1. Add action type to `ActionType` enum in `message_protocol.py`
-2. Add handler function in `server.py`:
-```python
-async def handle_new_action(ui, player, action_data):
-    # Your logic here
-    return {'success': True, 'message': 'Action completed'}
-```
-3. Add case in `player_action` event handler
-4. Add method to `NetworkClient` class
+Add the new `Operations` method's name to `network_rpc.NETWORK_OPERATIONS`; the UI keeps
+calling it as usual.
 
 ## Troubleshooting
 
@@ -186,7 +173,6 @@ async def handle_new_action(ui, player, action_data):
 
 - **"Connection refused"**: Server is not running or wrong URL/port
 - **"Game session not found"**: Invalid session ID or session expired
-- **"Not your turn"**: Trying to perform turn-based action out of turn
 
 ### Game State Issues
 

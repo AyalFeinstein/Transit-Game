@@ -22,6 +22,8 @@ class MapPresetRegistry:
         for preset_file in current_dir.glob("map_presets_*.py"):
             if "template" in preset_file.stem.lower() or preset_file.stem.endswith("_backup"):
                 continue
+            if preset_file.stem.endswith("_utils"):
+                continue  # helper modules shared by presets, not playable maps
             preset_name = preset_file.stem.replace("map_presets_", "")
             self._presets[preset_name] = {
                 'module': None,
@@ -80,7 +82,7 @@ class MapPresetRegistry:
         """Get a preset module by name.
         
         Args:
-            preset_name: Name of the preset (e.g., "nyc", "ny_metro", "custom")
+            preset_name: Name of the preset (the part of the file name after map_presets_)
             
         Returns:
             The preset module, or None if not found
@@ -91,11 +93,6 @@ class MapPresetRegistry:
         """List all available preset names."""
         return list(self._presets.keys())
     
-    def get_preset_info(self, preset_name: str) -> Optional[Dict[str, Any]]:
-        """Get information about a preset."""
-        return self._presets.get(preset_name)
-
-
 # Global registry instance
 _registry: Optional[MapPresetRegistry] = None
 
@@ -112,7 +109,7 @@ def load_map_preset(preset_name: str) -> Optional[Any]:
     """Load a map preset by name.
     
     Args:
-        preset_name: Name of the preset (e.g., "nyc", "ny_metro", "custom")
+        preset_name: Name of the preset (the part of the file name after map_presets_)
         
     Returns:
         The preset module, or None if not found
@@ -148,23 +145,128 @@ def preset_has_water_areas(preset_name: str) -> bool:
     return preset is not None and hasattr(preset, 'is_water_location')
 
 
-def preset_ai_relax_polyline_self_overlap_for_osm_candidate(
-    preset_name: str,
-    current_year: int,
-    min_pop_road: int,
-    existing_line_routes,
-) -> bool:
-    """Delegate to preset module if it defines ai_relax_polyline_self_overlap_for_osm_candidate (e.g. NYC OSM)."""
+# The map used when a game does not name one, and whose settings are the fallback for
+# anything another map leaves unspecified.
+DEFAULT_PRESET_NAME = "standard"
+
+
+def _preset_name_of(preset_or_map) -> Optional[str]:
+    if isinstance(preset_or_map, str) or preset_or_map is None:
+        return preset_or_map
+    return getattr(preset_or_map, 'map_preset_name', None)
+
+
+def _preset_hook(preset_name: str, hook: str, default=None):
+    """Call the preset's ``hook()`` (or read its ``hook`` attribute); ``default`` if absent."""
     if not preset_name:
-        return False
+        return default
     preset = load_map_preset(preset_name)
-    fn = getattr(preset, "ai_relax_polyline_self_overlap_for_osm_candidate", None)
-    if not callable(fn):
-        return False
-    try:
-        return bool(fn(current_year, min_pop_road, existing_line_routes))
-    except Exception:
-        return False
+    value = getattr(preset, hook, None) if preset is not None else None
+    if value is None:
+        return default
+    if callable(value):
+        try:
+            value = value()
+        except Exception:
+            return default
+    return default if value is None else value
+
+
+def get_map_view_center(preset_name: str):
+    """(lat, lon) the map view opens and re-centers on (preset ``MAP_VIEW_CENTER``), or None."""
+    center = _preset_hook(preset_name, 'MAP_VIEW_CENTER', None)
+    if not center or len(center) != 2:
+        return None
+    return float(center[0]), float(center[1])
+
+
+def get_new_game_default_preset() -> str:
+    """Map preselected in the new-game dialog: the one declaring NEW_GAME_DEFAULT, else the default map."""
+    for name in list_available_presets():
+        if _preset_hook(name, 'NEW_GAME_DEFAULT', False) is True:
+            return name
+    return DEFAULT_PRESET_NAME
+
+
+def get_default_preset():
+    """Module of the default map."""
+    return load_map_preset(DEFAULT_PRESET_NAME)
+
+
+def get_default_map_bounds() -> dict:
+    return get_map_bounds(DEFAULT_PRESET_NAME) or {
+        'center_lat': 0.0, 'center_lon': 0.0, 'default_width': 100, 'default_height': 75}
+
+
+def get_default_map_timeline() -> dict:
+    return get_map_timeline(DEFAULT_PRESET_NAME) or {'start_year': 1830, 'end_year': 2050}
+
+
+def get_default_map_zoom() -> dict:
+    return get_map_zoom(DEFAULT_PRESET_NAME) or {'default_zoom': 12, 'min_zoom': 8, 'max_zoom': 19}
+
+
+def get_default_population_settings() -> dict:
+    return get_preset_population_settings(DEFAULT_PRESET_NAME) or {}
+
+
+def default_grid_population_at(x: int, y: int, width: int, height: int) -> int:
+    """Starting population of a cell on maps without their own population data."""
+    preset = get_default_preset()
+    fn = getattr(preset, 'get_grid_population_at_location', None) if preset else None
+    if callable(fn):
+        try:
+            return int(fn(x, y, width, height))
+        except Exception:
+            pass
+    return 100
+
+
+def get_preset_population_settings(preset_name: str) -> Optional[Dict[str, Any]]:
+    """The preset's population settings (growth rates, targets by year), or None."""
+    if not preset_name:
+        return None
+    preset = load_map_preset(preset_name)
+    if preset is None:
+        return None
+    for name in (f"get_{preset_name}_population_settings", "get_population_settings"):
+        fn = getattr(preset, name, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
+    return getattr(preset, 'MAP_POPULATION', None)
+
+
+def get_preset_water_mask(preset_or_map):
+    """The preset's offline water/boundary data (a ``water_mask.WaterMask``), or None."""
+    return _preset_hook(_preset_name_of(preset_or_map), 'get_water_mask')
+
+
+def get_preset_events(preset_or_map) -> list:
+    """Historical events the preset adds to a game."""
+    return list(_preset_hook(_preset_name_of(preset_or_map), 'get_events', []) or [])
+
+
+def get_preset_road_utils(preset_or_map):
+    """Module with the preset's street-network data and queries, or None if it has no streets."""
+    return _preset_hook(_preset_name_of(preset_or_map), 'get_road_utils')
+
+
+def get_preset_transit_company_names(preset_or_map) -> list:
+    """AI company names specific to the preset (empty when it has none)."""
+    return list(_preset_hook(_preset_name_of(preset_or_map), 'TRANSIT_COMPANY_NAMES', []) or [])
+
+
+def get_preset_place_names(preset_or_map) -> tuple:
+    """((name, lat, lon), ...) neighbourhood / town centres used to name stations and lines."""
+    return tuple(_preset_hook(_preset_name_of(preset_or_map), 'get_place_names', ()) or ())
+
+
+def get_preset_area_boxes(preset_or_map) -> tuple:
+    """((name, min_lat, max_lat, min_lon, max_lon), ...) broad areas, used when no place is near."""
+    return tuple(_preset_hook(_preset_name_of(preset_or_map), 'get_area_boxes', ()) or ())
 
 
 def get_preset_excluded_water_points(preset_name: str) -> set:
@@ -183,8 +285,7 @@ def get_preset_excluded_water_points(preset_name: str) -> set:
 
 def preset_is_point_in_water(preset_name: str, grid_x: float, grid_y: float, game_map, skip_osm: bool = False) -> bool:
     """Check if grid point is in water using preset's water detection. Returns False if preset has no water support.
-    skip_osm: If True, do not use OSM/Overpass (avoids HTTP calls). Use preset-only water data (e.g. NYC_WATER_AREAS)."""
-    import math
+    skip_osm: If True, do not use OSM/Overpass (avoids HTTP calls). Use preset-only water data."""
     preset = load_map_preset(preset_name)
     if not preset or not hasattr(preset, 'is_water_location'):
         return False
@@ -199,8 +300,13 @@ def preset_is_point_in_water(preset_name: str, grid_x: float, grid_y: float, gam
     h = max(1, getattr(game_map, 'height', 50) or 50)
     min_lat, max_lat = bounds['min_lat'], bounds['max_lat']
     min_lon, max_lon = bounds['min_lon'], bounds['max_lon']
-    lat = min_lat + (gy / h) * (max_lat - min_lat)
-    lon = min_lon + (gx / w) * (max_lon - min_lon)
+    # The exact point, not its cell: rivers such as the East River are narrower than a grid
+    # cell, so rounding to the cell moved points in mid-river onto the shore.
+    lat = min_lat + (float(grid_y) / h) * (max_lat - min_lat)
+    lon = min_lon + (float(grid_x) / w) * (max_lon - min_lon)
+    ts = getattr(game_map, 'tile_system', None)
+    if getattr(ts, '_preset_only_water', False):
+        skip_osm = True
     osm = None if skip_osm else getattr(game_map, 'osm_integration', None)
     try:
         argcount = preset.is_water_location.__code__.co_argcount
@@ -251,9 +357,7 @@ def warm_game_start_year_end_caches(preset_name: str, game_map) -> None:
         game_map._preset_point_area_map_cache = {}
     if preset_has_road_support(preset_name):
         try:
-            from map_presets_nyc_road_utils import _get_ai_road_features
-
-            _get_ai_road_features(game_map, max_points=12)
+            get_preset_road_utils(preset_name)._get_ai_road_features(game_map, max_points=12)
         except Exception:
             pass
     try:
@@ -292,29 +396,6 @@ def get_preset_is_point_on_bridge(preset_name: str, x: float, y: float, year: in
         return False
 
 
-def get_preset_land_segment_fraction_on_street(
-    preset_name: str,
-    game_map,
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    current_year: int,
-) -> float:
-    """Share of a land segment lying on the preset street network (0..1)."""
-    if not preset_name or not preset_has_road_support(preset_name):
-        return 0.0
-    from map_presets_nyc_road_utils import land_segment_fraction_on_street_network
-    try:
-        return float(
-            land_segment_fraction_on_street_network(
-                game_map, float(x1), float(y1), float(x2), float(y2), int(current_year),
-            )
-        )
-    except Exception:
-        return 0.0
-
-
 def get_preset_bus_segment_follows_street(
     preset_name: str,
     game_map,
@@ -324,13 +405,23 @@ def get_preset_bus_segment_follows_street(
     y2: float,
     current_year: int,
 ) -> bool:
-    """True when a bus segment lies on the preset street network."""
-    from game_presets import BUS_STREET_MIN_SEGMENT_COVERAGE
+    """True when an entire bus land segment stays within 5m of a street centerline."""
+    from game_presets import BUS_STREET_MIN_SEGMENT_COVERAGE, BUS_STREET_MAX_DISTANCE_GRID
 
-    frac = get_preset_land_segment_fraction_on_street(
-        preset_name, game_map, x1, y1, x2, y2, current_year,
-    )
-    return frac >= float(BUS_STREET_MIN_SEGMENT_COVERAGE)
+    if not preset_name or not preset_has_road_support(preset_name):
+        return False
+    try:
+        land_segment_fraction_on_street_network = get_preset_road_utils(
+            preset_name).land_segment_fraction_on_street_network
+        frac = float(
+            land_segment_fraction_on_street_network(
+                game_map, float(x1), float(y1), float(x2), float(y2), int(current_year),
+                max_distance_grid=float(BUS_STREET_MAX_DISTANCE_GRID),
+            )
+        )
+    except Exception:
+        return False
+    return frac + 1e-12 >= float(BUS_STREET_MIN_SEGMENT_COVERAGE)
 
 
 def get_preset_point_near_street_centerline(
@@ -343,49 +434,11 @@ def get_preset_point_near_street_centerline(
     """True when a point lies near a preset street/bridge centerline (train midpoint check)."""
     if not preset_name or not preset_has_road_support(preset_name):
         return False
-    from map_presets_nyc_road_utils import point_near_street_network
     try:
+        point_near_street_network = get_preset_road_utils(preset_name).point_near_street_network
         return bool(point_near_street_network(game_map, float(x), float(y), int(current_year)))
     except Exception:
         return False
-
-
-def get_preset_polyline_follows_streets(
-    preset_name: str, game_map, points: list, current_year: int,
-) -> bool:
-    """Fast check that an AI street polyline can be queued on a road-capable preset."""
-    if not preset_name or not points or len(points) < 2:
-        return False
-    preset = load_map_preset(preset_name)
-    if not preset or not hasattr(preset, 'polyline_follows_streets_for_ai'):
-        return True
-    try:
-        return bool(preset.polyline_follows_streets_for_ai(game_map, points, current_year))
-    except Exception:
-        return False
-
-
-def get_preset_street_route_between_points(
-    preset_name: str,
-    game_map,
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    current_year: int,
-    max_distance_grid: float = 15.0,
-) -> list:
-    """Grid polyline from A to B along streets, or a straight chord when roads are unavailable."""
-    if not preset_name or not preset_has_road_support(preset_name):
-        return [(float(x1), float(y1)), (float(x2), float(y2))]
-    from map_presets_nyc_road_utils import find_street_route_between_points
-    try:
-        return find_street_route_between_points(
-            game_map, float(x1), float(y1), float(x2), float(y2), int(current_year),
-            max_distance_grid=max_distance_grid,
-        )
-    except Exception:
-        return [(float(x1), float(y1)), (float(x2), float(y2))]
 
 
 def get_preset_ai_station_population(game_map, px: float, py: float, pop_map: dict) -> int:
@@ -402,8 +455,8 @@ def get_preset_ai_station_population(game_map, px: float, py: float, pop_map: di
             return max(0, int(fn(float(px), float(py), game_map, pop_map) or 0))
         except Exception:
             pass
-    from map_presets_nyc_road_utils import _population_at_or_near
-    return _population_at_or_near(float(px), float(py), pop_map, radius=4)
+    from map_preset_utils import population_at_or_near
+    return population_at_or_near(float(px), float(py), pop_map, radius=4)
 
 
 def get_preset_station_name_for_point(
@@ -481,8 +534,7 @@ def _format_geography_street_label(raw: str, preset_name: str = None) -> str:
     if preset_name:
         try:
             if preset_has_road_support(preset_name):
-                from map_presets_nyc_road_utils import format_osm_road_name_for_display
-                return format_osm_road_name_for_display(str(raw).strip())
+                return get_preset_road_utils(preset_name).format_osm_road_name_for_display(str(raw).strip())
         except Exception:
             pass
     s = str(raw).replace("_", " ").strip()
@@ -534,8 +586,20 @@ def resolve_geography_station_name(
     existing_names: set = None,
     station_ordinal: int = None,
 ) -> Optional[str]:
-    """Street- or neighborhood-based station name from map geography (never fictional placeholders)."""
+    """Street- or neighborhood-based station name from map geography (never fictional placeholders).
+
+    The same rules on every map (geo_naming): cross-streets, else the neighbourhood or town,
+    else "place – street". The preset's own naming hook is only a fallback."""
     existing_names = existing_names or set()
+    if preset_name and game_map is not None:
+        try:
+            from geo_naming import station_name_for_point
+            year = current_year if current_year is not None else (getattr(game_map, 'start_year', None) or 1830)
+            geo = station_name_for_point(game_map, x, y, int(year), existing_names)
+            if geo:
+                return geo
+        except Exception:
+            pass
     if preset_name:
         suggestion = get_preset_station_name_for_point(
             preset_name,
@@ -920,37 +984,6 @@ def get_preset_default_line_names(preset_name: str) -> list:
         return preset_names
 
 
-def get_preset_available_line_corridor_counts(
-    preset_name: str, game_map, current_year: int,
-) -> dict:
-    """Counts of buildable street corridors for AI lines (OSM presets only)."""
-    if not preset_name or game_map is None:
-        return {'total_roads_in_bounds': 0, 'buildable_corridors': 0, 'unique_named_streets': 0}
-    preset = load_map_preset(preset_name)
-    if preset is None:
-        return {'total_roads_in_bounds': 0, 'buildable_corridors': 0, 'unique_named_streets': 0}
-    fn = getattr(preset, 'count_available_line_corridors', None)
-    if not callable(fn):
-        return {'total_roads_in_bounds': 0, 'buildable_corridors': 0, 'unique_named_streets': 0}
-    try:
-        return dict(fn(game_map, int(current_year)))
-    except Exception:
-        return {'total_roads_in_bounds': 0, 'buildable_corridors': 0, 'unique_named_streets': 0}
-    return names
-
-
-def get_preset_default_schedule_scheme(preset_name: str) -> Optional[Dict[str, float]]:
-    """Default schedule scheme for new lines (e.g. peak/off_peak/night multipliers). None if not set."""
-    if not preset_name:
-        return None
-    preset = load_map_preset(preset_name)
-    if preset is None:
-        return None
-    if hasattr(preset, 'DEFAULT_SCHEDULE_SCHEME') and preset.DEFAULT_SCHEDULE_SCHEME:
-        return dict(preset.DEFAULT_SCHEDULE_SCHEME)
-    return None
-
-
 def get_preset_road_segment_points(preset_name: str, game_map, current_year: int, max_points: int = 12,
                                    existing_line_routes=None, min_length_grid=None, max_length_grid=None,
                                    min_endpoint_population=None, rng=None, preset=None) -> list:
@@ -1067,3 +1100,65 @@ def get_preset_road_extension_points(preset_name: str, game_map, base_pt: tuple,
                 )
     except Exception:
         return []
+
+
+def get_preset_miles_per_grid_unit(preset_name: str) -> float:
+    """Real-world miles per grid cell for a preset (1.0 when the map has no geography).
+
+    A preset may set ``MILES_PER_GRID_UNIT``; otherwise it is measured from the preset's
+    lat/lon bounds and grid size.
+    """
+    import math
+    preset = load_map_preset(preset_name) if preset_name else None
+    if preset is None:
+        return 1.0
+    explicit = getattr(preset, 'MILES_PER_GRID_UNIT', None)
+    if isinstance(explicit, (int, float)) and explicit > 0:
+        return float(explicit)
+    b = get_map_bounds(preset_name) or {}
+    try:
+        min_lat, max_lat = float(b['min_lat']), float(b['max_lat'])
+        min_lon, max_lon = float(b['min_lon']), float(b['max_lon'])
+        width, height = float(b['width']), float(b['height'])
+    except (KeyError, TypeError, ValueError):
+        return 1.0
+    if width <= 0 or height <= 0 or max_lat <= min_lat or max_lon <= min_lon:
+        return 1.0
+    miles_per_deg_lat = 69.0
+    miles_per_deg_lon = 69.0 * math.cos(math.radians((min_lat + max_lat) / 2.0))
+    cell_y = (max_lat - min_lat) / height * miles_per_deg_lat
+    cell_x = (max_lon - min_lon) / width * miles_per_deg_lon
+    return (cell_x + cell_y) / 2.0
+
+
+def apply_preset_workplace_density(preset_name: str, population: dict, width: int, height: int) -> dict:
+    """Raise starting population where the preset says workplaces add to density.
+
+    A preset may define ``WORKPLACE_DENSITY_ZONES``: dicts with ``min_lat``, ``max_lat``,
+    ``min_lon``, ``max_lon`` and a ``multiplier`` (e.g. 1.02). The first zone containing a
+    cell applies. Population grows multiplicatively per cell, so the change carries forward.
+    """
+    preset = load_map_preset(preset_name) if preset_name else None
+    zones = getattr(preset, 'WORKPLACE_DENSITY_ZONES', None) if preset is not None else None
+    if not zones or not population:
+        return population
+    bounds = get_map_bounds(preset_name) or {}
+    if not all(k in bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon')):
+        return population
+    for (x, y), pop in list(population.items()):
+        if not pop or pop <= 0:
+            continue
+        lat, lon = convert_preset_grid_to_latlon(preset_name, x, y, bounds, width, height)
+        for zone in zones:
+            if zone['min_lat'] <= lat <= zone['max_lat'] and zone['min_lon'] <= lon <= zone['max_lon']:
+                population[(x, y)] = int(round(pop * float(zone['multiplier'])))
+                break
+    return population
+
+
+def get_preset_ai_line_specialties(preset_or_map) -> tuple:
+    """Line types AI companies may specialize in on this map (preset ``AI_LINE_SPECIALTIES``).
+
+    Empty when the preset does not say; ``ai_specialties`` then allows every type.
+    """
+    return tuple(_preset_hook(_preset_name_of(preset_or_map), 'AI_LINE_SPECIALTIES', ()) or ())

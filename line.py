@@ -94,7 +94,6 @@ class Line(RightOfWay):
         self.traversal_time_hours = 0
         self.quality = 1.0
         self.maintenance_workers = 0
-        self.num_tracks = 1  # Number of tracks (affects max frequency)
         # Elevation levels: list of 'street', 'above_ground', or 'underground' for each segment
         # Defaults to 'street' for all segments if not specified
         if elevation_levels is None:
@@ -171,6 +170,14 @@ class Line(RightOfWay):
         """Return list of stations on this line"""
         return self.stations
     
+    def route_length_miles(self, route=None) -> float:
+        """Real-world length of the route (grid length times the map's miles per cell)."""
+        route = self.get_route() if route is None else route
+        grid_length = 0.0
+        for a, b in zip(route or [], (route or [])[1:]):
+            grid_length += math.hypot(b[0] - a[0], b[1] - a[1])
+        return grid_length * float(getattr(self, 'miles_per_grid_unit', 1.0) or 1.0)
+
     def calc_traversal_time(self, avg_speed_mph=30, include_station_dwell=True):
         """Calculate time (hours) to traverse the full line at average speed.
         Includes dwell time at each station when include_station_dwell is True."""
@@ -178,11 +185,7 @@ class Line(RightOfWay):
             route = self.get_route()
             if not route or len(route) < 2:
                 return 0
-            total_distance = 0.0
-            for i in range(len(route) - 1):
-                x1, y1 = route[i]
-                x2, y2 = route[i + 1]
-                total_distance += math.hypot(x2 - x1, y2 - y1)
+            total_distance = self.route_length_miles(route)
             speed = self._effective_train_speed_mph(avg_speed_mph)
             if speed <= 0:
                 return 0.0
@@ -218,13 +221,10 @@ class Line(RightOfWay):
     def get_max_frequency_per_hour(self, time_period: str = 'peak') -> float:
         """Maximum physically feasible trains per hour (one direction).
 
-        Limited by assigned trainsets, line length, train speed, station dwell,
-        terminal turnaround, and track count.
+        Limited by assigned trainsets, line length, train speed, station dwell and terminal
+        turnaround. Trains pass each other, so the track itself sets no limit.
         """
-        from game_presets import (
-            TERMINAL_TURNAROUND_MINUTES,
-            TRACK_CAPACITY_TRAINS_PER_HOUR_BASE,
-        )
+        from game_presets import TERMINAL_TURNAROUND_MINUTES
 
         num_trains = len(self.vehicles) if self.vehicles else 0
         if num_trains <= 0:
@@ -236,17 +236,57 @@ class Line(RightOfWay):
             return 0.0
 
         round_trip_hours = (2.0 * one_way_hours) + (TERMINAL_TURNAROUND_MINUTES / 60.0)
-        max_by_trains = num_trains / round_trip_hours
+        return num_trains / round_trip_hours
 
-        # Faster trains allow slightly higher track throughput (shorter headways).
-        speed_factor = min(1.5, max(0.75, speed / 30.0))
-        track_capacity = self.num_tracks * TRACK_CAPACITY_TRAINS_PER_HOUR_BASE * speed_factor
+    def round_trip_hours(self, trainset_avg_speed=30, current_year=1830, time_period='off_peak'):
+        """Hours for one full round trip including turnaround."""
+        if isinstance(self, Bus):
+            trav_time = self.calc_traversal_time(
+                avg_speed_mph=trainset_avg_speed, current_year=current_year, time_period=time_period,
+            )
+        else:
+            trav_time = self.calc_traversal_time(avg_speed_mph=trainset_avg_speed)
+        if trav_time <= 0:
+            return 0.0
+        from game_presets import TERMINAL_TURNAROUND_MINUTES
+        return (2.0 * trav_time) + (TERMINAL_TURNAROUND_MINUTES / 60.0)
 
-        return min(track_capacity, max_by_trains)
+    def actual_frequency_per_hour(
+        self, time_period: str, trainset_avg_speed=30, current_year=1830,
+    ) -> float:
+        """Scheduled trains/hour for one period after physical caps."""
+        from game_presets import SCHEDULE_PERIODS
+        if time_period not in SCHEDULE_PERIODS:
+            return 0.0
+        sched_freq = float(self.schedule.get(time_period, 0) or 0)
+        if sched_freq <= 0:
+            return 0.0
+        round_trip = self.round_trip_hours(
+            trainset_avg_speed=trainset_avg_speed,
+            current_year=current_year,
+            time_period=time_period,
+        )
+        if round_trip <= 0:
+            return 0.0
+        return min(sched_freq, self.get_max_frequency_per_hour(time_period))
+
+    def scheduled_trips_per_year_by_period(
+        self, trainset_avg_speed=30, hours_per_year=8760, current_year=1830,
+    ) -> dict:
+        """Annual one-way trip counts per timetable period (peak/off-peak/night)."""
+        from game_presets import SCHEDULE_PERIOD_YEAR_FRACTIONS, SCHEDULE_PERIODS
+        trips = {}
+        for period in SCHEDULE_PERIODS:
+            freq = self.actual_frequency_per_hour(
+                period, trainset_avg_speed=trainset_avg_speed, current_year=current_year,
+            )
+            frac = SCHEDULE_PERIOD_YEAR_FRACTIONS[period]
+            trips[period] = int(freq * frac * hours_per_year)
+        return trips
     
     def set_schedule_frequency(self, time_period: str, frequency: float):
         """Set schedule frequency for a time period.
-        Frequency is capped at the physical limit from assigned trainsets and track capacity.
+        Frequency is capped at the physical limit from the assigned trainsets.
         Clearing profit cache ensures next profit calculation uses the new schedule."""
         max_frequency = self.get_max_frequency_per_hour(time_period)
         self.schedule[time_period] = max(0.0, min(float(frequency), max_frequency))
@@ -255,62 +295,24 @@ class Line(RightOfWay):
         if hasattr(self, '_cached_profit_year'):
             delattr(self, '_cached_profit_year')
     
-    def upgrade_tracks(self, additional_tracks: int = 1):
-        """Upgrade line by adding more tracks (increases capacity).
-        
-        Args:
-            additional_tracks: Number of tracks to add (default 1)
-        """
-        self.num_tracks += additional_tracks
-    
     def service_frequency_per_year(self, trainset_avg_speed=30, hours_per_year=8760, current_year=1830, time_period='off_peak'):
-        """Calculate how many times a trainset can traverse the line in a year.
-        Accounts for traversal time (including turnaround) and schedule.
-        hours_per_year is hours the line operates per year (typically 8760 for 24/7).
-        
-        Args:
-            trainset_avg_speed: Average speed of the trainset
-            hours_per_year: Hours the line operates per year
-            current_year: Current year (for bus traffic calculations)
-            time_period: Time period ('peak', 'off_peak', 'night') for bus traffic
-        """
-        if isinstance(self, Bus):
-            trav_time = self.calc_traversal_time(avg_speed_mph=trainset_avg_speed, current_year=current_year, time_period=time_period)
-        else:
-            trav_time = self.calc_traversal_time(avg_speed_mph=trainset_avg_speed)
-        if trav_time == 0:
-            return 0
-        # Assume 2x traversal time to account for turnaround/loading
-        round_trip_time = trav_time * 2
-        
-        # Use schedule to determine actual frequency
-        desired_frequency = (self.schedule['peak'] * 0.4 + 
-                            self.schedule['off_peak'] * 0.4 + 
-                            self.schedule['night'] * 0.2)
-        if desired_frequency == 0:
-            return 0
-
-        # Get max frequency for peak (most restrictive)
-        max_freq = self.get_max_frequency_per_hour('peak')
-        if max_freq == 0:
-            return 0
-        
-        # Actual frequency is minimum of desired and max capacity
-        actual_frequency = min(desired_frequency, max_freq, 60.0 / round_trip_time)
-        return int(actual_frequency * hours_per_year)
+        """Total scheduled one-way trips per year across all timetable periods."""
+        del time_period  # kept for API compatibility; trips are summed per period
+        by_period = self.scheduled_trips_per_year_by_period(
+            trainset_avg_speed=trainset_avg_speed,
+            hours_per_year=hours_per_year,
+            current_year=current_year,
+        )
+        return int(sum(by_period.values()))
 
     def calc_schedule_operating_cost(self, current_year: int = None) -> int:
         """Small annual cost for running scheduled service (crew, fuel wear)."""
         if not self.vehicles:
             return 0
-        from game_presets import SCHEDULE_OPERATING_COST_PER_TRAIN_HOUR
+        from game_presets import SCHEDULE_OPERATING_COST_PER_TRAIN_HOUR, schedule_weighted_trips_per_hour
         from inflation_utils import get_inflation_factor
 
-        trips_per_hour = (
-            float(self.schedule.get('peak', 0) or 0) * 0.4
-            + float(self.schedule.get('off_peak', 0) or 0) * 0.4
-            + float(self.schedule.get('night', 0) or 0) * 0.2
-        )
+        trips_per_hour = schedule_weighted_trips_per_hour(self.schedule)
         if trips_per_hour <= 0:
             return 0
         cy = int(current_year) if current_year is not None else 1830
@@ -612,11 +614,7 @@ class Bus(Line):
             route = self.get_route()
             if not route or len(route) < 2:
                 return 0
-            total_distance = 0.0
-            for i in range(len(route) - 1):
-                x1, y1 = route[i]
-                x2, y2 = route[i + 1]
-                total_distance += math.hypot(x2 - x1, y2 - y1)
+            total_distance = self.route_length_miles(route)
 
             self.update_traffic_multiplier(current_year, time_period)
             speed = self._effective_bus_speed_mph(avg_speed_mph)
@@ -697,15 +695,6 @@ class Bus(Line):
         if hasattr(self, '_cached_profit_year'):
             delattr(self, '_cached_profit_year')
     
-    def upgrade_busways(self, additional_busways: int = 1):
-        """Upgrade bus line by adding separated busways (increases capacity and eliminates traffic impact).
-        
-        Args:
-            additional_busways: Number of busways to add (default 1)
-        """
-        self.num_busways += additional_busways
-
-
 class Road(RightOfWay):
     def __init__(self,
                  name,

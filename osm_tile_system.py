@@ -49,7 +49,7 @@ class OSMTileSystem:
         self.tile_size = self.tile_size_lat  # approximate
 
         # Optional explicit bounds override (min/max lat/lon). When provided, we use
-        # bounds-based grid<->latlon conversion to match preset maps (e.g. NYC).
+        # bounds-based grid<->latlon conversion to match preset maps.
         # Format: (min_lat, min_lon, max_lat, max_lon)
         self._bounds_override: Optional[Tuple[float, float, float, float]] = None
         
@@ -62,10 +62,39 @@ class OSMTileSystem:
         # Water check deadline: when set, get_tile_type skips OSM if time.time() > _deadline (enforces 5s cap)
         self._deadline: Optional[float] = None
         # Preset-only mode: when True, use preset water detection only (no OSM) for fast cost preview
-        self._preset_only_water: bool = False
+        self._preset_only_water_scope: bool = False
+        # True when the map supplies complete offline water data (a water mask): its answer is
+        # final and the live OSM lookups, which can mislabel land near shores, are never used.
+        self.preset_water_authoritative: bool = False
 
         # Calculate bounds
         self._calculate_bounds()
+
+    @property
+    def _preset_only_water(self) -> bool:
+        """Use only the map's own water data (no live OSM): during fast checks, or always when
+        the map's offline water data is complete."""
+        return bool(getattr(self, '_preset_only_water_scope', False) or getattr(self, 'preset_water_authoritative', False))
+
+    @_preset_only_water.setter
+    def _preset_only_water(self, value: bool) -> None:
+        self._preset_only_water_scope = bool(value)
+
+    def _preset_is_water_location(self, lat: float, lon: float, osm_integration=None) -> bool:
+        """Water test of the map this tile system belongs to.
+
+        ``preset_water_fn`` is set by Map from the preset module; each preset has its own
+        notion of water. Without one, only the live OSM lookup is available.
+        """
+        fn = getattr(self, 'preset_water_fn', None)
+        if fn is None:
+            if osm_integration is not None:
+                return bool(osm_integration.is_water_at_latlon(lat, lon))
+            return False
+        try:
+            return bool(fn(lat, lon, osm_integration))
+        except TypeError:
+            return bool(fn(lat, lon))
 
     def set_water_check_deadline(self, seconds_from_now: float) -> None:
         """Set a deadline so water checks stop doing OSM after this many seconds."""
@@ -78,7 +107,7 @@ class OSMTileSystem:
         """Override the map bounds for this tile system.
 
         This is critical for preset maps that use explicit bounds-based coordinate conversion
-        (e.g. NYC and custom presets). It also dramatically improves water detection accuracy by
+        (maps with fixed geographic bounds). It also dramatically improves water detection accuracy by
         ensuring tile indices align with the map shown in the UI.
         """
         self._bounds_override = (float(min_lat), float(min_lon), float(max_lat), float(max_lon))
@@ -134,7 +163,7 @@ class OSMTileSystem:
         if cache_key in self._grid_to_latlon_cache:
             return self._grid_to_latlon_cache[cache_key]
 
-        # Preset maps (NYC/custom presets) use bounds-based conversion where grid coordinates
+        # Preset maps use bounds-based conversion where grid coordinates
         # run from (0..width, 0..height). If bounds are available, use that to stay consistent
         # with UI rendering and preset population generation.
         if self._bounds_override is not None and self.map_width and self.map_height:
@@ -193,13 +222,12 @@ class OSMTileSystem:
         # Get center of tile
         lat, lon = self._tile_to_latlon_center(tile_x, tile_y)
         
-        # Check if water using OSM integration or NYC-specific logic
+        # Check if water using OSM integration or the preset's own test
         is_water = False
-        if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
-            # For NYC: try preset-only first (no OSM) for speed; preset covers known water areas
+        if hasattr(self, 'has_preset_water') and self.has_preset_water:
+            # Preset maps: try preset-only first (no OSM) for speed; preset covers known water areas
             try:
-                from map_presets_nyc import is_water_location
-                is_water = is_water_location(lat, lon, None)
+                is_water = self._preset_is_water_location(lat, lon, None)
                 if is_water:
                     self._tile_cache[(tile_x, tile_y)] = 'water'
                     return 'water'
@@ -208,9 +236,9 @@ class OSMTileSystem:
                     self._tile_cache[(tile_x, tile_y)] = 'land'
                     return 'land'
                 # Preset said land - still check OSM for accuracy (harbor edges, etc.)
-                is_water = is_water_location(lat, lon, self.osm_integration)
+                is_water = self._preset_is_water_location(lat, lon, self.osm_integration)
             except Exception:
-                # Fallback to OSM if NYC function fails
+                # Fallback to OSM if the preset test fails
                 if self.osm_integration:
                     try:
                         is_water = self.osm_integration.is_water_at_latlon(lat, lon)
@@ -280,13 +308,19 @@ class OSMTileSystem:
             True if point is in water, False otherwise (or False if uncertain when skip_osm=True)
         """
         lat, lon = self._grid_to_latlon(x, y)
-        # CRITICAL (Governors Island ferry fix): For NYC, check PRESET water first (no OSM).
-        # OSM can misclassify piers/docks as land; preset NYC_WATER_AREAS includes the
-        # South Ferry–Governors Island channel. Preset must win so ferry routes in that corridor pass.
-        if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper and not skip_osm:
+        # Complete offline water data: the exact point's answer is final. (Tile answers come
+        # from a tile's centre, ~55 m away, and would mark shoreline land as water.)
+        if getattr(self, 'preset_water_authoritative', False):
             try:
-                from map_presets_nyc import is_water_location
-                if is_water_location(lat, lon, None):
+                return bool(self._preset_is_water_location(lat, lon, None))
+            except Exception:
+                pass
+        # Check PRESET water first (no OSM). OSM can misclassify piers/docks as land, while
+        # a preset's own water areas include its ferry channels; the preset must win so ferry
+        # routes in those corridors pass.
+        if hasattr(self, 'has_preset_water') and self.has_preset_water and not skip_osm:
+            try:
+                if self._preset_is_water_location(lat, lon, None):
                     tile_x, tile_y = self._latlon_to_tile(lat, lon)
                     tile_x = max(0, min(self.tiles_x - 1, tile_x))
                     tile_y = max(0, min(self.tiles_y - 1, tile_y))
@@ -302,9 +336,8 @@ class OSMTileSystem:
         if not skip_osm and not self._preset_only_water:
             try:
                 is_water_direct = False
-                if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
-                    from map_presets_nyc import is_water_location
-                    is_water_direct = is_water_location(lat, lon, self.osm_integration)
+                if hasattr(self, 'has_preset_water') and self.has_preset_water:
+                    is_water_direct = self._preset_is_water_location(lat, lon, self.osm_integration)
                 elif self.osm_integration:
                     is_water_direct = self.osm_integration.is_water_at_latlon(lat, lon)
                 if is_water_direct:
@@ -322,9 +355,8 @@ class OSMTileSystem:
                 lat, lon = self._grid_to_latlon(x, y)
                 is_water_direct = False
                 
-                if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
-                    from map_presets_nyc import is_water_location
-                    is_water_direct = is_water_location(lat, lon, self.osm_integration)
+                if hasattr(self, 'has_preset_water') and self.has_preset_water:
+                    is_water_direct = self._preset_is_water_location(lat, lon, self.osm_integration)
                 elif self.osm_integration:
                     is_water_direct = self.osm_integration.is_water_at_latlon(lat, lon)
                 
@@ -340,50 +372,6 @@ class OSMTileSystem:
         
         # If tile_type is None (uncertain), return False (not confidently in water)
         return tile_type == 'water'
-    
-    def get_segment_tile_types(self, x1: float, y1: float, x2: float, y2: float) -> list[str]:
-        """Get tile types for all tiles along a segment.
-        Returns list of tile types ('land' or 'water')."""
-        # Convert endpoints to lat/lon
-        lat1, lon1 = self._grid_to_latlon(x1, y1)
-        lat2, lon2 = self._grid_to_latlon(x2, y2)
-        
-        # Get tile coordinates
-        tile_x1, tile_y1 = self._latlon_to_tile(lat1, lon1)
-        tile_x2, tile_y2 = self._latlon_to_tile(lat2, lon2)
-        
-        # Clamp to valid range
-        tile_x1 = max(0, min(self.tiles_x - 1, tile_x1))
-        tile_y1 = max(0, min(self.tiles_y - 1, tile_y1))
-        tile_x2 = max(0, min(self.tiles_x - 1, tile_x2))
-        tile_y2 = max(0, min(self.tiles_y - 1, tile_y2))
-        
-        # Get all tiles along the line segment (Bresenham-like algorithm)
-        tile_types = []
-        visited_tiles = set()  # Avoid duplicate tiles
-        
-        dx = abs(tile_x2 - tile_x1)
-        dy = abs(tile_y2 - tile_y1)
-        sx = 1 if tile_x1 < tile_x2 else -1
-        sy = 1 if tile_y1 < tile_y2 else -1
-        err = dx - dy
-        
-        x, y = tile_x1, tile_y1
-        while True:
-            if (x, y) not in visited_tiles:
-                tile_types.append(self.get_tile_type(x, y))
-                visited_tiles.add((x, y))
-            if x == tile_x2 and y == tile_y2:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-        
-        return tile_types
     
     def get_water_segment_count(self, x1: float, y1: float, x2: float, y2: float) -> int:
         """Count how many water tiles a segment passes through.
@@ -489,21 +477,6 @@ class OSMTileSystem:
         
         return True  # All tiles are water
     
-    def _distance_meters(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        """Calculate distance between two lat/lon points in meters using Haversine formula"""
-        # Earth radius in meters
-        R = 6371000
-        
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        
-        a = (math.sin(dlat / 2) ** 2 +
-             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-             math.sin(dlon / 2) ** 2)
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        
-        return R * c
-    
     def _distance_meters_fast(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Fast approximation of distance in meters for nearby points (< 1km).
         Uses simple Euclidean distance in lat/lon space, which is accurate for small distances.
@@ -594,9 +567,8 @@ class OSMTileSystem:
                 if tile_type is None and not self._preset_only_water:
                     try:
                         tile_lat, tile_lon = self._tile_to_latlon_center(check_tile_x, check_tile_y)
-                        if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
-                            from map_presets_nyc import is_water_location
-                            if is_water_location(tile_lat, tile_lon, self.osm_integration):
+                        if hasattr(self, 'has_preset_water') and self.has_preset_water:
+                            if self._preset_is_water_location(tile_lat, tile_lon, self.osm_integration):
                                 tile_type = 'water'
                                 self._tile_cache[(check_tile_x, check_tile_y)] = 'water'
                         elif self.osm_integration:
@@ -658,9 +630,8 @@ class OSMTileSystem:
                 if tile_type is None:
                     try:
                         tile_lat, tile_lon = self._tile_to_latlon_center(check_tile_x, check_tile_y)
-                        if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
-                            from map_presets_nyc import is_water_location
-                            if is_water_location(tile_lat, tile_lon, self.osm_integration):
+                        if hasattr(self, 'has_preset_water') and self.has_preset_water:
+                            if self._preset_is_water_location(tile_lat, tile_lon, self.osm_integration):
                                 tile_type = 'water'
                             else:
                                 tile_type = 'land'
@@ -946,9 +917,8 @@ class OSMTileSystem:
                 return verify_callback(lat, lon)
             elif self.osm_integration:
                 try:
-                    if hasattr(self, 'is_nyc_proper') and self.is_nyc_proper:
-                        from map_presets_nyc import is_water_location
-                        return is_water_location(lat, lon, self.osm_integration)
+                    if hasattr(self, 'has_preset_water') and self.has_preset_water:
+                        return self._preset_is_water_location(lat, lon, self.osm_integration)
                     else:
                         return self.osm_integration.is_water_at_latlon(lat, lon)
                 except Exception:

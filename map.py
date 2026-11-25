@@ -1,23 +1,7 @@
-from line import RightOfWay, Line, Road, Bus, Ferry
+from line import Line
 # Dynamic map preset loading - allows custom maps without modifying main code
-from map_preset_loader import (
-    load_map_preset, is_map_preset, get_map_bounds, get_map_timeline,
-    list_available_presets, get_registry,
-    preset_has_water_areas, preset_has_population_init
-)
-try:
-    from map_presets_standard import (
-        STANDARD_BOUNDS, STANDARD_TIMELINE, STANDARD_ZOOM, STANDARD_POPULATION,
-        get_standard_population_at_location
-    )
-except ImportError:
-    STANDARD_BOUNDS = {'center_lat': 0.0, 'center_lon': 0.0, 'default_width': 100, 'default_height': 75}
-    STANDARD_TIMELINE = {'start_year': 1830, 'end_year': 2050}
-    STANDARD_ZOOM = {'default_zoom': 12, 'min_zoom': 8, 'max_zoom': 19}
-    STANDARD_POPULATION = {}
-    def get_standard_population_at_location(*args, **kwargs): return 100
-
-from map_presets import OSM_SETTINGS  # Keep OSM settings in main presets
+from map_preset_loader import load_map_preset, is_map_preset, get_map_bounds, get_map_timeline, list_available_presets, preset_has_water_areas, preset_has_population_init, get_default_map_bounds, get_default_map_timeline, get_default_map_zoom, get_default_population_settings, default_grid_population_at, get_preset_water_mask, DEFAULT_PRESET_NAME
+from map_presets import OSM_SETTINGS  # settings shared by every map
 
 
 class Map:
@@ -37,7 +21,7 @@ class Map:
         
         If use_osm is True, the map uses OpenStreetMap data for rights of way.
         map_center_lat and map_center_lon define the center point for OSM queries.
-        map_preset_name: Optional explicit preset (e.g. 'standard', 'nyc') - skips auto-detection."""
+        map_preset_name: Optional explicit preset name - skips auto-detection."""
         self.grid = grid
         self.lines = dict()
         for l in lines_list:
@@ -51,20 +35,20 @@ class Map:
         
         # Map type: use explicit preset if provided, else auto-detect
         self.map_preset_name = None
-        self.is_nyc_proper = False
-        self.is_ny_metro = False
+        self.has_preset_water = False
+        self.has_preset_population = False
         
         if map_preset_name and map_preset_name in list_available_presets():
             self.map_preset_name = map_preset_name
-            self.is_nyc_proper = preset_has_water_areas(map_preset_name)
-            self.is_ny_metro = preset_has_population_init(map_preset_name)
+            self.has_preset_water = preset_has_water_areas(map_preset_name)
+            self.has_preset_population = preset_has_population_init(map_preset_name)
         else:
             try:
                 for preset_name in list_available_presets():
                     if is_map_preset(preset_name, map_center_lat, map_center_lon, width, height):
                         self.map_preset_name = preset_name
-                        self.is_nyc_proper = preset_has_water_areas(preset_name)
-                        self.is_ny_metro = preset_has_population_init(preset_name)
+                        self.has_preset_water = preset_has_water_areas(preset_name)
+                        self.has_preset_population = preset_has_population_init(preset_name)
                         break
             except Exception:
                 pass
@@ -95,18 +79,18 @@ class Map:
                 try:
                     self.zoom_settings = getattr(preset, f"get_{self.map_preset_name}_zoom")()
                 except:
-                    self.zoom_settings = STANDARD_ZOOM
+                    self.zoom_settings = get_default_map_zoom()
             elif preset and hasattr(preset, "MAP_ZOOM"):
                 self.zoom_settings = preset.MAP_ZOOM
             else:
-                self.zoom_settings = STANDARD_ZOOM
+                self.zoom_settings = get_default_map_zoom()
         else:
             # Standard/default map
-            self.map_center_lat = map_center_lat if map_center_lat is not None else STANDARD_BOUNDS['center_lat']
-            self.map_center_lon = map_center_lon if map_center_lon is not None else STANDARD_BOUNDS['center_lon']
-            self.start_year = STANDARD_TIMELINE['start_year']
-            self.end_year = STANDARD_TIMELINE['end_year']
-            self.zoom_settings = STANDARD_ZOOM
+            self.map_center_lat = map_center_lat if map_center_lat is not None else get_default_map_bounds()['center_lat']
+            self.map_center_lon = map_center_lon if map_center_lon is not None else get_default_map_bounds()['center_lon']
+            self.start_year = get_default_map_timeline()['start_year']
+            self.end_year = get_default_map_timeline()['end_year']
+            self.zoom_settings = get_default_map_zoom()
         
         self.osm_integration = None
         if use_osm:
@@ -137,9 +121,15 @@ class Map:
                     tile_size=0.0005,  # ~55m per tile (dramatically increased resolution)
                     osm_integration=self.osm_integration
                 )
-                # Set is_nyc_proper flag on tile system for NYC-specific logic
-                if hasattr(self, 'is_nyc_proper'):
-                    self.tile_system.is_nyc_proper = self.is_nyc_proper
+                # Tell the tile system whether this map has its own water test
+                if hasattr(self, 'has_preset_water'):
+                    self.tile_system.has_preset_water = self.has_preset_water
+                # Each preset's own water test (the tile system must not assume another map's).
+                _preset_mod = load_map_preset(self.map_preset_name) if self.map_preset_name else None
+                if _preset_mod is not None and hasattr(_preset_mod, 'is_water_location'):
+                    self.tile_system.preset_water_fn = _preset_mod.is_water_location
+                _mask = get_preset_water_mask(self.map_preset_name)
+                self.tile_system.preset_water_authoritative = bool(_mask is not None and _mask.has_data())
 
                 # CRITICAL FIX: Ensure tile system bounds match preset map bounds.
                 # Without this, grid->latlon conversion can be inconsistent with UI rendering,
@@ -162,7 +152,7 @@ class Map:
         # Population is stored as {(x, y): population_count}
         # Delegate to preset-specific initialization functions
         # Try custom preset first, then fall back to hardcoded presets
-        if self.map_preset_name and self.map_preset_name != "standard" and preset_has_population_init(self.map_preset_name):
+        if self.map_preset_name and self.map_preset_name != DEFAULT_PRESET_NAME and preset_has_population_init(self.map_preset_name):
             # Custom preset - try to initialize population
             preset = load_map_preset(self.map_preset_name)
             if preset:
@@ -197,7 +187,7 @@ class Map:
                         self.population = {}
                         for x in range(self.width + 1):
                             for y in range(self.height + 1):
-                                self.population[(x, y)] = get_standard_population_at_location(x, y, self.width, self.height)
+                                self.population[(x, y)] = default_grid_population_at(x, y, self.width, self.height)
                 except Exception as e:
                     import warnings
                     warnings.warn(f"Failed to initialize population for custom preset {self.map_preset_name}: {e}")
@@ -205,7 +195,7 @@ class Map:
                     self.population = {}
                     for x in range(self.width + 1):
                         for y in range(self.height + 1):
-                            self.population[(x, y)] = get_standard_population_at_location(x, y, self.width, self.height)
+                            self.population[(x, y)] = default_grid_population_at(x, y, self.width, self.height)
             else:
                 # Preset module failed to load (load_map_preset returned None) - fall back to standard
                 import warnings
@@ -213,15 +203,24 @@ class Map:
                 self.population = {}
                 for x in range(self.width + 1):
                     for y in range(self.height + 1):
-                        self.population[(x, y)] = get_standard_population_at_location(x, y, self.width, self.height)
+                        self.population[(x, y)] = default_grid_population_at(x, y, self.width, self.height)
         else:
             # Standard map: Use similar population density (per grid square)
             self.population = {}
             for x in range(self.width + 1):
                 for y in range(self.height + 1):
-                    pop = get_standard_population_at_location(x, y, self.width, self.height)
+                    pop = default_grid_population_at(x, y, self.width, self.height)
                     self.population[(x, y)] = pop
         
+        self._remove_population_on_water()
+        if self.map_preset_name:
+            from map_preset_loader import apply_preset_workplace_density
+            try:
+                apply_preset_workplace_density(self.map_preset_name, self.population, self.width, self.height)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Workplace density adjustment failed for {self.map_preset_name}: {e}")
+
         # Points removed in edit mode - never show or use these (persists for session)
         self._deleted_population_points = set()
 
@@ -232,34 +231,51 @@ class Map:
         self._buildable_included_points: frozenset[tuple[int, int]] | None = None
         self._buildable_included_points_loaded = False
 
-    def invalidate_buildable_area_cache(self) -> None:
-        """Clear cached buildable points after edit-mode preset file changes."""
-        self._buildable_included_points = None
-        self._buildable_included_points_loaded = False
+    def _remove_population_on_water(self) -> None:
+        """Fill required land, drop excluded areas, and keep population off water.
 
-    def _get_buildable_included_points(self) -> frozenset[tuple[int, int]] | None:
-        """Included grid points for preset maps, or None when all in-bounds cells are buildable."""
-        if self._buildable_included_points_loaded:
-            return self._buildable_included_points
-        self._buildable_included_points_loaded = True
-        if self.population:
-            self._buildable_included_points = frozenset(
-                pt for pt, pop in self.population.items() if pop and int(pop) > 0
+        Water cells are dropped (people move to the nearest land cell).
+
+        Runs on the final grid, after presets spread anchors onto neighbouring cells, which
+        is what otherwise puts points in rivers and bays. Maps without real geography
+        (the standard grid) have no water data and are left as they are.
+        """
+        preset_name = getattr(self, 'map_preset_name', None)
+        if not preset_name or not self.population or not preset_has_water_areas(preset_name):
+            return
+        try:
+            from map_preset_loader import convert_preset_grid_to_latlon
+            from map_preset_utils import remove_water_population_cells
+            bounds = get_map_bounds(preset_name) or {}
+            if not all(k in bounds for k in ('min_lat', 'max_lat', 'min_lon', 'max_lon')):
+                return
+            w, h = self.width, self.height
+            to_latlon = lambda gx, gy: convert_preset_grid_to_latlon(preset_name, gx, gy, bounds, w, h)
+            preset = load_map_preset(preset_name)
+            mask = get_preset_water_mask(preset_name)
+            # Land a preset must cover even where its stored data has gaps.
+            fill_fn = getattr(preset, 'population_fill_regions', None) if preset else None
+            fill_regions = fill_fn() if callable(fill_fn) else None
+            if fill_regions:
+                from map_preset_utils import fill_population_in_regions
+                self.population, _filled = fill_population_in_regions(
+                    self.population, w, h, to_latlon, fill_regions, cache_key=f"{preset_name}_{w}x{h}",
+                    mask=mask,
+                )
+            # Areas a preset leaves out entirely.
+            regions = getattr(preset, 'EXCLUDED_POPULATION_REGIONS', ()) if preset else ()
+            if regions:
+                from map_preset_utils import remove_population_in_regions
+                self.population, _dropped = remove_population_in_regions(
+                    self.population, to_latlon, regions, cache_key=f"{preset_name}_{w}x{h}", mask=mask,
+                )
+            self.population, _removed = remove_water_population_cells(
+                self.population, to_latlon, cache_key=f"{preset_name}_{w}x{h}", mask=mask,
             )
-            return self._buildable_included_points
-        if not self.map_preset_name:
-            self._buildable_included_points = None
-            return None
-        from map_preset_utils import get_preset_file_info, read_included_points_from_file
-        preset_info = get_preset_file_info(self)
-        if not preset_info:
-            self._buildable_included_points = None
-            return None
-        file_path, variable_name = preset_info
-        included = read_included_points_from_file(file_path, variable_name)
-        self._buildable_included_points = frozenset(included) if included else None
-        return self._buildable_included_points
-        
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Could not remove population on water: {e}")
+
     def is_point_in_buildable_area(self, x: float, y: float) -> bool:
         """Check if a grid point is within map bounds.
 
@@ -275,9 +291,15 @@ class Map:
     
     def get_population(self, x, y) -> int:
         """Get the population at a specific location. Accepts int or float coordinates."""
-        # Convert float coordinates to int for dictionary lookup
         grid_x, grid_y = int(round(x)), int(round(y))
-        return self.population.get((grid_x, grid_y), 0)
+        direct = self.population.get((grid_x, grid_y))
+        if direct is not None and int(direct) > 0:
+            return int(direct)
+        anchors = getattr(self, '_population_anchors', None)
+        if anchors:
+            from map_preset_utils import population_at_point_from_anchors
+            return population_at_point_from_anchors(float(x), float(y), anchors)
+        return int(direct or 0)
     
     def get_available_passengers(self, x: int, y: int, time_period: str = "off_peak") -> int:
         """Get available passengers at a location for a time period.
@@ -305,7 +327,7 @@ class Map:
         import random
         
         # Get population settings from preset or use standard
-        pop_settings = STANDARD_POPULATION
+        pop_settings = get_default_population_settings()
         if self.map_preset_name:
             preset = load_map_preset(self.map_preset_name)
             if preset:
@@ -380,7 +402,7 @@ class Map:
 
         # Get area-specific population changes from events (if preset map)
         area_population_changes = {}
-        if self.map_preset_name and self.map_preset_name != "standard":
+        if self.map_preset_name and self.map_preset_name != DEFAULT_PRESET_NAME:
             try:
                 if hasattr(self, '_game') and hasattr(self._game, 'event_system'):
                     event_effects = self._game.event_system.get_combined_effects(current_year)
@@ -474,7 +496,7 @@ class Map:
                 for pt, cnt in Counter(random.choices(station_points, k=n)).items():
                     self.population[pt] = self.population.get(pt, 0) + cnt
         
-        # Scale total population to match NYC historical targets (fluid interpolation)
+        # Scale total population to match the map's historical targets (fluid interpolation)
         current_total = sum(self.population.values())
         if current_total > 0:
             scale_factor = 1.0
@@ -497,7 +519,7 @@ class Map:
                     else:
                         target = targets[years[-1]]
                 scale_factor = target / current_total
-            elif (self.map_preset_name == "standard" or not self.map_preset_name):
+            elif (self.map_preset_name == DEFAULT_PRESET_NAME or not self.map_preset_name):
                 # Scale by map size: reference 100x75; total proportional to area
                 ref_area = 100 * 75
                 map_area = self.width * self.height
@@ -516,30 +538,34 @@ class Map:
                             new_val = min(max_pop_int, new_val)
                         self.population[(x, y)] = new_val
     
-    def get_width(self):
-        return self.width
-    
-    def get_height(self):
-        return self.height
-
-    def get_grid(self):
-        return self.grid
-
     def get_lines_by_name(self):
         return self.lines
-
-    def get_lines_by_id(self):
-        id_lines = dict()
-        for l in self.lines:
-            id_lines[l.object_id] = l
-        return id_lines
 
     def get_roads(self):
         return self.roads
 
+    def miles_per_grid_unit(self) -> float:
+        """Real-world miles per grid cell (1.0 on maps without geography)."""
+        cached = getattr(self, '_miles_per_grid_unit', None)
+        if cached is None:
+            from map_preset_loader import get_preset_miles_per_grid_unit
+            try:
+                cached = float(get_preset_miles_per_grid_unit(getattr(self, 'map_preset_name', None)))
+            except Exception:
+                cached = 1.0
+            self._miles_per_grid_unit = cached
+        return cached
+
+    def apply_distance_scale_to_lines(self) -> None:
+        """Give every line this map's miles-per-cell (used for travel times)."""
+        scale = self.miles_per_grid_unit()
+        for line in self.lines.values():
+            line.miles_per_grid_unit = scale
+
     def add_line(self,
                  the_line: Line):
         self.lines[the_line.name] = the_line
+        the_line.miles_per_grid_unit = self.miles_per_grid_unit()
         
         # When a line is built, increase population near the line
         # People settle near railroads
@@ -547,7 +573,6 @@ class Map:
             route = the_line.get_route()
             if route:
                 import random
-                import math
                 
                 # Increase population at stations and nearby locations
                 for point in route:

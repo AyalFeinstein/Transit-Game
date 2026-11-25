@@ -19,10 +19,6 @@ class GridPoint:
             return False
 
 
-    def get_coordinates(self):
-        return self.x, self.y
-
-
 class GridSquare:
     def __init__(self,
                  top_left_coord: GridPoint,
@@ -50,10 +46,6 @@ class Water(GridSquare):
 
     def calc_area(self):
         return self.top_left_coord.y * self.bottom_right_coord.x
-
-    def get_area(self):
-        return self.area
-
 
 class Land(GridSquare):
     def __init__(self,

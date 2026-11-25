@@ -42,7 +42,7 @@ You can build several kinds of lines depending on the map preset. Each mode has 
 ### Construction (all line types)
 - Lines connect at least **two** points on the map
 - Construction time depends on: number of **construction workers**, elevation (underground/elevated take longer), terrain (e.g. water crossings), and a **minimum of one turn**
-- AI players refuse to queue a new line when a conservative model suggests **annual operating revenue would not cover minimum line maintenance plus one engineer’s base salary** once the line is in service. The estimate uses **endpoints and interior samples along the route**, the host **profit margin**, event **profit multipliers** (capped downward for the check), and **AI difficulty** (easier AIs accept slightly thinner projected margins than hard AIs). Humans are not blocked by this check.
+- AI players refuse to queue a new line when a conservative model suggests **annual operating revenue would not cover minimum line maintenance plus one engineer’s base salary** once the line is in service. The estimate uses **endpoints and interior samples along the route**, event **profit multipliers** (capped downward for the check), and **AI difficulty** (easier AIs accept slightly thinner projected margins than hard AIs). Humans are not blocked by this check.
 
 ### Stations
 - Stations must be built on lines to generate revenue
@@ -130,10 +130,10 @@ You can build several kinds of lines depending on the map preset. Each mode has 
 
 ### Profit generation (year-end, primary model)
 - Each year the simulation allocates **ridership** among lines (population, transfers, and line quality influence who rides where). Your line’s share of riders is capped by **how many passengers your schedules could carry** (service frequency × total trainset capacity on the line).
-- **Line revenue** (before track/rolling-stock maintenance in the yearly settlement) is driven by:
+- **Line revenue** (before track/rolling-stock maintenance in the yearly settlement) is **riders × fare**, from:
   - **Riders served** (minimum of allocated ridership and scheduled capacity; small floors apply when ridership sampling is sparse)
   - **Fare**, compared to a **maximum acceptable fare** that rises over time (**\$2 in 1830** to **\$15 in 2050**); the fare used for revenue is effectively scaled by an inflation factor (capped at **5.5×** by 2050) so nominal fares stay in a sensible “real” range
-  - **Game profit margin** setting (host option; scales all line profits)
+  - Rider counts shown in the game are scaled up from the simulated riders to real-world levels; revenue uses the simulated riders.
   - **Line quality**: `update_quality()` combines maintenance workers and vehicle quality into a score up to **3.0**; revenue uses a **quality multiplier** derived from that score (higher quality ⇒ higher profit, all else equal)
   - **Event profit multipliers** (e.g. **COVID-19** scales line profits down during the recovery window) and **natural-disaster recovery** can temporarily reduce line profits
 - **Maintenance** for track segments, vehicles, and schedule-related operating cost is computed **separately** (`calc_maitnance` / year-end finances) and reduces cash along with other expenses.
@@ -275,7 +275,7 @@ These exist in the game and settings but are not spelled out in the core section
 - **Mergers** between players (optional rules) and **random AI** companies joining mid-campaign (interval and difficulty configurable)
 - **Map presets** (e.g. standard grid, NYC, NY Metro): discovery-based loading—add new preset modules without editing core files
 - **OSM** water/terrain for display and **ferry** validation (**60 m** near-water rule)
-- **Host / game settings**: worker replenishment, natural disaster frequency, marketplace years visible, **line build speed multiplier**, **marketplace bulk discount**, **inflation rate** (scales lawsuit/lobby/etc. inflation caps), **profit margin**, **war** probabilities and wartime hire multiplier, **AI** options, optional **`game_seed`** for reproducible AI
+- **Host / game settings**: worker replenishment, natural disaster frequency, marketplace years visible, **line build speed multiplier**, **marketplace bulk discount**, **inflation rate** (scales lawsuit/lobby/etc. inflation caps), **loan interest rate**, **war** probabilities and wartime hire multiplier, **AI** options, optional **`game_seed`** for reproducible AI
 - **News log** filler articles (economy/oddities pools) and war/draft headlines
 - **Preset-specific timeline events** (e.g. NYC history) in addition to the global events in this document
 - **Edit mode** (remove population points) and session-scoped deleted-point memory in networked play

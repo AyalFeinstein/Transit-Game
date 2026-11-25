@@ -9,7 +9,12 @@ MARKETPLACE_BULK_DISCOUNT_PERCENT = 0.25
 MARKETPLACE_BULK_DISCOUNT_THRESHOLD = 10
 MARKETPLACE_TARGET_TOTAL_ITEMS = 60
 # Standalone marketplace railcars at start and replenishment base: num_players * factor
-MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR = 2
+MARKETPLACE_RAILCARS_PER_PLAYER_FACTOR = 4
+# Starting marketplace quantity multipliers (applied after even distribution among types)
+MARKETPLACE_LOCOMOTIVE_QUANTITY_FACTOR = 0.5
+MARKETPLACE_NON_LOCOMOTIVE_VEHICLE_QUANTITY_FACTOR = 2.0
+# Worker supplies at game start: base per player * this factor (see initialize_marketplace_trainsets)
+MARKETPLACE_STARTING_WORKER_SUPPLY_FACTOR = 2.0
 # Replenishment target scales with year (e.g. 1.0 at 1830, MARKETPLACE_TARGET_MAX_MULTIPLIER at 2050)
 MARKETPLACE_REPLENISHMENT_START_YEAR = 1830
 MARKETPLACE_REPLENISHMENT_END_YEAR = 2050
@@ -19,8 +24,8 @@ MARKETPLACE_TARGET_MAX_MULTIPLIER = 2.0
 # Early-game locomotive restock probability scales from this (1830) to 1.0 (2050).
 MARKETPLACE_LOCOMOTIVE_REPLENISHMENT_START = 0.05
 # Guaranteed standalone copies when a vehicle type is first invented
-MARKETPLACE_NEW_LOCOMOTIVE_COPIES = 3  # legacy floor for locomotives
-MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER = 1  # min copies = num_players * this (at least 1 per player)
+MARKETPLACE_NEW_LOCOMOTIVE_COPIES = 1  # legacy floor for locomotives (halved from 3)
+MARKETPLACE_NEW_VEHICLE_COPIES_PER_PLAYER = 2  # min copies = num_players * this (doubled from 1)
 # Through this calendar year, only this fraction of replenishment shortfall is filled per turn.
 MARKETPLACE_EARLY_REPLENISHMENT_END_YEAR = 1845
 MARKETPLACE_EARLY_REPLENISHMENT_FACTOR = 0.35
@@ -60,17 +65,12 @@ AI_EARLY_GROWTH_YEARS = 25
 AI_EARLY_PAYBACK_YEARS = 16
 # After bootstrap, new lines/extensions must pay back within this many years (stricter than early growth).
 AI_SUSTAINED_PROFIT_PAYBACK_YEARS = 6
-# Profit-margin multiplier for the standard-map AI sustained-profit unit test only (gameplay default remains 1.0).
-# Above the in-game UI cap (5.0) so the regression can assert post-bootstrap annual net > 0 on standard maps.
-AI_PROFITABILITY_TEST_PROFIT_MARGIN = 20.0
 # Standard-map benchmark: AI vs human who takes no actions (only pays upkeep/taxes on starting assets).
 AI_OUTLAST_IDLE_STARTING_MONEY = 50000
 AI_OUTLAST_IDLE_TRIALS = 5
 AI_OUTLAST_IDLE_MIN_WINS = 2
 # Stop before Public TA establishment (1930) on standard preset.
 AI_OUTLAST_IDLE_MAX_CALENDAR_YEARS = 95
-# Modest revenue boost for the idle-comparison regression only (default gameplay stays 1.0).
-AI_OUTLAST_IDLE_TEST_PROFIT_MARGIN = 5.0
 # Profitability profile: first positive annual net during turns [5, 15]; from turn 16 through 1900 mostly positive.
 AI_PROFITABILITY_ONSET_MIN_TURN = 5
 AI_PROFITABILITY_ONSET_MAX_TURN = 15
@@ -78,7 +78,7 @@ AI_PROFITABILITY_SUSTAIN_THROUGH_CALENDAR_YEAR = 1900
 AI_PROFITABILITY_SUSTAIN_MIN_FRACTION = 0.65
 AI_PROFITABILITY_TEST_TRIALS = 5
 AI_PROFITABILITY_TEST_MIN_WINS = 4
-# NYC benchmark: 1 human vs 2 hard + 1 medium AI; each AI should hold more cash than the human by turn 50.
+# Benchmark: 1 human vs 2 hard + 1 medium AI; each AI should hold more cash than the human by turn 50.
 AI_BEATS_HUMAN_MONEY_TURNS = 50
 AI_BEATS_HUMAN_MONEY_TRIALS = 5
 AI_BEATS_HUMAN_MONEY_MIN_WINS = 3
@@ -103,9 +103,17 @@ AI_MAX_STRAIGHT_LAND_SEGMENT_MILES = AI_MAX_STRAIGHT_LAND_SEGMENT_GRID / 1.60934
 AI_BUS_MAX_CONNECTOR_M = 2.0
 AI_BUS_MAX_CONNECTOR_GRID = AI_BUS_MAX_CONNECTOR_M / 1000.0
 AI_BUS_CONNECTOR_COST_MULTIPLIER = 5.0
-# Bus routes must hug road centerlines (not just pass near them).
-BUS_STREET_MAX_DISTANCE_GRID = 0.012
-BUS_STREET_MIN_SEGMENT_COVERAGE = 0.98
+# Bus routes must hug road centerlines; no point on a land segment may be >5m off-street.
+BUS_STREET_MAX_OFF_DISTANCE_M = 5.0
+BUS_STREET_MAX_DISTANCE_GRID = BUS_STREET_MAX_OFF_DISTANCE_M / 1000.0
+BUS_STREET_MIN_SEGMENT_COVERAGE = 1.0
+# Human bus routes: entire combined land length must stay on streets (not a segment-count rule).
+BUS_STREET_MIN_ROUTE_FRACTION = 1.0
+# AI rail: strictly more than this fraction of route length must lie on OSM street polylines.
+AI_RAIL_MIN_STREET_POLYLINE_ROUTE_FRACTION = 0.5
+# Land segments shorter than this do not count toward on-street / OSM polyline length totals.
+AI_MIN_STREET_QUALIFYING_SEGMENT_M = 10.0
+AI_MIN_STREET_QUALIFYING_SEGMENT_GRID = AI_MIN_STREET_QUALIFYING_SEGMENT_M / 1000.0
 # AI rail: segment must lie on an OSM road polyline (not a chord between polylines).
 AI_RAIL_OSM_POLYLINE_MAX_DISTANCE_GRID = 0.012
 AI_RAIL_OSM_POLYLINE_MIN_SEGMENT_COVERAGE = 0.92
@@ -132,6 +140,20 @@ STATION_MERGE_MAX_DISTANCE_M = 20.0
 STATION_DUPLICATE_NAME_MAX_DISTANCE_M = STATION_MERGE_MAX_DISTANCE_M
 # Construction cost fraction when extending a same-name station within merge distance (vs full new stop).
 STATION_MERGE_CONSTRUCTION_COST_FRACTION = 0.5
+# Station construction cost in 1830 money (before inflation and the construction multiplier):
+# a new stop, plus this much for each extra line it serves from the start. Half the original
+# 500 / 250.
+STATION_BASE_COST = 250
+STATION_ADDITIONAL_LINE_COST = 125
+# Expanding an existing station to one of your lines that passes within reach of it costs
+# STATION_ADDITIONAL_LINE_COST x STATION_MERGE_CONSTRUCTION_COST_FRACTION. "Within reach" is the
+# same distance at which a station counts as on a line's route (0.5 grid units).
+STATION_LINE_EXPANSION_RANGE_GRID = 0.5
+# AI lines must not come back to where they started: once a line is at least
+# AI_LINE_RETURN_CHECK_MIN_LENGTH_GRID long, its two ends must be at least this share of its
+# length apart (loops and U-turns back toward the start are refused).
+AI_LINE_END_SEPARATION_MIN_SHARE = 0.3
+AI_LINE_RETURN_CHECK_MIN_LENGTH_GRID = 1.0
 # Annual line-maintenance savings per multi-line merged station hub (nominal; inflation applied in ops).
 STATION_MERGE_MAINTENANCE_SAVINGS = 50
 AI_LINE_NAME_MAX_DISTANCE_M = 10.0
@@ -145,24 +167,99 @@ AI_PARALLEL_COMPETITION_DISTANCE_GRID = AI_PARALLEL_COMPETITION_DISTANCE_M / 100
 # AI appetite for additional lines after the first is revenue-positive.
 AI_SECOND_LINE_BUILD_CHANCE_MIN = 0.52
 AI_SECOND_LINE_BUILD_CHANCE_MAX = 0.78
-AI_SECOND_LINE_MIN_YEARS_NYC = 2
+AI_SECOND_LINE_MIN_YEARS_STREET_MAP = 2
 AI_SECOND_LINE_MIN_YEARS_DEFAULT = 5
-AI_SECOND_LINE_MONEY_NYC_WITH_PROFIT = 12000
+AI_SECOND_LINE_MONEY_STREET_MAP_WITH_PROFIT = 12000
 AI_SECOND_LINE_MONEY_DEFAULT_WITH_PROFIT = 15000
+
+# AI line creation: scales random anchor count, pair shuffle band, and stochastic build attempts.
+AI_LINE_CREATION_RANDOMNESS_FACTOR = 1.75
+AI_ROUTE_CANDIDATE_COUNT_DEFAULT = 8
 
 # Small annual operating cost per train-hour of scheduled service (nominal; inflation applied in calc_maitnance).
 SCHEDULE_OPERATING_COST_PER_TRAIN_HOUR = 0.004
+# AI schedule budgeting: each train run costs this many train-hours of operating cost (conservative vs nominal hourly rate).
+AI_SCHEDULE_COST_PER_RUN_MULTIPLIER = 8.0
 
 # Applied to all construction costs (line creation, extension, stations, upgrades, ferries).
 CONSTRUCTION_COST_MULTIPLIER = 2.0
-# Default line-revenue multiplier for new games (1.0 = full fare revenue; lower = tighter economy).
-DEFAULT_PROFIT_MARGIN = 0.75
+# Loans (loans.py): base yearly interest (set per game in Game Settings), plus up to
+# LOAN_MAX_RISK_PREMIUM for borrowers unlikely to repay. Repaid in equal instalments over a
+# term the borrower picks (LOAN_MIN_TERM_YEARS-LOAN_MAX_TERM_YEARS); each year past the minimum
+# adds LOAN_TERM_PREMIUM_PER_YEAR to the rate. Assets are seized after LOAN_SEIZURE_DEBT_YEARS
+# year ends in debt.
+LOAN_BASE_INTEREST_RATE = 0.06
+LOAN_MAX_RISK_PREMIUM = 0.25
+LOAN_MIN_TERM_YEARS = 10
+LOAN_MAX_TERM_YEARS = 20
+LOAN_TERM_YEARS = LOAN_MIN_TERM_YEARS  # default term
+LOAN_TERM_PREMIUM_PER_YEAR = 0.001
+# AI companies borrow to keep about this much cash (1830 money) when the lender thinks they are
+# likely enough to repay, and pay loans off early once they hold several times that.
+AI_LOAN_TARGET_CASH = 15000
+AI_LOAN_MIN_REPAYMENT_CHANCE = 0.5
+AI_LOAN_REPAY_CASH_MULTIPLE = 3
+LOAN_MIN_AMOUNT = 1000
+# Every company (until its assets are seized) can borrow at least this much, in 1830 money.
+LOAN_BASE_CREDIT = 20000
+LOAN_SEIZURE_DEBT_YEARS = 3
+# Yearly line maintenance (upkeep) is this share of the line's base cost.
+LINE_MAINTENANCE_COST_MULTIPLIER = 0.75
+# Rider counts shown to players are the simulated riders times this. The model counts about two
+# rides per resident a year between served places; real city dwellers ride hundreds of times a
+# year, so the displayed figures are scaled up. Revenue and capacity use the simulated riders.
+RIDERSHIP_DISPLAY_MULTIPLIER = 150
+# Track over land costs less where few people live: at least this share of the normal price
+# in empty country, rising to full price at the map's busiest places (the top
+# TRACK_COST_FULL_PRICE_TOP_FRACTION of populated cells).
+TRACK_COST_MIN_POPULATION_FACTOR = 0.5
+TRACK_COST_FULL_PRICE_TOP_FRACTION = 0.10
+# Ferry route cost per grid unit of length (before the line-cost and construction multipliers).
+# One fifth of the original 32 (40 x 0.8): ferries need no track, only landings.
+FERRY_LENGTH_COST_PER_UNIT = 32.0 / 5
 
 # Schedule / traversal physics (hours added per station stop; terminal turnaround per round trip).
-STATION_DWELL_MINUTES_PER_STOP = 1.5
-TERMINAL_TURNAROUND_MINUTES = 10.0
-# Each track supports up to this many trains/hour at minimum headway (scales with train speed).
+STATION_DWELL_MINUTES_PER_STOP = 0.5
+TERMINAL_TURNAROUND_MINUTES = 4.0
+# Each busway carries up to this many buses/hour (rail lines have no track limit: trains pass).
 TRACK_CAPACITY_TRAINS_PER_HOUR_BASE = 30.0
+# Minimum schedule frequency step (0.25/hr = one train every 4 hours).
+SCHEDULE_FREQUENCY_STEP = 0.25
+
+# Share of the calendar year each timetable period represents (must sum to 1.0).
+HOURS_PER_YEAR = 8760
+SCHEDULE_PERIODS = ('peak', 'off_peak', 'night')
+SCHEDULE_PERIOD_YEAR_FRACTIONS = {
+    'peak': 0.4,
+    'off_peak': 0.4,
+    'night': 0.2,
+}
+
+
+def schedule_weighted_trips_per_hour(schedule: dict) -> float:
+    """Blended trips/hour from peak/off-peak/night weighted by year fraction."""
+    sched = schedule or {}
+    return sum(
+        float(sched.get(period, 0) or 0) * SCHEDULE_PERIOD_YEAR_FRACTIONS[period]
+        for period in SCHEDULE_PERIODS
+    )
+
+
+def format_schedule_frequency(frequency: float) -> str:
+    """Human-readable schedule rate: 2/hr, or 1 every 2 hrs when below 1/hr."""
+    freq = max(0.0, float(frequency or 0))
+    if freq <= 0:
+        return "0/hr"
+    if freq >= 1.0:
+        if abs(freq - round(freq)) < 1e-9:
+            return f"{int(round(freq))}/hr"
+        return f"{freq:g}/hr"
+    interval_hours = 1.0 / freq
+    if abs(interval_hours - round(interval_hours)) < 1e-9:
+        n = int(round(interval_hours))
+        suffix = "hr" if n == 1 else "hrs"
+        return f"1 every {n} {suffix}"
+    return f"{freq:g}/hr"
 
 # --- Rail / bus route geometry (grid units; ~1 unit ≈ 1 km on standard maps) ---
 # Maximum heading change at a vertex (degrees). Blocks U-turns and hairpins on rail lines.
@@ -181,7 +278,7 @@ FERRY_MAX_DISTANCE_FROM_WATER_M = 100.0
 MAJOR_TERMINAL_STATION_NAMES = (
     "Union Station",
     "Central Station",
-    "Grand Central",
+    "Grand Terminal",
     "City Terminal",
     "Metropolitan Terminal",
     "Main Terminal",

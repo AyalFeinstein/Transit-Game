@@ -1,5 +1,4 @@
 """OpenStreetMap integration for GoCommuter map and line creation"""
-import time
 from typing import List, Tuple, Optional, Dict
 
 import requests
@@ -31,7 +30,11 @@ class OSMIntegration:
 
     def _post_overpass(self, query: str, timeout: float):
         """POST to Overpass, rotating mirrors on 403/429/5xx. Returns Response or None."""
+        import time
+        if time.monotonic() < getattr(self, '_offline_until', 0.0):
+            return None  # recent total failure: don't stall the UI retrying every mirror
         data = query.encode('utf-8') if isinstance(query, str) else query
+        network_errors = 0
         for url in self._overpass_urls:
             try:
                 response = requests.post(
@@ -42,7 +45,10 @@ class OSMIntegration:
                 response.raise_for_status()
                 return response
             except requests.exceptions.RequestException:
+                network_errors += 1
                 continue
+        if network_errors >= len(self._overpass_urls):
+            self._offline_until = time.monotonic() + 60.0
         return None
     
     def get_railway_ways_in_bbox(self, min_lat: float, min_lon: float, 
@@ -195,33 +201,23 @@ class OSMIntegration:
     def convert_latlon_to_grid(self, lat: float, lon: float, 
                                map_center_lat: float, map_center_lon: float,
                                grid_size: int, map_width: int = None, map_height: int = None,
-                               is_nyc_proper: bool = False) -> Tuple[float, float]:
+                               bounds: dict = None) -> Tuple[float, float]:
         """Convert lat/lon coordinates to grid coordinates (preserving float precision).
-        For NYC maps, uses bounds-based conversion to match grid->lat/lon conversion."""
+        With ``bounds`` (the map's min/max lat/lon) the conversion is the exact inverse of the
+        bounds-based grid->lat/lon conversion used by maps with fixed bounds."""
         import math
-        
-        # For NYC maps, use bounds-based conversion to match the grid->lat/lon conversion
-        if is_nyc_proper and map_width and map_height:
+
+        if bounds and 'min_lat' in bounds and map_width and map_height:
             try:
-                from map_presets_nyc import get_nyc_bounds
-                nyc_bounds = get_nyc_bounds()
-                # Reverse of: lat = min_lat + (y/height) * (max_lat - min_lat)
-                # So: y = (lat - min_lat) / (max_lat - min_lat) * height
-                y = (lat - nyc_bounds['min_lat']) / (nyc_bounds['max_lat'] - nyc_bounds['min_lat']) * map_height
-                # Reverse of: lon = min_lon + (x/width) * (max_lon - min_lon)
-                # So: x = (lon - min_lon) / (max_lon - min_lon) * width
-                x = (lon - nyc_bounds['min_lon']) / (nyc_bounds['max_lon'] - nyc_bounds['min_lon']) * map_width
-                
-                # Clamp to grid bounds (but keep as float)
+                y = (lat - bounds['min_lat']) / (bounds['max_lat'] - bounds['min_lat']) * map_height
+                x = (lon - bounds['min_lon']) / (bounds['max_lon'] - bounds['min_lon']) * map_width
                 x = max(0.0, min(float(map_width), x))
                 y = max(0.0, min(float(map_height), y))
-                
                 return (x, y)
             except Exception:
-                # Fall through to standard conversion if NYC bounds not available
                 pass
-        
-        # Standard conversion for non-NYC maps
+
+        # Centre-based conversion for maps without fixed bounds
         # Simple equirectangular projection
         # 1 degree lat ≈ 111 km, 1 degree lon ≈ 111 km * cos(lat)
         lat_km = (lat - map_center_lat) * 111.0
@@ -318,71 +314,4 @@ class OSMIntegration:
         except requests.exceptions.RequestException:
             # Request failed - assume not water
             return False
-    
-    def is_in_nyc_borough(self, lat: float, lon: float) -> bool:
-        """Check if a point is within NYC borough boundaries using OSM administrative boundaries.
-        Queries for relations with admin_level=6 and boundary=administrative in NYC area.
-        Returns True if the point is within NYC boroughs, False otherwise."""
-        # NYC borough bounding box for query
-        nyc_bbox = (40.4950, -74.0500, 40.9150, -73.7000)
-        min_lat, min_lon, max_lat, max_lon = nyc_bbox
-        
-        cache_key = f"borough_{lat}_{lon}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        
-        # Overpass QL query to check for NYC borough boundaries
-        # admin_level=6 is typically used for boroughs/counties in US
-        # boundary=administrative and place=borough or place=county
-        query = f"""
-        [out:json][timeout:10];
-        (
-          relation["admin_level"="6"]["boundary"="administrative"][~"^place|^name"~"^(Manhattan|Brooklyn|Queens|Bronx|Staten Island|Richmond|Kings|New York)",i]({min_lat},{min_lon},{max_lat},{max_lon});
-        );
-        (._;>;);
-        out geom;
-        """
-        
-        try:
-            response = self._post_overpass(query, 10)
-            if not response:
-                return self._is_in_nyc_approximate_bounds(lat, lon)
-            data = response.json()
-            
-            # Check if point is within any of the borough boundaries
-            # For simplicity, use a point-in-polygon check with the relation geometries
-            # OSM returns relations with members that define the boundary
-            elements = data.get('elements', [])
-            
-            # Use improved approximate bounds (OSM relation parsing is complex)
-            # The bounds check excludes water and New Jersey
-            result = self._is_in_nyc_approximate_bounds(lat, lon)
-            self._cache[cache_key] = result
-            return result
-        except requests.exceptions.Timeout:
-            # Timeout - use approximate bounds as fallback
-            return self._is_in_nyc_approximate_bounds(lat, lon)
-        except requests.exceptions.RequestException:
-            # Request failed - use approximate bounds
-            return self._is_in_nyc_approximate_bounds(lat, lon)
-    
-    def _is_in_nyc_approximate_bounds(self, lat: float, lon: float) -> bool:
-        """Fallback method using approximate NYC borough bounds when OSM query fails.
-        Expanded to cover all land in the five boroughs."""
-        # Manhattan - covers all of Manhattan including small islands
-        if 40.70 <= lat <= 40.88 and -74.05 <= lon <= -73.90:
-            return True
-        # Brooklyn - covers all of Brooklyn including southern and eastern parts
-        elif 40.57 <= lat <= 40.75 and -74.05 <= lon <= -73.70:
-            return True
-        # Queens - covers all of Queens including northern and eastern parts
-        elif 40.55 <= lat <= 40.80 and -74.05 <= lon <= -73.70:
-            return True
-        # Bronx - covers all of the Bronx including northern parts
-        elif 40.80 <= lat <= 40.92 and -73.95 <= lon <= -73.75:
-            return True
-        # Staten Island (Richmond) - extended west to cover all of Staten Island
-        elif 40.49 <= lat <= 40.65 and -74.30 <= lon <= -74.02:
-            return True
-        return False
 

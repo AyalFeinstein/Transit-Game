@@ -168,10 +168,6 @@ class Government:
             total += self._get_seat_influence(i)
         return total + LEADER_INFLUENCE_WEIGHT
 
-    def get_unfavorable_count(self, player_id: int) -> int:
-        """Number of seats unfavorable (favor another player or neutral)."""
-        return self.NUM_SEATS - self.get_favorable_count(player_id)
-
     def get_unfavorable_influence(self, player_id: int) -> float:
         """Total influence of seats unfavorable to this player."""
         total = 0.0
@@ -274,11 +270,6 @@ class Government:
         self._tiebreaker = player_id
         self._lobbied_hidden.add(50)
         return True
-
-    def record_lobby_attempt(self, seat_index: int) -> None:
-        """Record that a lobby was attempted on this seat. Hides result until election (even if it failed)."""
-        if 0 <= seat_index <= 50:
-            self._lobbied_hidden.add(seat_index)
 
     def pass_annual_laws(self, year: int, eliminated_player_ids: set = None) -> dict:
         """Pass annual laws based on government composition. Usually favors majority-favored players.

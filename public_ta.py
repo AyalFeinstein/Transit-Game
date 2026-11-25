@@ -6,9 +6,3 @@ class PublicTA(Player):
         self.is_public_ta = True
         self.established = False
     
-    def is_public_transit_authority(self):
-        return True
-    
-    def get_annual_funding(self, config: dict) -> int:
-        return config.get('annual_funding', 50000)
-

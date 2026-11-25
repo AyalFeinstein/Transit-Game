@@ -3,10 +3,10 @@
 Client-side networking module for GoCommuter
 Handles connection to game server and message passing
 """
-import asyncio
+import importlib.util
 import pickle
 import base64
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Dict, Any
 import socketio
 try:
     import socketio.exceptions
@@ -51,7 +51,10 @@ class NetworkClient(QObject):
             self.sio = socketio.Client(reconnection=True, reconnection_attempts=3, reconnection_delay=1)
             self._setup_event_handlers()
             # Use wait_timeout to avoid hanging and specify websocket transport only
-            self.sio.connect(self.server_url, wait_timeout=5, transports=['websocket'])
+            self.sio.connect(
+                self.server_url, wait_timeout=5,
+                transports=['websocket', 'polling'] if importlib.util.find_spec('websocket') else ['polling'],
+            )
             self.connected_flag = True
             print(f"Connected to server: {self.server_url}")
         except socketio.exceptions.ConnectionError as e:
@@ -92,9 +95,12 @@ class NetworkClient(QObject):
             self.connected.emit({'status': 'connected'})
         
         @self.sio.event
-        def disconnect():
+        def disconnect(*_reason):
             self.connected_flag = False
-            self.disconnected.emit()
+            try:
+                self.disconnected.emit()
+            except RuntimeError:
+                pass  # the Qt object is already gone (application shutting down)
         
         @self.sio.on('connected')
         def on_connected(data):
@@ -163,22 +169,6 @@ class NetworkClient(QObject):
         def on_chat_message(data):
             self.chat_received.emit(data)
 
-    def create_game(self, player_names: list[str], map_width: int = 100, 
-                   map_height: int = 75, starting_money: int = 20000,
-                   worker_replenishment_rate: float = 1.0):
-        """Create a new game session"""
-        if not self.connected_flag:
-            self.error_received.emit("Not connected to server")
-            return
-        
-        self.sio.emit('create_game', {
-            'player_names': player_names,
-            'map_width': map_width,
-            'map_height': map_height,
-            'starting_money': starting_money,
-            'worker_replenishment_rate': worker_replenishment_rate
-        })
-    
     def join_game(self, session_id: str):
         """Join an existing game session"""
         if not self.connected_flag:
@@ -211,44 +201,6 @@ class NetworkClient(QObject):
             'action_data': action_data
         })
     
-    def build_line(self, name: str, points: list, construction_workers: int = 0):
-        """Build a new line"""
-        self.send_action('build_line', {
-            'name': name,
-            'points': points,
-            'construction_workers': construction_workers
-        })
-    
-    def buy_trainset(self, item_id: str):
-        """Buy a trainset from marketplace"""
-        self.send_action('buy_trainset', {
-            'item_id': item_id
-        })
-    
-    def assign_trainset(self, trainset_index: int, line_name: str):
-        """Assign a trainset to a line"""
-        self.send_action('assign_trainset', {
-            'trainset_index': trainset_index,
-            'line_name': line_name
-        })
-    
-    def sell_trainset(self, trainset_index: int):
-        """Sell a trainset for half price"""
-        self.send_action('sell_trainset', {
-            'trainset_index': trainset_index
-        })
-    
-    def rent_workers(self, worker_type_name: str, quantity: int):
-        """Rent workers from the marketplace"""
-        self.send_action('rent_workers', {
-            'worker_type_name': worker_type_name,
-            'quantity': quantity
-        })
-    
-    def advance_year(self):
-        """Advance the game year (legacy - redirects to end_year)"""
-        self.end_year()
-    
     def end_year(self):
         """Signal ready to end the year - year advances when all players are ready"""
         self.send_action('end_year', {})
@@ -261,10 +213,6 @@ class NetworkClient(QObject):
             'session_id': self.session_id,
             'message': message
         })
-    
-    def end_turn(self):
-        """End current turn (legacy - no longer used in simultaneous mode)"""
-        self.send_action('end_turn', {})
     
     def list_games(self):
         """Request list of available games"""
@@ -284,92 +232,37 @@ class NetworkClient(QObject):
             'value': value
         })
     
-    def start_game_on_server(self, ai_player_indices=None):
-        """Request server to start the game. ai_player_indices: list of player indices that are AI."""
+    def start_game_on_server(self, player_names: list = None, operations_kwargs: dict = None):
+        """Ask the server to start a game for everyone connected.
+
+        ``operations_kwargs`` are the Operations settings (map preset, money, AI players, ...);
+        connected clients take the human (non-AI) seats in connection order.
+        """
         if not self.connected_flag:
             self.error_received.emit("Not connected to server")
             return
-        
-        self.sio.emit('start_game', {'ai_player_indices': ai_player_indices if ai_player_indices is not None else []})
+        self.sio.emit('start_game', {
+            'player_names': list(player_names or []),
+            'operations_kwargs': dict(operations_kwargs or {}),
+        })
     
     def deserialize_game_state(self, game_state_data: dict) -> Optional[Game]:
-        """Deserialize game state from server format"""
-        import sys
+        """The Game from a server game_state message, or None if it is missing or unreadable."""
+        game_data_b64 = (game_state_data or {}).get('game_data')
+        if not isinstance(game_data_b64, str) or not game_data_b64:
+            print(f"Game state without game data (keys: {list((game_state_data or {}).keys())})")
+            return None
         try:
-            print(f"Deserializing game state. Received keys: {list(game_state_data.keys()) if game_state_data else 'None'}", flush=True)
-            sys.stdout.flush()
-            
-            game_data_b64 = game_state_data.get('game_data')
-            if not game_data_b64:
-                print(f"Error: No 'game_data' field in game_state_data. Keys: {list(game_state_data.keys()) if game_state_data else 'None'}")
-                return None
-            
-            if not isinstance(game_data_b64, str):
-                print(f"Error: game_data_b64 is not a string, got {type(game_data_b64)}")
-                return None
-            
-            print(f"Received game_data_b64 length: {len(game_data_b64)} characters", flush=True)
-            sys.stdout.flush()
-            
-            # Decode base64
-            try:
-                game_data = base64.b64decode(game_data_b64.encode('utf-8'))
-                print(f"Decoded base64 to {len(game_data)} bytes", flush=True)
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"Error decoding base64: {e}")
-                print(f"Base64 data length: {len(game_data_b64)}")
-                print(f"First 100 chars of base64: {game_data_b64[:100]}")
-                import traceback
-                traceback.print_exc()
-                return None
-            
-            # Deserialize pickle
-            try:
-                print("Attempting to unpickle game data...", flush=True)
-                sys.stdout.flush()
-                game = pickle.loads(game_data)
-                print(f"Successfully unpickled game. Type: {type(game)}, Players: {len(game.get_players()) if hasattr(game, 'get_players') else 'N/A'}", flush=True)
-                sys.stdout.flush()
-                
-                # Verify game object is valid
-                if game is None:
-                    print("ERROR: game object is None after unpickling!", flush=True)
-                    return None
-                if not hasattr(game, 'get_players'):
-                    print(f"ERROR: game object missing get_players method! Attributes: {dir(game)}", flush=True)
-                    return None
-                try:
-                    players = game.get_players()
-                    print(f"Verified game object: {len(players)} players found", flush=True)
-                except Exception as e:
-                    print(f"ERROR: Failed to call get_players() on game object: {e}", flush=True)
-                    import traceback
-                    traceback.print_exc()
-                    return None
-                
-                print("Returning game object from deserialize_game_state", flush=True)
-                sys.stdout.flush()
-                return game
-            except pickle.UnpicklingError as e:
-                print(f"Unpickling error: {e}")
-                print(f"Pickle data length: {len(game_data)} bytes")
-                print(f"First 100 bytes (hex): {game_data[:100].hex()}")
-                import traceback
-                traceback.print_exc()
-                return None
-            except Exception as e:
-                print(f"Error unpickling game data: {e}")
-                print(f"Error type: {type(e)}")
-                print(f"Pickle data length: {len(game_data)} bytes")
-                import traceback
-                traceback.print_exc()
-                return None
+            game = pickle.loads(base64.b64decode(game_data_b64.encode('utf-8')))
         except Exception as e:
-            print(f"Unexpected error deserializing game state: {e}")
             import traceback
+            print(f"Could not read game state from server: {e}")
             traceback.print_exc()
             return None
+        if not hasattr(game, 'get_players'):
+            print(f"Server sent a {type(game).__name__}, not a game")
+            return None
+        return game
 
 
 class NetworkThread(QThread):

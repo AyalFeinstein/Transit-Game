@@ -23,4 +23,17 @@ operations_monolith_backup.py
 
 # Test / generated binary artifacts
 *.pkl
+!nyc_road_spatial_index.pkl
 nyc_road_spatial_index_corrupt_test.pkl
+
+# Local caches (water mask)
+.water_mask_index.pkl
+.water_cells_cache/
+gocommuter_errors.log
+
+# Not needed to play: tests, notebooks and the Python copy of the road data
+# (the game reads nyc_historical_roads_osm_generated.json).
+test_*.py
+tests/
+test.ipynb
+nyc_historical_roads_osm_generated.py

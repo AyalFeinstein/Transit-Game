@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Main entry point for networked GoCommuter (alias for main.py)"""
 import sys
+import crash_log
+crash_log.install()  # unexpected errors are logged and shown instead of closing the game
 from PyQt6.QtWidgets import QApplication, QDialog
 from qt_networked import NetworkedMainWindow, GameModeDialog, MainWindow
 from qt_networked import _install_osm_tile_interceptor, application_window_icon

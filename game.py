@@ -23,10 +23,10 @@ class Game:
                  merge_ai_human_enabled: bool = True,
                  merge_human_human_enabled: bool = True,
                  inflation_rate: float = 1.0,
-                 profit_margin: float = None,
                  random_ai_spawn_interval_years: int = 30,
                  default_ai_difficulty_for_spawns: str = 'hard',
                  ai_min_population: int = 100,
+                 ai_route_candidate_count: int = 8,
                  game_seed: int = None,
                  merge_ai_healthy_profit_threshold_pct: float = 25.0,
                  merge_ai_reject_chance_pct: float = 90.0,
@@ -50,15 +50,9 @@ class Game:
         self.players_by_name = self.calc_players_by_name()
         self.event_system = EventSystem(natural_disaster_frequency)
         
-        if hasattr(game_map, 'is_nyc_proper') and game_map.is_nyc_proper:
-            from nyc_events import get_nyc_events
-            for event in get_nyc_events():
-                self.event_system.add_event(event)
-        elif hasattr(game_map, 'is_ny_metro') and game_map.is_ny_metro:
-            # NY Metro uses same events as NYC
-            from nyc_events import get_nyc_events
-            for event in get_nyc_events():
-                self.event_system.add_event(event)
+        from map_preset_loader import get_preset_events
+        for event in get_preset_events(getattr(game_map, 'map_preset_name', None)):
+            self.event_system.add_event(event)
         self.build_queue = []
         self.worker_replenishment_rate = worker_replenishment_rate
         self.random_ai_spawn_enabled = random_ai_spawn_enabled
@@ -67,13 +61,10 @@ class Game:
         self.merge_ai_human_enabled = merge_ai_human_enabled
         self.merge_human_human_enabled = merge_human_human_enabled
         self.inflation_rate = max(0.1, min(5.0, inflation_rate))
-        from game_presets import DEFAULT_PROFIT_MARGIN
-        if profit_margin is None:
-            profit_margin = DEFAULT_PROFIT_MARGIN
-        self.profit_margin = max(0.25, min(5.0, profit_margin))
         self.random_ai_spawn_interval_years = max(5, min(200, random_ai_spawn_interval_years))
         self.default_ai_difficulty_for_spawns = default_ai_difficulty_for_spawns if default_ai_difficulty_for_spawns in ('easy', 'medium', 'hard') else 'hard'
         self.ai_min_population = max(0, ai_min_population)
+        self.ai_route_candidate_count = max(2, min(24, int(ai_route_candidate_count)))
         self.ai_debug_notifications_enabled = bool(ai_debug_notifications_enabled)
         self.merge_ai_healthy_profit_threshold_pct = max(0, min(100, merge_ai_healthy_profit_threshold_pct))
         self.merge_ai_reject_chance_pct = max(0, min(100, merge_ai_reject_chance_pct))
@@ -146,12 +137,23 @@ class Game:
         return [p for p in self.players if not p.is_eliminated]
     
     def eliminate_player(self, player: Player):
-        """Eliminate a player from the game"""
+        """Eliminate a player. Their built lines go straight onto the marketplace (without
+        vehicles, which leave with the player); their unfinished construction is dropped."""
         player.eliminate()
+        self.build_queue = [b for b in self.build_queue if b.get('player') is not player]
+        year = self.timeline.year
+        seller = player.get_name()
         for line_name in list(player.line_names):
             line = self.map.get_lines_by_name().get(line_name)
-            if line:
-                self.map.delete_line(line)
+            if not line:
+                continue
+            if hasattr(line, 'vehicles'):
+                line.vehicles.clear()
+            if hasattr(line, 'schedule') and isinstance(line.schedule, dict):
+                line.schedule = {k: 0 for k in line.schedule}
+            self.map.delete_line(line)
+            if len(line.get_route() or []) >= 2:
+                self.marketplace.add_line(line, current_year=year, seller=seller)
         player.line_names.clear()
         player.trainsets.clear()
 
@@ -216,23 +218,9 @@ class Game:
             if len(points) > 1:
                 game_map = self.map
                 def is_point_in_water(x, y):
-                    if game_map.is_nyc_proper:
-                        from map_presets_nyc import NYC_EXCLUDED_POINTS, is_water_location
-                        from map_presets_nyc import get_nyc_default_center_lat, get_nyc_default_center_lon
-                        grid_x, grid_y = int(round(x)), int(round(y))
-                        if (grid_x, grid_y) in NYC_EXCLUDED_POINTS:
-                            return True
-                        grid_size = max(game_map.width, game_map.height)
-                        lat_km = (y - grid_size // 2)
-                        lon_km = (x - grid_size // 2)
-                        center_lat = game_map.map_center_lat if game_map.map_center_lat is not None else get_nyc_default_center_lat()
-                        center_lon = game_map.map_center_lon if game_map.map_center_lon is not None else get_nyc_default_center_lon()
-                        lat = center_lat + (lat_km / 111.0)
-                        lon_deg_per_km = 111.0 * math.cos(math.radians(center_lat))
-                        if lon_deg_per_km == 0:
-                            lon_deg_per_km = 111.0
-                        lon = center_lon + (lon_km / lon_deg_per_km)
-                        return is_water_location(lat, lon, game_map.osm_integration)
+                    if game_map.has_preset_water:
+                        from map_preset_loader import preset_is_point_in_water
+                        return preset_is_point_in_water(game_map.map_preset_name, x, y, game_map)
                     elif game_map.osm_integration:
                         grid_size = max(game_map.width, game_map.height)
                         center_lat = game_map.map_center_lat or 0.0
@@ -305,10 +293,6 @@ class Game:
         the_line = Line(name=name, object_id=None, route=points, owner=player, vehicles=[], fare=fare)
         return the_line
 
-    def buy_line(self, name, player, route):
-        the_line = self.create_line(name, player, route)
-        self.map.add_line(the_line)
-
     def __bool__(self):
         return self.is_playing
     
@@ -334,9 +318,10 @@ class Game:
                 total += maint_cost
         return int(total) if total else 0
     
-    def calc_resource_costs(self, player: Player, current_year: int = None):
+    def calc_resource_costs(self, player: Player, current_year: int = None, only_trainset=None):
         """Calculate resource costs (fuel) for a player's trainsets using historical pricing.
-        Costs update annually based on current_year. Electricity is never free."""
+        Costs update annually based on current_year. Electricity is never free.
+        ``only_trainset``: return the yearly fuel cost of that one trainset instead."""
         # Get current year if not provided
         if current_year is None:
             current_year = self.get_year()
@@ -407,18 +392,18 @@ class Game:
             adjustment = year_adjustments.get(resource, 1.0)
             resource_costs_table[resource] = int(base_cost * adjustment)
         
-        total = 0
-        for trainset in player.get_trainsets():
+        def _fuel_cost(trainset) -> int:
             try:
                 loco = getattr(trainset, 'locomotive', None)
                 if loco and hasattr(loco, 'fuel') and loco.fuel:
-                    fuel_name = getattr(loco.fuel, 'name', None)
-                    if fuel_name and fuel_name in resource_costs_table:
-                        # Get per-unit cost for this fuel type
-                        fuel_cost = resource_costs_table.get(fuel_name, 0)
-                        total += fuel_cost
+                    return int(resource_costs_table.get(getattr(loco.fuel, 'name', None), 0) or 0)
             except (AttributeError, TypeError):
                 pass
+            return 0
+
+        if only_trainset is not None:
+            return _fuel_cost(only_trainset)
+        total = sum(_fuel_cost(trainset) for trainset in player.get_trainsets())
         return int(total) if total else 0
     
     def calc_taxes(self, player: Player, current_year: int, player_profit: int = 0):
@@ -485,8 +470,9 @@ class Game:
 
         return poll_tax, property_tax, income_tax
     
-    def calc_worker_costs(self, player: Player, current_year: int):
-        """Calculate worker costs and advance worker rentals. Returns (cost, is_on_strike)
+    def calc_worker_costs(self, player: Player, current_year: int, advance: bool = True):
+        """Calculate worker costs; at the year end (``advance``) also advance worker rentals
+        (new demands, strikes). Returns (cost, is_on_strike).
         Eliminated players: return (0, False) and do not advance strike state."""
         from worker import ENGINEER, CONSTRUCTION_WORKER
         if player.is_player_eliminated():
@@ -496,13 +482,15 @@ class Game:
         engineer_rental = player.get_worker_rental(ENGINEER.name)
         
         if engineer_rental:
-            engineer_rental.advance_turn(current_year)
+            if advance:
+                engineer_rental.advance_turn(current_year)
             is_on_strike = engineer_rental.is_on_strike()
             worker_costs += engineer_rental.get_yearly_cost(current_year)
         
         construction_rental = player.get_worker_rental(CONSTRUCTION_WORKER.name)
         if construction_rental:
-            construction_rental.advance_turn(current_year)
+            if advance:
+                construction_rental.advance_turn(current_year)
             worker_costs += construction_rental.get_yearly_cost(current_year)
         
         return worker_costs, is_on_strike
@@ -518,6 +506,9 @@ class Game:
             for worker_type in worker_types:
                 worker_rental = player.get_worker_rental(worker_type.name)
                 if worker_rental and worker_rental.will_strike_next_turn(current_year):
+                    # Remember the warning: a strike can only start at a later year end.
+                    if getattr(worker_rental, 'strike_warned_year', None) is None:
+                        worker_rental.strike_warned_year = current_year
                     current_multiplier = worker_rental.worker_type.get_salary_multiplier()
                     warnings.append({
                         'player': player,
@@ -532,7 +523,7 @@ class Game:
     def process_end_of_year(self, current_year: int):
         """Process end of year operations: replenish supplies, generate excuses, etc."""
         import random
-        from worker import ENGINEER, LAWYER
+        from worker import ENGINEER
         from lawsuit import LAWSUIT_EXCUSES
         
         base_replenishment = random.randint(2, 5)

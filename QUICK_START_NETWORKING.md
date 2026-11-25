@@ -38,12 +38,14 @@ client = NetworkClient("http://localhost:8080")
 thread = NetworkThread(client)
 thread.start()
 
-# Wait for connection, then create/join game
-client.create_game(player_names=["Player1", "Player2"])
+# Wait for connection, then start a game for everyone connected
+client.start_game_on_server(
+    player_names=["Player1", "Player2"],
+    operations_kwargs={"map_preset_name": "ny_metro", "starting_money": 500000},
+)
 
-# Send actions
-client.build_line(name="Main Line", points=[(10, 10), (20, 20)])
-client.advance_year()
+# Actions: see NETWORKING_README.md (network_rpc.install_network_operations)
+client.end_year()
 ```
 
 ## Testing Locally

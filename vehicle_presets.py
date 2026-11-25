@@ -1,5 +1,5 @@
-from vehicle import Vehicle, Locomotive, Railcar, Trainset, Ferry, Bus
-from game_resource import Resource, Coal, Wood, Oil, Electricity, Food, Gasoline, Gasoline
+from vehicle import Locomotive, Railcar, Ferry, Bus
+from game_resource import Coal, Wood, Oil, Electricity, Food, Gasoline
 
 # Local Passenger Rail Locomotives - Historically Accurate
 
@@ -160,13 +160,17 @@ horse_carriage.year_introduced = 1800
 early_ferry = Ferry(name="Early Ferry", object_id=17, fuel=Wood(), miles_per_unit=0.1, top_speed=8, average_speed=5, capacity=100, maitnance_costs=25, year_introduced=1800, quality=1.0, base_price=200)
 
 # Steam ferry (1830s-1900s) - steam-powered ferry
-steam_ferry = Ferry(name="Steam Ferry", object_id=18, fuel=Coal(), miles_per_unit=0.15, top_speed=12, average_speed=8, capacity=200, maitnance_costs=40, year_introduced=1830, quality=1.5, base_price=300)
+steam_ferry = Ferry(name="Steamboat", object_id=18, fuel=Coal(), miles_per_unit=0.15, top_speed=12, average_speed=8, capacity=200, maitnance_costs=40, year_introduced=1840, quality=1.5, base_price=300)
 
 # Modern ferry (1900s+) - diesel/electric powered ferry
-modern_ferry = Ferry(name="Modern Ferry", object_id=19, fuel=Oil(), miles_per_unit=0.4, top_speed=20, average_speed=15, capacity=400, maitnance_costs=60, year_introduced=1900, quality=2.5, base_price=400)
+deisel_ferry = Ferry(name="Deisel Ferry", object_id=19, fuel=Oil(), miles_per_unit=0.4, top_speed=20, average_speed=15, capacity=400, maitnance_costs=60, year_introduced=1900, quality=2.5, base_price=400)
+
+gas_ferry = Ferry(name="Gas Ferry", object_id=19, fuel=Oil(), miles_per_unit=0.5, top_speed=30, average_speed=20, capacity=450, maitnance_costs=70, year_introduced=1960, quality=3.5, base_price=600)
+
+catamaran_ferry = Ferry(name="Large Catamaran", object_id=19, fuel=Oil(), miles_per_unit=0.6, top_speed=40, average_speed=22, capacity=600, maitnance_costs=70, year_introduced=1980, quality=3.5, base_price=600)
 
 # High-speed ferry (1980s+) - fast passenger ferry
-high_speed_ferry = Ferry(name="High-Speed Ferry", object_id=20, fuel=Oil(), miles_per_unit=0.6, top_speed=35, average_speed=25, capacity=300, maitnance_costs=80, year_introduced=1980, quality=4.0, base_price=500)
+high_speed_ferry = Ferry(name="High-Speed Ferry", object_id=20, fuel=Oil(), miles_per_unit=0.6, top_speed=45, average_speed=25, capacity=300, maitnance_costs=80, year_introduced=1990, quality=5.0, base_price=500)
 
 """ Bus Vehicles """
 early_motor_bus = Bus(name="Early Motor Bus", object_id=21, fuel=Gasoline(), miles_per_unit=0.1, top_speed=15, average_speed=10, capacity=25, maitnance_costs=20, year_introduced=1895, quality=1.5, base_price=180)

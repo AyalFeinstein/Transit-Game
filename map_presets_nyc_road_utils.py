@@ -1,14 +1,13 @@
 """Road and bridge point-checking utilities for NYC map.
-Imported by map_presets_nyc to avoid circular imports.
+Used by the NYC and NY Metro maps; city data comes from nyc_city_data.
 Uses spatial index to expedite street detection without sacrificing accuracy."""
 
 import heapq
 import logging
 import math
-from typing import Optional
 from weakref import WeakKeyDictionary
 
-from map_presets_nyc import get_nyc_bounds
+from nyc_city_data import get_nyc_bounds
 from map_preset_utils import ai_grid_polyline_overlap_tolerance, polyline_has_self_overlap
 
 logger = logging.getLogger(__name__)
@@ -51,10 +50,34 @@ def _get_nyc_roads():
             return OSM_ROADS
     except ImportError:
         pass
-    from map_presets_nyc import NYC_HISTORICAL_ROADS
+    from nyc_city_data import NYC_HISTORICAL_ROADS
     _OSM_ROADS_CACHE = NYC_HISTORICAL_ROADS
     return NYC_HISTORICAL_ROADS
 
+# Generic name used by code that works with any map's road data
+get_all_roads = _get_nyc_roads
+
+
+def road_data_files_status() -> list:
+    """[(file name, present)] for the data files the street network is built from."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    names = ('nyc_road_spatial_index.pkl', 'nyc_historical_roads_osm_generated.json')
+    return [(name, os.path.isfile(os.path.join(here, name))) for name in names]
+
+
+# Shown when the street network could not be loaded.
+ROAD_DATA_FIX_HINT = (
+    "  • Fix: run `python build_road_spatial_index.py` after OSM road JSON is generated",
+    "    (or place a pre-built nyc_road_spatial_index.pkl beside the game modules).",
+)
+
+
+# Cache grid polylines per road and per cell-set (AI validation calls this heavily).
+_ROAD_GRID_POLYLINE_BY_ID: dict = {}
+
+_ROAD_GRID_POLYLINE_BOUNDS_SIG = None
+_POLYLINES_FOR_CELLS_CACHE: dict = {}
 # Spatial index: (cell_lat, cell_lon) -> list of (road_name, road, seg_idx). Built lazily.
 _ROAD_SPATIAL_INDEX = None
 _BRIDGE_SPATIAL_INDEX = None
@@ -88,6 +111,7 @@ def _build_road_spatial_index(game_map=None):
     """Build spatial index for fast road lookups. One-time cost.
     Loads pre-built index from nyc_road_spatial_index.pkl if available (~2s); else builds at runtime (~25s)."""
     global _ROAD_SPATIAL_INDEX, _BRIDGE_SPATIAL_INDEX, _SPATIAL_INDEX_BOUNDS_SIG
+    global _ROAD_GRID_POLYLINE_BOUNDS_SIG
     sig = _spatial_index_bounds_signature(game_map) if game_map is not None else None
     if game_map is not None:
         if _ROAD_SPATIAL_INDEX is not None and _SPATIAL_INDEX_BOUNDS_SIG == sig:
@@ -96,6 +120,10 @@ def _build_road_spatial_index(game_map=None):
         _ROAD_SPATIAL_INDEX = None
         _BRIDGE_SPATIAL_INDEX = None
         _SPATIAL_INDEX_BOUNDS_SIG = None
+        _POLYLINES_FOR_CELLS_CACHE.clear()
+        _ROAD_GRID_POLYLINE_BY_ID.clear()
+        _ROAD_GRID_POLYLINE_BOUNDS_SIG = None
+        _POINT_ON_ROAD_CACHE.clear()
     elif _ROAD_SPATIAL_INDEX is not None:
         return
     import os
@@ -771,25 +799,53 @@ def _grid_polylines_for_named_street(
     return polylines
 
 
-def _min_distance_to_polylines(px: float, py: float, polylines: list) -> float:
+def _min_distance_to_polylines(
+    px: float, py: float, polylines: list, max_distance: float = None,
+) -> float:
+    """Minimum distance from (px, py) to any polyline segment.
+
+    When ``max_distance`` is given, returns as soon as a segment within it is found and
+    segments whose bounding box is farther than ``max_distance`` are skipped (the result is
+    then only meaningful for ``<= max_distance`` comparisons; it is ``inf`` if none is close).
+    """
     best = float("inf")
+    md = max_distance
     for poly in polylines or []:
-        for i in range(len(poly) - 1):
-            ax, ay = poly[i][0], poly[i][1]
-            bx, by = poly[i + 1][0], poly[i + 1][1]
+        prev = None
+        for pt in poly:
+            if prev is None:
+                prev = pt
+                continue
+            ax, ay = prev[0], prev[1]
+            bx, by = pt[0], pt[1]
+            prev = pt
+            if md is not None:
+                if ((px < ax - md and px < bx - md) or (px > ax + md and px > bx + md)
+                        or (py < ay - md and py < by - md) or (py > ay + md and py > by + md)):
+                    continue
             d = _point_to_segment_distance(px, py, ax, ay, bx, by)
             if d < best:
                 best = d
+                if md is not None and best <= md:
+                    return best
     return best
 
 
-# Buses must hug road centerlines — looser point checks allow diagonal block cuts in dense grids.
-from game_presets import (
-    AI_RAIL_OSM_POLYLINE_MAX_DISTANCE_GRID,
-    AI_RAIL_OSM_POLYLINE_MIN_SEGMENT_COVERAGE,
-    BUS_STREET_MAX_DISTANCE_GRID,
-    BUS_STREET_MIN_SEGMENT_COVERAGE,
-)
+from game_presets import AI_RAIL_OSM_POLYLINE_MAX_DISTANCE_GRID, AI_RAIL_OSM_POLYLINE_MIN_SEGMENT_COVERAGE, BUS_STREET_MAX_DISTANCE_GRID
+
+
+def _spatial_cells_near_grid_point(
+    px: float, py: float, game_map, bounds=None, expand: int = 1,
+) -> set:
+    """Spatial-index cells near a grid point."""
+    bounds = _get_bounds(game_map, bounds)
+    lat, lon = _grid_to_latlon(px, py, game_map, bounds)
+    base = (int(lat / _CELL_SIZE), int(lon / _CELL_SIZE))
+    cells = set()
+    for dlat in range(-expand, expand + 1):
+        for dlon in range(-expand, expand + 1):
+            cells.add((base[0] + dlat, base[1] + dlon))
+    return cells
 
 
 def _spatial_cells_near_grid_segment(
@@ -797,29 +853,54 @@ def _spatial_cells_near_grid_segment(
 ) -> set:
     """Spatial-index cells overlapping a grid segment (with neighbor expansion)."""
     bounds = _get_bounds(game_map, bounds)
-    cells = set()
-    seg_len = math.hypot(bx - ax, by - ay)
-    n = max(2, int(math.ceil(seg_len / 0.02)) + 1)
-    for j in range(n):
-        t = j / (n - 1) if n > 1 else 0.0
-        px = ax + t * (bx - ax)
-        py = ay + t * (by - ay)
-        lat, lon = _grid_to_latlon(px, py, game_map, bounds)
-        base = (int(lat / _CELL_SIZE), int(lon / _CELL_SIZE))
-        cells.add(base)
-        for dlat in range(-expand, expand + 1):
-            for dlon in range(-expand, expand + 1):
-                cells.add((base[0] + dlat, base[1] + dlon))
+    cells = _spatial_cells_near_grid_point(ax, ay, game_map, bounds, expand=expand)
+    cells |= _spatial_cells_near_grid_point(bx, by, game_map, bounds, expand=expand)
+    mid_x = ax + 0.5 * (bx - ax)
+    mid_y = ay + 0.5 * (by - ay)
+    cells |= _spatial_cells_near_grid_point(mid_x, mid_y, game_map, bounds, expand=expand)
     return cells
+
+
+def _road_grid_polyline(road, game_map, bounds) -> list:
+    """Grid polyline for one OSM road, cached per bounds signature."""
+    global _ROAD_GRID_POLYLINE_BY_ID, _ROAD_GRID_POLYLINE_BOUNDS_SIG
+    sig = _spatial_index_bounds_signature(game_map) if game_map is not None else None
+    if sig != _ROAD_GRID_POLYLINE_BOUNDS_SIG:
+        _ROAD_GRID_POLYLINE_BY_ID = {}
+        _ROAD_GRID_POLYLINE_BOUNDS_SIG = sig
+    rid = id(road)
+    cached = _ROAD_GRID_POLYLINE_BY_ID.get(rid)
+    if cached is not None:
+        return cached
+    route = road.get("route", []) or []
+    b = _get_bounds(game_map, bounds)
+    d_lon = b['max_lon'] - b['min_lon']
+    d_lat = b['max_lat'] - b['min_lat']
+    if d_lon == 0 or d_lat == 0:
+        pts = [(float(max(1, game_map.width) / 2), float(max(1, game_map.height) / 2)) for _ in route]
+    else:
+        sx = max(1, game_map.width) / d_lon
+        sy = max(1, game_map.height) / d_lat
+        min_lon, min_lat = b['min_lon'], b['min_lat']
+        pts = [((r[1] - min_lon) * sx, (r[0] - min_lat) * sy) for r in route]
+    _ROAD_GRID_POLYLINE_BY_ID[rid] = pts
+    return pts
 
 
 def _collect_road_grid_polylines_for_cells(
     game_map, cells: set, current_year: int, bounds=None, *, include_bridges: bool = True,
 ) -> list:
     """Road (and optional bridge) centerline polylines in grid units for spatial cells."""
+    if not cells:
+        return []
     _build_road_spatial_index(game_map)
     bounds = _get_bounds(game_map, bounds)
-    grid_cache = {}
+    sig = _spatial_index_bounds_signature(game_map) if game_map is not None else None
+    cache_key = (sig, int(current_year), bool(include_bridges), frozenset(cells))
+    cached = _POLYLINES_FOR_CELLS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     polylines = []
     seen = set()
 
@@ -832,22 +913,19 @@ def _collect_road_grid_polylines_for_cells(
         if year_built > current_year or (removed_year is not None and removed_year <= current_year):
             return
         seen.add(rid)
-        if rid not in grid_cache:
-            pts = []
-            for r in road.get("route", []) or []:
-                gx, gy = _latlon_to_grid(r[0], r[1], game_map, bounds)
-                pts.append((float(gx), float(gy)))
-            grid_cache[rid] = pts
-        pts = grid_cache.get(rid) or []
+        pts = _road_grid_polyline(road, game_map, bounds)
         if len(pts) >= 2:
             polylines.append(pts)
 
-    for cell in cells or []:
+    for cell in cells:
         for _road_name, road, _ in _ROAD_SPATIAL_INDEX.get(cell, []):
             _add_road(road)
         if include_bridges:
             for _road_name, road, _ in _BRIDGE_SPATIAL_INDEX.get(cell, []):
                 _add_road(road)
+    _POLYLINES_FOR_CELLS_CACHE[cache_key] = polylines
+    if len(_POLYLINES_FOR_CELLS_CACHE) > 256:
+        _POLYLINES_FOR_CELLS_CACHE.clear()
     return polylines
 
 
@@ -870,15 +948,16 @@ def land_segment_fraction_on_street_network(
     bounds = _get_bounds(game_map, bounds)
     cells = _spatial_cells_near_grid_segment(ax, ay, bx, by, game_map, bounds)
     polylines = _collect_road_grid_polylines_for_cells(game_map, cells, int(current_year), bounds)
-    sample_step = max(0.004, float(max_distance_grid) * 0.5)
-    n_samples = max(4, int(math.ceil(seg_len / sample_step)))
+    sample_step = max(0.05, float(max_distance_grid) * 0.5)
+    n_samples = min(12, max(4, int(math.ceil(seg_len / sample_step))))
     on_len = 0.0
     chunk = seg_len / n_samples
+    max_d = float(max_distance_grid)
     for j in range(n_samples):
         t = (j + 0.5) / n_samples
         px = ax + t * (bx - ax)
         py = ay + t * (by - ay)
-        if polylines and _min_distance_to_polylines(px, py, polylines) <= float(max_distance_grid):
+        if polylines and _min_distance_to_polylines(px, py, polylines, max_distance=max_d) <= max_d:
             on_len += chunk
         elif is_point_on_bridge_at_year(px, py, int(current_year), game_map, bounds):
             on_len += chunk
@@ -898,6 +977,10 @@ def route_land_segment_on_osm_polyline(
     min_coverage: float = None,
 ) -> bool:
     """True when a land segment lies on OSM road geometry (not a chord between polylines)."""
+    from game_presets import AI_MIN_STREET_QUALIFYING_SEGMENT_GRID
+
+    ax, ay, bx, by = float(x1), float(y1), float(x2), float(y2)
+    seg_len = math.hypot(bx - ax, by - ay)
     max_d = float(
         max_distance_grid
         if max_distance_grid is not None
@@ -908,8 +991,21 @@ def route_land_segment_on_osm_polyline(
         if min_coverage is not None
         else AI_RAIL_OSM_POLYLINE_MIN_SEGMENT_COVERAGE
     )
+    if seg_len + 1e-12 >= float(AI_MIN_STREET_QUALIFYING_SEGMENT_GRID):
+        if route_segment_is_osm_polyline_edge(
+            game_map, ax, ay, bx, by, int(current_year), bounds,
+            max_distance_grid=max_d,
+        ):
+            return True
+        # Street-router paths are simplified; accept when the segment hugs the network.
+        street_snap = max(max_d, 1.0)
+        frac = land_segment_fraction_on_street_network(
+            game_map, ax, ay, bx, by, current_year, bounds,
+            max_distance_grid=street_snap,
+        )
+        return frac + 1e-9 >= min_cov
     frac = land_segment_fraction_on_street_network(
-        game_map, x1, y1, x2, y2, current_year, bounds,
+        game_map, ax, ay, bx, by, current_year, bounds,
         max_distance_grid=max_d,
     )
     return frac + 1e-9 >= min_cov
@@ -934,7 +1030,7 @@ def point_near_street_network(
     base = (int(lat / _CELL_SIZE), int(lon / _CELL_SIZE))
     cells = {(base[0] + dlat, base[1] + dlon) for dlat in (-1, 0, 1) for dlon in (-1, 0, 1)}
     polylines = _collect_road_grid_polylines_for_cells(game_map, cells, int(current_year), bounds)
-    return bool(polylines) and _min_distance_to_polylines(px, py, polylines) <= max_d
+    return bool(polylines) and _min_distance_to_polylines(px, py, polylines, max_distance=max_d) <= max_d
 
 
 def route_fraction_on_named_street(
@@ -968,7 +1064,7 @@ def route_fraction_on_named_street(
             t = (j + 0.5) / n_samples
             px = ax + t * (bx - ax)
             py = ay + t * (by - ay)
-            if _min_distance_to_polylines(px, py, polylines) <= max_d:
+            if _min_distance_to_polylines(px, py, polylines, max_distance=max_d) <= max_d:
                 on_street_len += chunk
     if total_len <= 0:
         return 0.0
@@ -1128,247 +1224,6 @@ def get_nearest_road_name_for_point(game_map, x: float, y: float, current_year: 
     if max_distance_grid is not None and best_dist > float(max_distance_grid):
         return ""
     return best_name
-
-
-def _project_point_on_segment_grid(px: float, py: float, ax: float, ay: float, bx: float, by: float):
-    """Project (px,py) onto segment (ax,ay)-(bx,by). Returns (nx, ny, distance)."""
-    dx = bx - ax
-    dy = by - ay
-    dist_sq = dx * dx + dy * dy
-    if dist_sq < 1e-20:
-        return ax, ay, math.hypot(px - ax, py - ay)
-    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / dist_sq))
-    nx = ax + t * dx
-    ny = ay + t * dy
-    return nx, ny, math.hypot(px - nx, py - ny)
-
-
-def snap_point_to_nearest_road(
-    game_map,
-    x: float,
-    y: float,
-    current_year: int,
-    bounds=None,
-    max_distance_grid: float = 15.0,
-    max_segments: int = 120,
-) -> Optional[tuple]:
-    """Snap grid point to nearest road segment. Returns (snap_x, snap_y) or None."""
-    _build_road_spatial_index(game_map)
-    bx, by = float(x), float(y)
-    lat, lon = _grid_to_latlon(bx, by, game_map, bounds)
-    cell = (int(lat / _CELL_SIZE), int(lon / _CELL_SIZE))
-    cells_to_check = [cell]
-    for dlat, dlon in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
-        cells_to_check.append((cell[0] + dlat, cell[1] + dlon))
-
-    best_dist = float("inf")
-    best_pt = None
-    segments_checked = 0
-    grid_cache = {}
-
-    for c in cells_to_check:
-        for road_name, road, _ in _ROAD_SPATIAL_INDEX.get(c, []):
-            if segments_checked >= max_segments:
-                break
-            year_built = road.get("year", 1800)
-            removed_year = road.get("removed_year")
-            if year_built > current_year or (removed_year is not None and removed_year <= current_year):
-                continue
-            route = road.get("route", [])
-            if len(route) < 2:
-                continue
-            if road_name not in grid_cache:
-                pts = []
-                for r in route:
-                    gx, gy = _latlon_to_grid(r[0], r[1], game_map, bounds)
-                    pts.append((float(gx), float(gy)))
-                grid_cache[road_name] = pts
-            grid_pts = grid_cache[road_name]
-            for i in range(len(grid_pts) - 1):
-                if segments_checked >= max_segments:
-                    break
-                segments_checked += 1
-                ax, ay = grid_pts[i][0], grid_pts[i][1]
-                cx, cy = grid_pts[i + 1][0], grid_pts[i + 1][1]
-                nx, ny, d = _project_point_on_segment_grid(bx, by, ax, ay, cx, cy)
-                if d < best_dist:
-                    best_dist = d
-                    best_pt = (nx, ny)
-    if best_pt is None or best_dist > float(max_distance_grid):
-        return None
-    return best_pt
-
-
-def _route_graph_node_key(x: float, y: float, precision: float = 0.35) -> tuple:
-    return (round(float(x) / precision) * precision, round(float(y) / precision) * precision)
-
-
-def _simplify_polyline_points(points: list) -> list:
-    def _as_xy(p):
-        if isinstance(p, (list, tuple)) and len(p) >= 2:
-            return float(p[0]), float(p[1])
-        return float(getattr(p, 'x', 0)), float(getattr(p, 'y', 0))
-
-    if not points:
-        return []
-    if len(points) <= 2:
-        return [_as_xy(p) for p in points]
-    out = [_as_xy(points[0])]
-    for i in range(1, len(points) - 1):
-        ax, ay = out[-1]
-        bx, by = _as_xy(points[i])
-        cx, cy = _as_xy(points[i + 1])
-        v1x, v1y = bx - ax, by - ay
-        v2x, v2y = cx - bx, cy - by
-        l1 = math.hypot(v1x, v1y)
-        l2 = math.hypot(v2x, v2y)
-        if l1 < 1e-6 or l2 < 1e-6:
-            continue
-        cos_a = (v1x * v2x + v1y * v2y) / (l1 * l2)
-        if cos_a < 0.995:
-            out.append((bx, by))
-    out.append(_as_xy(points[-1]))
-    if len(out) < 2:
-        return [_as_xy(points[0]), _as_xy(points[-1])]
-    return out
-
-
-def find_street_route_between_points(
-    game_map,
-    ax: float,
-    ay: float,
-    bx: float,
-    by: float,
-    current_year: int,
-    bounds=None,
-    max_distance_grid: float = 15.0,
-    max_route_points: int = 150,
-) -> list:
-    """Return grid polyline from A to B following streets when possible."""
-    snap_a = snap_point_to_nearest_road(game_map, ax, ay, current_year, bounds, max_distance_grid)
-    snap_b = snap_point_to_nearest_road(game_map, bx, by, current_year, bounds, max_distance_grid)
-    if snap_a is None:
-        snap_a = (float(ax), float(ay))
-    if snap_b is None:
-        snap_b = (float(bx), float(by))
-    ax, ay = snap_a
-    bx, by = snap_b
-    if math.hypot(bx - ax, by - ay) < 0.05:
-        return [snap_a, snap_b]
-
-    bridge = get_bridge_polyline_between_shores(game_map, snap_a, snap_b, current_year, bounds=bounds)
-    if bridge and len(bridge) >= 2:
-        return _simplify_polyline_points(bridge)[:max_route_points]
-
-    margin = max(25.0, math.hypot(bx - ax, by - ay) * 0.75)
-    min_x, max_x = min(ax, bx) - margin, max(ax, bx) + margin
-    min_y, max_y = min(ay, by) - margin, max(ay, by) + margin
-
-    adj = {}
-    grid_cache = {}
-
-    def add_edge(n1, n2, w):
-        if w <= 0:
-            w = 1e-6
-        adj.setdefault(n1, []).append((n2, w))
-        adj.setdefault(n2, []).append((n1, w))
-
-    def in_bbox(px, py):
-        return min_x <= px <= max_x and min_y <= py <= max_y
-
-    _build_road_spatial_index(game_map)
-    seen_cells = set()
-    for px, py in ((ax, ay), (bx, by), (min_x, min_y), (max_x, max_y)):
-        lat, lon = _grid_to_latlon(px, py, game_map, bounds)
-        seen_cells.add((int(lat / _CELL_SIZE), int(lon / _CELL_SIZE)))
-    cells = list(seen_cells)
-    for cell in list(seen_cells):
-        for dlat, dlon in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
-            cells.append((cell[0] + dlat, cell[1] + dlon))
-
-    segments_checked = 0
-    for cell in cells:
-        for road_name, road, _ in _ROAD_SPATIAL_INDEX.get(cell, []):
-            if segments_checked >= _MAX_EXTEND_ROAD_CHECKS * 3:
-                break
-            year_built = road.get("year", 1800)
-            removed_year = road.get("removed_year")
-            if year_built > current_year or (removed_year is not None and removed_year <= current_year):
-                continue
-            route = road.get("route", [])
-            if len(route) < 2:
-                continue
-            if road_name not in grid_cache:
-                pts = []
-                for r in route:
-                    gx, gy = _latlon_to_grid(r[0], r[1], game_map, bounds)
-                    pts.append((float(gx), float(gy)))
-                grid_cache[road_name] = pts
-            grid_pts = grid_cache[road_name]
-            for i in range(len(grid_pts) - 1):
-                if segments_checked >= _MAX_EXTEND_ROAD_CHECKS * 3:
-                    break
-                segments_checked += 1
-                p1x, p1y = grid_pts[i][0], grid_pts[i][1]
-                p2x, p2y = grid_pts[i + 1][0], grid_pts[i + 1][1]
-                if not in_bbox(p1x, p1y) and not in_bbox(p2x, p2y):
-                    continue
-                n1 = _route_graph_node_key(p1x, p1y)
-                n2 = _route_graph_node_key(p2x, p2y)
-                w = math.hypot(p2x - p1x, p2y - p1y)
-                add_edge(n1, n2, w)
-
-    start = (ax, ay)
-    goal = (bx, by)
-    connect_radius = max(20.0, max_distance_grid * 1.5)
-    for node in list(adj.keys()):
-        ds = math.hypot(node[0] - start[0], node[1] - start[1])
-        if ds <= connect_radius:
-            add_edge(start, node, ds)
-        dg = math.hypot(node[0] - goal[0], node[1] - goal[1])
-        if dg <= connect_radius:
-            add_edge(goal, node, dg)
-
-    if start not in adj:
-        return _simplify_polyline_points([start, goal])[:max_route_points]
-
-    def heuristic(n):
-        return math.hypot(n[0] - goal[0], n[1] - goal[1])
-
-    open_heap = [(heuristic(start), 0.0, start)]
-    came_from = {}
-    g_score = {start: 0.0}
-    closed = set()
-    expansions = 0
-    max_expansions = 80000
-    found = None
-
-    while open_heap and expansions < max_expansions:
-        _, g, current = heapq.heappop(open_heap)
-        if current in closed:
-            continue
-        closed.add(current)
-        expansions += 1
-        if math.hypot(current[0] - goal[0], current[1] - goal[1]) < 0.35:
-            found = current
-            break
-        for neighbor, w in adj.get(current, []):
-            if neighbor in closed:
-                continue
-            tentative = g + w
-            if tentative < g_score.get(neighbor, float("inf")):
-                g_score[neighbor] = tentative
-                came_from[neighbor] = current
-                heapq.heappush(open_heap, (tentative + heuristic(neighbor), tentative, neighbor))
-
-    if found is None:
-        return _simplify_polyline_points([start, goal])[:max_route_points]
-
-    path = [found]
-    while path[-1] in came_from:
-        path.append(came_from[path[-1]])
-    path.reverse()
-    return _simplify_polyline_points(path)[:max_route_points]
 
 
 # Overlap tolerance: road points within this distance (grid units) of existing lines are "redundant"
@@ -1982,41 +1837,121 @@ def get_road_segment_points_for_ai(game_map, current_year: int, max_points: int 
 
 def _point_to_segment_distance(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
     """Distance from point (px, py) to line segment (ax,ay)-(bx,by). Uses lat/lon as x/y."""
+    d, _t = _point_to_segment_distance_and_param(px, py, ax, ay, bx, by)
+    return d
+
+
+def _point_to_segment_distance_and_param(
+    px: float, py: float, ax: float, ay: float, bx: float, by: float,
+) -> tuple[float, float]:
+    """Return (distance, t) where t in [0,1] is the projection parameter on the segment."""
     dx = bx - ax
     dy = by - ay
     dist_sq = dx * dx + dy * dy
     if dist_sq < 1e-20:
-        return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
-    t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / dist_sq))
+        return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5, 0.0
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / dist_sq))
     nx = ax + t * dx
     ny = ay + t * dy
-    return ((px - nx) ** 2 + (py - ny) ** 2) ** 0.5
+    return ((px - nx) ** 2 + (py - ny) ** 2) ** 0.5, t
+
+
+def _closest_location_on_polyline(
+    px: float, py: float, poly: list,
+) -> tuple[float, float, int, float]:
+    """Return (distance, cumulative_arclength, segment_index, t) for the closest point on poly."""
+    best = (float("inf"), 0.0, 0, 0.0)
+    cumulative = 0.0
+    for si in range(len(poly) - 1):
+        ax, ay = float(poly[si][0]), float(poly[si][1])
+        bx, by = float(poly[si + 1][0]), float(poly[si + 1][1])
+        seg_len = math.hypot(bx - ax, by - ay)
+        d, t = _point_to_segment_distance_and_param(px, py, ax, ay, bx, by)
+        if d < best[0]:
+            best = (d, cumulative + t * seg_len, si, t)
+        cumulative += seg_len
+    return best
+
+
+def route_segment_is_osm_polyline_edge(
+    game_map,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    current_year: int,
+    bounds=None,
+    *,
+    max_distance_grid: float = None,
+    min_path_ratio: float = 0.85,
+) -> bool:
+    """True when a land segment follows an OSM road polyline rather than cutting across blocks.
+
+    Long chords that run near a parallel street do not qualify; the segment length must match
+    the polyline path length between its endpoints on the same centerline.
+    """
+    from game_presets import AI_RAIL_OSM_POLYLINE_MAX_DISTANCE_GRID
+
+    ax, ay, bx, by = float(x1), float(y1), float(x2), float(y2)
+    seg_len = math.hypot(bx - ax, by - ay)
+    if seg_len <= 1e-9:
+        return True
+    max_d = float(
+        max_distance_grid
+        if max_distance_grid is not None
+        else AI_RAIL_OSM_POLYLINE_MAX_DISTANCE_GRID
+    )
+    bounds = _get_bounds(game_map, bounds)
+    cells = _spatial_cells_near_grid_segment(ax, ay, bx, by, game_map, bounds, expand=2)
+    polylines = _collect_road_grid_polylines_for_cells(game_map, cells, int(current_year), bounds)
+    if not polylines:
+        return False
+
+    best_ratio = 0.0
+    for poly in polylines:
+        if len(poly) < 2:
+            continue
+        dist_a, arc_a, _si_a, _t_a = _closest_location_on_polyline(ax, ay, poly)
+        dist_b, arc_b, _si_b, _t_b = _closest_location_on_polyline(bx, by, poly)
+        if dist_a > max_d or dist_b > max_d:
+            continue
+        path_len = abs(arc_b - arc_a)
+        if path_len <= 1e-9:
+            continue
+        ratio = seg_len / path_len
+        if ratio > best_ratio:
+            best_ratio = ratio
+    return best_ratio + 1e-9 >= float(min_path_ratio)
+
+
+_POINT_ON_ROAD_CACHE: dict = {}
 
 
 def is_point_on_road_at_year(x: float, y: float, current_year: int, game_map, bounds=None) -> bool:
     """Check if grid point (x, y) is on a road that exists at current_year in NYC.
-    Uses spatial index for fast lookup - only checks road segments in same grid cell."""
+    Uses cached grid polylines near the point (avoids false negatives from dense segment caps)."""
+    sig = _spatial_index_bounds_signature(game_map) if game_map is not None else None
+    cache_key = (round(float(x), 2), round(float(y), 2), int(current_year), sig)
+    cached = _POINT_ON_ROAD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     _build_road_spatial_index(game_map)
-    lat, lon = _grid_to_latlon(x, y, game_map, bounds)
-    tolerance = 0.00015  # ~15m in degrees
-    cell = (int(lat / _CELL_SIZE), int(lon / _CELL_SIZE))
-    candidates = _ROAD_SPATIAL_INDEX.get(cell, [])
-    for road_name, road, seg_idx in candidates:
-        year_built = road.get('year', 1800)
-        removed_year = road.get('removed_year')
-        if year_built > current_year:
-            continue
-        if removed_year is not None and removed_year <= current_year:
-            continue
-        route = road.get('route', [])
-        if seg_idx >= len(route) - 1:
-            continue
-        a_lat, a_lon = route[seg_idx][0], route[seg_idx][1]
-        b_lat, b_lon = route[seg_idx + 1][0], route[seg_idx + 1][1]
-        d = _point_to_segment_distance(lon, lat, a_lon, a_lat, b_lon, b_lat)
-        if d <= tolerance:
-            return True
-    return False
+    px, py = float(x), float(y)
+    bounds = _get_bounds(game_map, bounds)
+    cy = int(current_year)
+    if is_point_on_bridge_at_year(px, py, cy, game_map, bounds):
+        found = True
+    else:
+        on_road_max_d = max(0.004, float(BUS_STREET_MAX_DISTANCE_GRID) * 0.5)
+        cells = _spatial_cells_near_grid_point(px, py, game_map, bounds, expand=1)
+        polylines = _collect_road_grid_polylines_for_cells(game_map, cells, cy, bounds)
+        found = bool(polylines) and _min_distance_to_polylines(
+            px, py, polylines, max_distance=on_road_max_d,
+        ) <= on_road_max_d
+    _POINT_ON_ROAD_CACHE[cache_key] = found
+    if len(_POINT_ON_ROAD_CACHE) > 8192:
+        _POINT_ON_ROAD_CACHE.clear()
+    return found
 
 
 def get_bridge_polyline_between_shores(

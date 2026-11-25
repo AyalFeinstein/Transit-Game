@@ -32,12 +32,9 @@ python qt_networked.py
 `NetworkedMainWindow` extends `MainWindow` from `qt.py` and:
 
 1. **Adds network UI** to the game setup tab (checkbox, server URL, status)
-2. **Overrides key methods** to add network support:
-   - `on_start_game_clicked()` - Checks for network mode
-   - `on_create_line_clicked()` - Sends build actions to server
-   - `advance_year_button_clicked()` - Sends advance year to server
-   - `buy_trainset_from_marketplace()` - Sends purchase to server
-   - `buy_vehicle_from_marketplace()` - Sends purchase to server
+2. **Starts games on the server** with the lobby's settings (`on_start_game_clicked()`); the
+   game itself then runs in a `MainWindow` whose `Operations` forwards every game-changing
+   call to the server (see `network_rpc.py`), and whose End Year button votes to end the year.
 
 3. **Handles network events**:
    - Connection/disconnection

@@ -97,3 +97,15 @@ def get_standard_population_at_location(x: int, y: int, width: int, height: int)
         STANDARD_POPULATION['population_per_grid_square_max']
     )
 
+
+
+# Line types AI companies may specialize in here (see ai_specialties.SPECIALTIES).
+# The standard grid has no water, so no ferry companies.
+AI_LINE_SPECIALTIES = (
+    'commuter_rail', 'city_rail', 'light_rail', 'local_bus', 'express_bus', 'all_bus',
+)
+
+# Generic hook names used by map_preset_loader
+MAP_ZOOM = STANDARD_ZOOM
+MAP_POPULATION = STANDARD_POPULATION
+get_grid_population_at_location = get_standard_population_at_location

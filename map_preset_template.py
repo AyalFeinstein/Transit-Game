@@ -7,7 +7,7 @@ To use a custom map preset:
 2. Fill in all the required variables below
 3. The map will be automatically discovered and can be used without modifying main code!
 
-4. Put offline generation scripts in generate_<map_id>_*.py (e.g. generate_nyc_population_points.py).
+4. Put offline generation scripts in generate_<map_id>_*.py (e.g. generate_mycity_population_points.py).
    Preset files (map_presets_*.py) hold bounds, runtime helpers, and precomputed data only.
 
 The preset will be automatically loaded when you specify the map name in the game.
@@ -42,6 +42,13 @@ MAP_ZOOM = {
     'max_zoom': 19,  # Maximum zoom
 }
 
+# Optional: line types AI companies may specialize in on this map (default: all of them).
+# Choices: 'commuter_rail', 'city_rail', 'light_rail', 'local_bus', 'express_bus', 'all_bus', 'ferry'.
+# Leave out 'ferry' on maps without water.
+AI_LINE_SPECIALTIES = (
+    'commuter_rail', 'city_rail', 'light_rail', 'local_bus', 'express_bus', 'all_bus', 'ferry',
+)
+
 # Optional: Default line names for companies (players) on this map. First line gets first name, etc.
 DEFAULT_LINE_NAMES = [
     "Main Line",
@@ -53,6 +60,19 @@ DEFAULT_LINE_NAMES = [
     "Riverside Line",
     "Metro Link",
 ]
+
+# Optional: names. Station and line names follow the same rules on every map (geo_naming):
+# cross-streets, else the nearest place, else "place – street"; lines are named for the
+# places at their ends. A map only supplies its geography:
+#   def get_place_names():  return ((name, lat, lon), ...)      # or (name, lat, lon, max_km)
+#   def get_area_boxes():   return ((name, min_lat, max_lat, min_lon, max_lon), ...)
+#   def get_road_utils():   return <module with this map's street data>   # for cross-streets
+#
+# Other optional hooks read through map_preset_loader:
+#   TRANSIT_COMPANY_NAMES = [...]     # AI company names for this map
+#   NEW_GAME_DEFAULT = True           # preselect this map in the new-game dialog
+#   def get_events():       return [...]   # GameEvent objects added to every game on this map
+#   def get_water_mask():   return water_mask.WaterMask(...)   # offline coastline/lake data
 
 # Optional: Default schedule scheme for new lines. peak/off_peak/night multipliers (e.g. 1.0 = full service).
 DEFAULT_SCHEDULE_SCHEME = {"peak": 1.0, "off_peak": 0.8, "night": 0.3}

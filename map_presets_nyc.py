@@ -9,58 +9,13 @@ Precomputed included points / population: run generate_nyc_*.py scripts (not at 
 MAP_NAME = "New York City"
 MAP_ID = "nyc"
 
-# OSM relation for Governors Island landmass (included in buildable area with population).
-GOVERNORS_ISLAND_OSM_RELATION_ID = 2389631
-GOVERNORS_ISLAND_BOUNDS = {
-    'min_lat': 40.684,
-    'max_lat': 40.696,
-    'min_lon': -74.028,
-    'max_lon': -74.012,
-}
+from nyc_city_data import (  # shared with the NY Metro map
+    AREA_BOXES, GOVERNORS_ISLAND_BOUNDS, GOVERNORS_ISLAND_OSM_RELATION_ID, NYC_BOUNDS,
+    NYC_BOUNDS_EXTENDED_BROOKLYN_SW, NYC_HISTORICAL_BRIDGES, NYC_HISTORICAL_ROADS, PLACE_NAMES,
+    TEMP_EXTEND_BROOKLYN_SW_BOUNDS, TRANSIT_COMPANY_NAMES, WORKPLACE_DENSITY_ZONES,
+    _get_active_nyc_bounds, get_nyc_bounds, get_nyc_population_at_location, is_in_governors_island,
+)
 
-
-def is_in_governors_island(lat: float, lon: float) -> bool:
-    """True when a lat/lon lies on Governors Island (approximate bounds)."""
-    return (
-        GOVERNORS_ISLAND_BOUNDS['min_lat'] <= lat <= GOVERNORS_ISLAND_BOUNDS['max_lat']
-        and GOVERNORS_ISLAND_BOUNDS['min_lon'] <= lon <= GOVERNORS_ISLAND_BOUNDS['max_lon']
-    )
-
-# NYC Proper bounds - covers all five boroughs including Staten Island
-# NOTE: Keep this as the *default* bounds used by scripts unless they explicitly opt into
-# a temporary extension.
-NYC_BOUNDS = {
-    'center_lat': 40.7128,  # NYC center (Manhattan)
-    'center_lon': -73.9352,  # NYC center
-    'min_lat': 40.4900,  # Southern edge (Staten Island)
-    'max_lat': 40.9200,  # Northern edge (Bronx)
-    'min_lon': -74.3000,  # Western edge (Staten Island - must include all of Staten Island)
-    'max_lon': -73.7000,  # Eastern edge (Queens)
-    'width': 50,
-    'height': 50
-}
-
-# Temporary: extend the playable population grid slightly south and west of Brooklyn.
-# This is useful when you want a bit of extra buildable space near Brooklyn's edge without
-# redoing the full polygon point generation.
-#
-# IMPORTANT: This changes the (lat/lon)<->(x/y) mapping for NYC maps, so treat it as
-# a temporary experimentation flag.
-TEMP_EXTEND_BROOKLYN_SW_BOUNDS = True
-
-NYC_BOUNDS_EXTENDED_BROOKLYN_SW = {
-    **NYC_BOUNDS,
-    # Extend a bit further south and west
-    'min_lat': 40.4500,
-    'min_lon': -74.3800,
-}
-
-
-def _get_active_nyc_bounds() -> dict:
-    """Internal helper to pick the active NYC bounds."""
-    if TEMP_EXTEND_BROOKLYN_SW_BOUNDS:
-        return NYC_BOUNDS_EXTENDED_BROOKLYN_SW
-    return NYC_BOUNDS
 
 # Timeline settings
 NYC_TIMELINE = {
@@ -83,6 +38,11 @@ NYC_ZOOM = {
 }
 
 # Default line names for companies on this map (first line A, second B, etc.)
+# Boundaries (keys in ny_metro_osm_relation_polygons.json) whose population is not part of
+# this map: the New York City map shows only New York City.
+EXCLUDED_POPULATION_REGIONS = ('nj_state',)
+
+
 DEFAULT_LINE_NAMES = [
     "Hudson Line",
     "Harlem Service",
@@ -145,7 +105,29 @@ NYC_EXCLUDED_AREAS = [
 ]
 
 def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
-    """Check if a location (lat, lon) is in a water area or excluded area.
+    """True for water, and for places that are not part of this map (off the map, or in New
+    Jersey). Uses the offline OSM coastline / lake data and the real New Jersey boundary; the
+    rough rectangles below are only a fallback when that data file is missing."""
+    active_bounds = _get_active_nyc_bounds()
+    if (lat < active_bounds['min_lat'] or lat > active_bounds['max_lat'] or
+            lon < active_bounds['min_lon'] or lon > active_bounds['max_lon']):
+        return True
+    try:
+        mask = get_water_mask()
+        if mask.has_data():
+            if is_in_governors_island(lat, lon):
+                return False
+            if any(mask.in_region(name, lat, lon) for name in EXCLUDED_POPULATION_REGIONS):
+                return True
+            return mask.is_water_latlon(lat, lon)
+    except Exception:
+        pass
+    return _is_water_location_rectangles(lat, lon, osm_integration)
+
+
+def _is_water_location_rectangles(lat: float, lon: float, osm_integration=None) -> bool:
+    """Fallback water test from rectangles (used only without the offline water data).
+    Check if a location (lat, lon) is in a water area or excluded area.
     Uses OSM data if available for accurate water detection (rivers aren't straight).
     Returns True if the location is in water or outside NYC proper, False otherwise.
     Upper Manhattan and Bronx are included (even if population is 0)."""
@@ -318,6 +300,13 @@ def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
     
     return False
 
+
+# Line types AI companies may specialize in here (see ai_specialties.SPECIALTIES).
+# The city map is too small for commuter rail.
+AI_LINE_SPECIALTIES = (
+    'city_rail', 'light_rail', 'local_bus', 'express_bus', 'all_bus', 'ferry',
+)
+
 # Population settings for NYC - historical milestones for realistic growth
 # Sources: NYC Planning, US Census. Growth was rapid 1830-1900, moderate 1900-1950, flat 1950-2000.
 NYC_POPULATION = {
@@ -331,7 +320,7 @@ NYC_POPULATION = {
     'max_population_per_location': 50000,
     # Realistic historical targets (interpolated between years)
     'population_targets_by_year': {
-        1830: 202589,
+        1830: 100226,
         1850: 515547,
         1870: 942292,
         1890: 1515301,
@@ -346,92 +335,6 @@ NYC_POPULATION = {
         2050: 9000000,  # Modest projected growth
     },
 }
-
-def get_nyc_population_at_location(lat: float, lon: float, is_water: bool) -> int:
-    """Get population at a specific location for 1830 NYC.
-    
-    Args:
-        lat: Latitude
-        lon: Longitude
-        is_water: Whether the location is in water
-        
-    Returns:
-        Population count (0 if water, otherwise based on historical density)
-    """
-    if is_water:
-        return 0
-    
-    import random
-    
-    if 40.70 <= lat <= 40.88 and -74.02 <= lon <= -73.93:
-        if lat < 40.75:
-            return random.randint(800, 1500)
-        elif lat < 40.80:
-            return random.randint(400, 800)
-        elif 40.80 <= lat <= 40.82:
-            return random.randint(50, 150)
-        else:
-            return random.randint(20, 80)
-    
-    # Brooklyn Heights (growing area in 1830)
-    elif 40.68 <= lat <= 40.72 and -74.02 <= lon <= -73.95:
-        return random.randint(200, 500)
-    
-    # Other Brooklyn (sparse, but includes southern and western Brooklyn)
-    # Southern Brooklyn (Coney Island area) - sparse in 1830, but had some population
-    elif 40.57 <= lat <= 40.65 and -74.02 <= lon <= -73.90:
-        return random.randint(20, 100)  # Southern Brooklyn had some population
-    # Western Brooklyn (near Manhattan) - more population
-    elif 40.65 <= lat <= 40.68 and -74.02 <= lon <= -73.95:
-        return random.randint(50, 200)
-    # Eastern Brooklyn - sparse
-    elif 40.65 <= lat <= 40.68 and -73.95 <= lon <= -73.90:
-        return random.randint(30, 150)
-    
-    # Queens (very sparse in 1830)
-    elif -73.98 <= lon <= -73.85:
-        return random.randint(10, 100)
-    elif 40.80 <= lat <= 40.92 and -73.95 <= lon <= -73.75:
-        if 40.80 <= lat <= 40.85:
-            return random.randint(30, 100) 
-        elif 40.85 <= lat <= 40.88:
-            return random.randint(10, 60) 
-        else:
-            return random.randint(5, 40)  
-    elif lat <= 40.65 and lon <= -74.00:
-        return random.randint(5, 50)
-    
-    # Roosevelt Island (Welfare Island in 1830) - had some population but sparse
-    # Roosevelt Island is approximately 40.75-40.77 lat, -73.95 to -73.94 lon
-    elif 40.75 <= lat <= 40.77 and -73.95 <= lon <= -73.94:
-        return random.randint(20, 80)  # Sparse population in 1830
-
-    # Governors Island — military garrison and sparse civilian settlement in 1830
-    elif is_in_governors_island(lat, lon):
-        return random.randint(50, 200)
-    
-    # Staten Island (Richmond County) - sparse population in 1830, mostly rural
-    # Staten Island is approximately 40.49-40.65 lat, -74.30 to -74.02 lon
-    elif 40.49 <= lat <= 40.65 and -74.30 <= lon <= -74.02:
-        if 40.55 <= lat <= 40.62 and -74.20 <= lon <= -74.10:
-            return random.randint(50, 150)  # More populated central area
-        else:
-            return random.randint(10, 80)  # Sparse rural areas
-    
-    # Long Island area (Brooklyn/Queens area between Long Island and New York relations)
-    # This area includes parts of Brooklyn and Queens that were developing in 1830
-    # Brooklyn Heights and nearby areas had more population
-    elif 40.65 <= lat <= 40.75 and -74.00 <= lon <= -73.85:
-        if 40.68 <= lat <= 40.72 and -74.00 <= lon <= -73.95:
-            return random.randint(150, 400)  # Brooklyn Heights area
-        elif 40.65 <= lat <= 40.68 and -74.00 <= lon <= -73.90:
-            return random.randint(30, 150)  # Southern Brooklyn
-        else:
-            return random.randint(10, 100)  # Other Brooklyn/Queens areas
-    
-    # Default for other areas
-    else:
-        return random.randint(10, 150)
 
 
 def is_nyc_map(map_center_lat: float = None, map_center_lon: float = None, width: int = None, height: int = None) -> bool:
@@ -477,11 +380,6 @@ def get_nyc_default_center_lon() -> float:
     return _get_active_nyc_bounds()['center_lon']
 
 
-def get_nyc_bounds() -> dict:
-    """Get NYC bounds dictionary. All NYC-specific bounds logic should use this function."""
-    return _get_active_nyc_bounds().copy()
-
-
 def get_nyc_timeline() -> dict:
     """Get NYC timeline dictionary. All NYC-specific timeline logic should use this function."""
     return NYC_TIMELINE.copy()
@@ -495,6 +393,34 @@ def get_nyc_zoom() -> dict:
 def get_nyc_population_settings() -> dict:
     """Get NYC population settings dictionary. All NYC-specific population settings should use this function."""
     return NYC_POPULATION.copy()
+
+
+def get_place_names() -> tuple:
+    """Neighbourhood centres used to name stations and lines on this map."""
+    return PLACE_NAMES
+
+
+def get_area_boxes() -> tuple:
+    """Broad areas used for names when no neighbourhood is near."""
+    return AREA_BOXES
+
+
+def get_water_mask():
+    """Offline coastline / lake / boundary data for this map."""
+    from map_presets_ny_water_utils import WATER_MASK
+    return WATER_MASK
+
+
+def get_events() -> list:
+    """Historical events for this map."""
+    from nyc_events import get_nyc_events
+    return get_nyc_events()
+
+
+def get_road_utils():
+    """Module holding this map's street network data and queries."""
+    import map_presets_nyc_road_utils
+    return map_presets_nyc_road_utils
 
 
 def get_point_area_map() -> dict:
@@ -607,102 +533,9 @@ def get_road_extension_points_from_end(game_map, base_pt: tuple, other_end_pt: t
 
 
 def get_ferry_segment_points_for_ai(game_map, current_year: int, max_points: int = 12, existing_line_routes=None, rng=None) -> list:
-    """Return NYC ferry route candidates as grid polylines over water.
-    Preset-scoped so core AI can stay map-agnostic."""
-    import math
-
-    b = get_nyc_bounds()
-    w = max(1, getattr(game_map, "width", 1))
-    h = max(1, getattr(game_map, "height", 1))
-    pop_map = getattr(game_map, "population", None) or {}
-
-    def _latlon_to_grid(lat: float, lon: float) -> tuple[float, float]:
-        x = (lon - b["min_lon"]) / max(1e-9, (b["max_lon"] - b["min_lon"])) * w
-        y = (lat - b["min_lat"]) / max(1e-9, (b["max_lat"] - b["min_lat"])) * h
-        return (float(x), float(y))
-
-    def _in_map(pt: tuple[float, float]) -> bool:
-        return 0 <= pt[0] <= w and 0 <= pt[1] <= h
-
-    def _pop_near(px: float, py: float, radius: int = 10) -> int:
-        """Match AI road-building population lookup (sparse OSM grid vs population keys)."""
-        ix, iy = int(round(px)), int(round(py))
-        p = int(pop_map.get((ix, iy), 0))
-        if p > 0:
-            return p
-        for r in range(1, radius + 1):
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
-                    if dx * dx + dy * dy <= r * r:
-                        q = int(pop_map.get((ix + dx, iy + dy), 0))
-                        if q > 0:
-                            return q
-        return 0
-
-    def _is_water_grid(x: float, y: float) -> bool:
-        try:
-            from map_preset_loader import preset_is_point_in_water
-            return bool(preset_is_point_in_water("nyc", x, y, game_map, skip_osm=True))
-        except Exception:
-            lat = b["min_lat"] + (float(y) / h) * (b["max_lat"] - b["min_lat"])
-            lon = b["min_lon"] + (float(x) / w) * (b["max_lon"] - b["min_lon"])
-            return bool(is_water_location(lat, lon, None))
-
-    # Build candidates from water cells that have nearby population.
-    # Endpoints are on water (passes ferry endpoint validation) but close to population centers.
-    water_points = []
-    for x in range(int(w) + 1):
-        for y in range(int(h) + 1):
-            if not _is_water_grid(x, y):
-                continue
-            near_pop = _pop_near(x, y, radius=3)
-            if near_pop >= 120:
-                water_points.append((float(x), float(y), int(near_pop)))
-    water_points.sort(key=lambda t: t[2], reverse=True)
-    if rng:
-        top = water_points[:180]
-        rng.shuffle(top)
-        water_points = top + water_points[180:]
-    else:
-        water_points = water_points[:220]
-
-    out = []
-    seen = set()
-    for i in range(len(water_points)):
-        x1, y1, p1 = water_points[i]
-        for j in range(i + 1, len(water_points)):
-            x2, y2, p2 = water_points[j]
-            d = math.hypot(x2 - x1, y2 - y1)
-            if d < 0.8 or d > 4.8:
-                continue
-            # Ensure route remains mostly over water.
-            water_hits = 0
-            total = 0
-            for t in (0.15, 0.3, 0.45, 0.6, 0.75, 0.9):
-                sx = x1 + t * (x2 - x1)
-                sy = y1 + t * (y2 - y1)
-                total += 1
-                if _is_water_grid(sx, sy):
-                    water_hits += 1
-            if total > 0 and (water_hits / total) < 0.70:
-                continue
-            ts = getattr(game_map, "tile_system", None)
-            if ts and hasattr(ts, "ferry_corridor_interior_mostly_water"):
-                try:
-                    if not ts.ferry_corridor_interior_mostly_water(
-                        x1, y1, x2, y2, skip_osm=False, min_fraction=0.88
-                    ):
-                        continue
-                except Exception:
-                    continue
-            key = tuple(sorted(((int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))))))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append([(x1, y1), (x2, y2)])
-            if len(out) >= max(1, min(10, max_points)):
-                return out
-    return out
+    """NYC ferry route candidates: water crossings near population, ending on the shore."""
+    from map_preset_utils import ai_ferry_segment_candidates
+    return ai_ferry_segment_candidates('nyc', get_nyc_bounds(), game_map, max_points=max_points, rng=rng)
 
 
 def get_station_name_for_point(x: float, y: float, game_map, current_year: int = None, line_name: str = None, existing_names: set = None) -> str:
@@ -713,6 +546,15 @@ def get_station_name_for_point(x: float, y: float, game_map, current_year: int =
     except Exception:
         year = 1830
     existing_names = existing_names or set()
+
+    # Cross-streets ("Canal St & Broadway") or the neighbourhood; older logic below is the fallback.
+    try:
+        from geo_naming import station_name_for_point
+        geo = station_name_for_point(game_map, x, y, year, existing_names)
+        if geo:
+            return geo
+    except Exception:
+        pass
 
     try:
         from game_presets import pick_major_terminal_station_name
@@ -816,18 +658,18 @@ def initialize_nyc_population(width: int, height: int, map_center_lat: float = N
         if file_pop:
             source = file_pop
 
-    population: dict[tuple[int, int], int] = {}
+    from map_preset_utils import spread_population_from_anchors
+
+    anchors: dict[tuple[int, int], int] = {}
     for (x, y), pop in source.items():
-        if 0 <= x <= width and 0 <= y <= height and pop > 0:
-            population[(x, y)] = int(pop)
+        if 0 <= x <= width and 0 <= y <= height:
+            anchors[(x, y)] = int(pop or 0)
 
-    return population
-
+    return spread_population_from_anchors(anchors, width, height)
 
 
 # Pre-computed excluded points - cleared, will be regenerated from OSM
 NYC_EXCLUDED_POINTS = []
-
 
 
 NYC_INITIAL_POPULATION: dict[tuple[int, int], int] = {
@@ -960,6 +802,8 @@ NYC_INITIAL_POPULATION: dict[tuple[int, int], int] = {
     (26, 19): 49,
     (26, 20): 16,
     (26, 21): 16,
+    (26, 25): 465,
+    (26, 26): 262,
     (26, 29): 50,
     (27, 13): 88,
     (27, 14): 71,
@@ -972,6 +816,7 @@ NYC_INITIAL_POPULATION: dict[tuple[int, int], int] = {
     (27, 23): 66,
     (27, 24): 125,
     (27, 25): 255,
+    (27, 26): 302,
     (27, 27): 1327,
     (27, 28): 1200,
     (27, 29): 1119,
@@ -1531,145 +1376,6 @@ NYC_INITIAL_POPULATION: dict[tuple[int, int], int] = {
     (48, 32): 29,
     (49, 31): 108,
     (49, 32): 106
-}
-
-
-
-
-NYC_HISTORICAL_ROADS = {
-    # Major NYC streets and their construction/removal years
-    # Format: road_name: {'year': construction_year, 'removed_year': removal_year (optional), 'bounds': {...}}
-    # If 'removed_year' is specified, the road is not available after that year
-    # Broadway (Manhattan) - one of the oldest streets, existed before 1830, never removed
-    'Broadway_Manhattan': {
-        'year': 1600,  # Pre-colonial, existed before game start
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.70,
-            'max_lat': 40.78,
-            'min_lon': -74.02,
-            'max_lon': -73.98
-        }
-    },
-    # Wall Street - existed before 1830, never removed
-    'Wall_Street': {
-        'year': 1650,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.70,
-            'max_lat': 40.71,
-            'min_lon': -74.02,
-            'max_lon': -74.00
-        }
-    },
-    # Fifth Avenue - constructed 1824, never removed
-    'Fifth_Avenue': {
-        'year': 1824,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.70,
-            'max_lat': 40.78,
-            'min_lon': -74.00,
-            'max_lon': -73.97
-        }
-    },
-    # Lexington Avenue - constructed 1832, never removed
-    'Lexington_Avenue': {
-        'year': 1832,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.72,
-            'max_lat': 40.78,
-            'min_lon': -73.98,
-            'max_lon': -73.96
-        }
-    },
-    # Park Avenue - constructed 1850s, never removed
-    'Park_Avenue': {
-        'year': 1850,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.72,
-            'max_lat': 40.78,
-            'min_lon': -73.99,
-            'max_lon': -73.97
-        }
-    },
-    # Madison Avenue - constructed 1840s, never removed
-    'Madison_Avenue': {
-        'year': 1840,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.72,
-            'max_lat': 40.78,
-            'min_lon': -73.99,
-            'max_lon': -73.97
-        }
-    },
-    # Brooklyn Bridge approach roads - 1883, never removed
-    'Brooklyn_Bridge_Approach': {
-        'year': 1883,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.70,
-            'max_lat': 40.72,
-            'min_lon': -74.00,
-            'max_lon': -73.98
-        }
-    },
-    # Queens Boulevard - constructed 1900s, never removed
-    'Queens_Boulevard': {
-        'year': 1900,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.72,
-            'max_lat': 40.75,
-            'min_lon': -73.90,
-            'max_lon': -73.85
-        }
-    },
-    # Grand Concourse (Bronx) - constructed 1909, never removed
-    'Grand_Concourse': {
-        'year': 1909,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.82,
-            'max_lat': 40.88,
-            'min_lon': -73.92,
-            'max_lon': -73.88
-        }
-    },
-    # FDR Drive - constructed 1930s, never removed
-    'FDR_Drive': {
-        'year': 1934,
-        'removed_year': None,  # Never removed
-        'bounds': {
-            'min_lat': 40.70,
-            'max_lat': 40.78,
-            'min_lon': -73.98,
-            'max_lon': -73.95
-        }
-    },
-    # West Side Highway - constructed 1930, removed 1973 (replaced by West Side Highway replacement)
-    'West_Side_Highway': {
-        'year': 1930,
-        'removed_year': 1973,  # Removed in 1973 (collapsed, replaced)
-        'bounds': {
-            'min_lat': 40.70,
-            'max_lat': 40.78,
-            'min_lon': -74.02,
-            'max_lon': -74.00
-        }
-    }
-}
-
-NYC_HISTORICAL_BRIDGES = {
-    # Major NYC bridges and their construction years
-    # Brooklyn Bridge: 1883
-    # Manhattan Bridge: 1909
-    # Williamsburg Bridge: 1903
-    # Queensboro Bridge: 1909
-    # etc.
 }
 
 

@@ -31,6 +31,9 @@ def _configure_logging() -> None:
 
 _configure_logging()
 
+import crash_log
+crash_log.install()  # unexpected errors are logged and shown instead of closing the game
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QDialog
 QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)

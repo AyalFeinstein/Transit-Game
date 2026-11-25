@@ -6,6 +6,10 @@ Follows standardized preset format for easy customization."""
 # Map identification
 MAP_NAME = "New York Metropolitan Zone"
 MAP_ID = "ny_metro"
+# Preselected in the new-game dialog
+NEW_GAME_DEFAULT = True
+# The map view opens (and re-centers on refresh) over Midtown Manhattan
+MAP_VIEW_CENTER = (40.758, -73.9855)
 
 # OSM multipolygon for Long Island land cells added beyond the NYC map
 LONG_ISLAND_OSM_RELATION_ID = 3955977
@@ -37,7 +41,7 @@ METRO_NORTH_LAT = 41.80
 
 def get_nyc_matched_cell_degrees() -> tuple[float, float]:
     """Degrees per grid cell — identical to the OSM NYC map (50×50 over active NYC bounds)."""
-    from map_presets_nyc import get_nyc_bounds
+    from nyc_city_data import get_nyc_bounds
     b = get_nyc_bounds()
     cell_lat = (b['max_lat'] - b['min_lat']) / b['height']
     cell_lon = (b['max_lon'] - b['min_lon']) / b['width']
@@ -46,7 +50,7 @@ def get_nyc_matched_cell_degrees() -> tuple[float, float]:
 
 def get_ny_metro_grid_origin() -> tuple[float, float]:
     """Southwest grid origin aligned with the NYC map for 1:1 cell spacing."""
-    from map_presets_nyc import get_nyc_bounds
+    from nyc_city_data import get_nyc_bounds
     nyc = get_nyc_bounds()
     return nyc['min_lat'], MORRISTOWN_LON
 
@@ -80,7 +84,7 @@ COUNTY_OPEN_WATER_AREAS = [
     {'min_lat': 40.40, 'max_lat': 40.48, 'min_lon': -74.20, 'max_lon': -73.92},
 ]
 
-# Open water excluded from suburb/Long Island buildable cells (NYC uses map_presets_nyc rules).
+# Open water excluded from suburb/Long Island buildable cells (NYC uses nyc_city_data rules).
 METRO_WATER_AREAS = [
     # Hudson River channel (lower)
     {'min_lat': 40.68, 'max_lat': 40.88, 'min_lon': -74.10, 'max_lon': -74.02},
@@ -251,6 +255,22 @@ NY_METRO_POPULATION = {
     },
 }
 
+from nyc_city_data import TRANSIT_COMPANY_NAMES as _CITY_TRANSIT_COMPANY_NAMES
+# Line types AI companies may specialize in here (see ai_specialties.SPECIALTIES): all of them.
+AI_LINE_SPECIALTIES = (
+    'commuter_rail', 'city_rail', 'light_rail', 'local_bus', 'express_bus', 'all_bus', 'ferry',
+)
+from nyc_city_data import WORKPLACE_DENSITY_ZONES  # Manhattan jobs count toward density here too
+
+# AI company names for this map: the city's plus regional railroads
+TRANSIT_COMPANY_NAMES = [
+    *_CITY_TRANSIT_COMPANY_NAMES,
+    "Lehigh Valley Railroad",
+    "Baltimore & Ohio",
+    "Philadelphia Rapid Transit",
+]
+
+
 def get_ny_metro_bounds() -> dict:
     """Get NY Metropolitan Zone bounds dictionary."""
     return NY_METRO_BOUNDS.copy()
@@ -377,6 +397,15 @@ def get_station_name_for_point(x: float, y: float, game_map, current_year: int =
         year = 1830
     existing_names = existing_names or set()
 
+    # Cross-streets ("Canal St & Broadway") or the neighbourhood; older logic below is the fallback.
+    try:
+        from geo_naming import station_name_for_point
+        geo = station_name_for_point(game_map, x, y, year, existing_names)
+        if geo:
+            return geo
+    except Exception:
+        pass
+
     road_name = ""
     try:
         from map_presets_nyc_road_utils import get_nearest_road_name_for_point, format_osm_road_name_for_display
@@ -454,7 +483,7 @@ def is_ny_metro_map(map_center_lat: float = None, map_center_lon: float = None, 
 
 def get_nyc_to_metro_grid_offset() -> tuple[int, int]:
     """Integer offset so NYC grid (nx, ny) maps to metro (offset_x + nx, offset_y + ny) without rounding loss."""
-    from map_presets_nyc import get_nyc_bounds
+    from nyc_city_data import get_nyc_bounds
     nyc_bounds = get_nyc_bounds()
     cell_lat, cell_lon = get_nyc_matched_cell_degrees()
     origin_lat, origin_lon = get_ny_metro_grid_origin()
@@ -470,11 +499,19 @@ def nyc_grid_to_metro_grid(nx: int, ny: int) -> tuple[int, int]:
 
 
 def get_nyc_derived_metro_cells(width: int = None, height: int = None) -> set[tuple[int, int]]:
-    """Metro grid cells for every NYC_INITIAL_POPULATION cell (same layout as the NYC OSM map)."""
-    from map_presets_nyc import NYC_INITIAL_POPULATION
+    """Metro grid cells for every NYC_INITIAL_POPULATION cell (same layout as the NYC OSM map).
 
+    Used by tests and the population generator only; reads the NYC map's population table from
+    its file (without importing it) and returns nothing when that map is absent.
+    """
+    import os
+    from map_preset_utils import read_initial_population_from_file
+
+    nyc_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'map_presets_nyc.py')
+    nyc_population = (read_initial_population_from_file(nyc_file, 'NYC_INITIAL_POPULATION')
+                      if os.path.exists(nyc_file) else {})
     cells: set[tuple[int, int]] = set()
-    for x, y in NYC_INITIAL_POPULATION:
+    for x, y in nyc_population:
         cells.add(nyc_grid_to_metro_grid(x, y))
     return cells
 
@@ -496,7 +533,7 @@ def _latlon_to_grid(lat: float, lon: float, bounds: dict, width: int, height: in
 
 
 def _is_in_nyc_bounds(lat: float, lon: float) -> bool:
-    from map_presets_nyc import get_nyc_bounds
+    from nyc_city_data import get_nyc_bounds
     b = get_nyc_bounds()
     return b['min_lat'] <= lat <= b['max_lat'] and b['min_lon'] <= lon <= b['max_lon']
 
@@ -529,19 +566,260 @@ def is_metro_water_location(lat: float, lon: float) -> bool:
     return False
 
 
+def get_ferry_segment_points_for_ai(game_map, current_year: int, max_points: int = 12, existing_line_routes=None, rng=None) -> list:
+    """Ferry route candidates over this map's harbours, rivers and sounds (for AI ferry companies)."""
+    from map_preset_utils import ai_ferry_segment_candidates
+    return ai_ferry_segment_candidates('ny_metro', get_ny_metro_bounds(), game_map, max_points=max_points, rng=rng)
+
+
 def is_water_location(lat: float, lon: float, osm_integration=None) -> bool:
-    """Water detection for NY Metro preset (used by map_preset_loader and point builders)."""
-    if _is_in_nyc_bounds(lat, lon):
-        from map_presets_nyc import is_water_location as nyc_is_water
-        try:
-            if nyc_is_water(lat, lon, osm_integration):
-                return True
-        except TypeError:
-            if nyc_is_water(lat, lon):
-                return True
-        # Open water inside NYC bbox (e.g. Long Island Sound east of Bronx)
-        return is_metro_water_location(lat, lon)
+    """Water detection for NY Metro (used by map_preset_loader and point builders).
+
+    Uses the OSM coastline / lake data (get_water_mask). The NYC map's own test must not be
+    used here: it reports New Jersey and other non-NYC land as excluded, which on this map
+    made every station site around Newark and Jersey City look like water. The rough
+    METRO_WATER_AREAS rectangles are only a fallback when the data file is missing.
+    """
+    try:
+        mask = get_water_mask()
+        if mask.has_data():
+            return mask.is_water_latlon(lat, lon)
+    except Exception:
+        pass
     return is_metro_water_location(lat, lon)
+
+
+from nyc_city_data import PLACE_NAMES as _CITY_PLACE_NAMES, AREA_BOXES as _CITY_AREA_BOXES
+
+# Towns and cities outside New York City: (name, lat, lon, max_km).  Suburban towns are
+# farther apart than city neighbourhoods, so they claim a wider radius.
+_REGION_PLACE_NAMES = tuple((name, lat, lon, 5.0) for name, lat, lon in (
+    # New Jersey: Hudson County
+    ("Jersey City", 40.7178, -74.0431), ("Hoboken", 40.7440, -74.0324),
+    ("Weehawken", 40.7690, -74.0200), ("Union City", 40.7795, -74.0238),
+    ("West New York", 40.7879, -74.0143), ("North Bergen", 40.8043, -74.0121),
+    ("Bayonne", 40.6687, -74.1143), ("Secaucus", 40.7895, -74.0565),
+    ("Kearny", 40.7684, -74.1454), ("Harrison", 40.7465, -74.1563),
+    ("Journal Square", 40.7326, -74.0627), ("Greenville", 40.6990, -74.0850),
+    # New Jersey: Essex County
+    ("Newark", 40.7357, -74.1724), ("Ironbound", 40.7250, -74.1500),
+    ("North Newark", 40.7750, -74.1650), ("Weequahic", 40.7080, -74.2000),
+    ("Vailsburg", 40.7450, -74.2250), ("East Orange", 40.7673, -74.2049),
+    ("Orange", 40.7707, -74.2326), ("West Orange", 40.7987, -74.2390),
+    ("South Orange", 40.7490, -74.2613), ("Maplewood", 40.7312, -74.2735),
+    ("Irvington", 40.7323, -74.2349), ("Bloomfield", 40.8068, -74.1854),
+    ("Montclair", 40.8259, -74.2090), ("Belleville", 40.7937, -74.1643),
+    ("Nutley", 40.8223, -74.1599), ("Livingston", 40.7959, -74.3149),
+    ("Millburn", 40.7248, -74.3040), ("Verona", 40.8298, -74.2401),
+    ("Caldwell", 40.8398, -74.2765), ("Cedar Grove", 40.8518, -74.2290),
+    # New Jersey: Union County
+    ("Elizabeth", 40.6640, -74.2107), ("Linden", 40.6220, -74.2446),
+    ("Rahway", 40.6082, -74.2776), ("Union", 40.6976, -74.2632),
+    ("Hillside", 40.7012, -74.2301), ("Roselle", 40.6523, -74.2590),
+    ("Cranford", 40.6584, -74.2996), ("Westfield", 40.6590, -74.3474),
+    ("Summit", 40.7157, -74.3649), ("Plainfield", 40.6337, -74.4074),
+    ("Scotch Plains", 40.6551, -74.3899), ("Springfield", 40.7049, -74.3171),
+    ("Clark", 40.6209, -74.3110), ("New Providence", 40.6984, -74.4015),
+    # New Jersey: Middlesex and Monmouth
+    ("Perth Amboy", 40.5068, -74.2654), ("Woodbridge", 40.5576, -74.2846),
+    ("Carteret", 40.5773, -74.2282), ("Metuchen", 40.5432, -74.3632),
+    ("Edison", 40.5187, -74.4121), ("New Brunswick", 40.4862, -74.4518),
+    ("Highland Park", 40.4959, -74.4243), ("Piscataway", 40.5549, -74.4643),
+    ("South Plainfield", 40.5793, -74.4115), ("South Amboy", 40.4779, -74.2907),
+    ("Sayreville", 40.4594, -74.3610), ("Keyport", 40.4332, -74.1996),
+    ("Keansburg", 40.4418, -74.1299), ("Atlantic Highlands", 40.4079, -74.0343),
+    ("Middletown", 40.4107, -74.0810), ("Old Bridge", 40.4148, -74.3654),
+    # New Jersey: Bergen County
+    ("Fort Lee", 40.8509, -73.9701), ("Edgewater", 40.8270, -73.9757),
+    ("Cliffside Park", 40.8215, -73.9876), ("Englewood", 40.8929, -73.9726),
+    ("Teaneck", 40.8976, -74.0160), ("Hackensack", 40.8859, -74.0435),
+    ("Ridgefield", 40.8343, -74.0085), ("Leonia", 40.8615, -73.9882),
+    ("Bergenfield", 40.9276, -73.9974), ("Tenafly", 40.9254, -73.9629),
+    ("Paramus", 40.9445, -74.0754), ("Ridgewood", 40.9793, -74.1165),
+    ("Fair Lawn", 40.9404, -74.1318), ("Garfield", 40.8815, -74.1132),
+    ("Lodi", 40.8823, -74.0832), ("Rutherford", 40.8265, -74.1068),
+    ("Lyndhurst", 40.8120, -74.1243), ("Hasbrouck Heights", 40.8582, -74.0807),
+    ("Westwood", 40.9912, -74.0326), ("Closter", 40.9732, -73.9615),
+    ("Mahwah", 41.0887, -74.1438), ("Ramsey", 41.0573, -74.1410),
+    ("Oradell", 40.9587, -74.0368), ("Dumont", 40.9406, -73.9968),
+    # New Jersey: Passaic and Morris
+    ("Paterson", 40.9168, -74.1718), ("Passaic", 40.8568, -74.1285),
+    ("Clifton", 40.8584, -74.1638), ("Wayne", 40.9254, -74.2765),
+    ("Totowa", 40.9051, -74.2099), ("Hawthorne", 40.9493, -74.1538),
+    ("Little Falls", 40.8690, -74.2082), ("Pompton Lakes", 41.0054, -74.2907),
+    ("Morristown", 40.7968, -74.4815), ("Madison", 40.7598, -74.4171),
+    ("Chatham", 40.7409, -74.3838), ("Florham Park", 40.7879, -74.3882),
+    ("Parsippany", 40.8579, -74.4260), ("Boonton", 40.9026, -74.4071),
+    ("Lincoln Park", 40.9243, -74.3021), ("East Hanover", 40.8201, -74.3649),
+    # Westchester County
+    ("Yonkers", 40.9312, -73.8988), ("Mount Vernon", 40.9126, -73.8371),
+    ("New Rochelle", 40.9115, -73.7824), ("Pelham", 40.9098, -73.8079),
+    ("Bronxville", 40.9382, -73.8321), ("Eastchester", 40.9584, -73.8085),
+    ("Scarsdale", 40.9887, -73.7979), ("Larchmont", 40.9279, -73.7518),
+    ("Mamaroneck", 40.9487, -73.7326), ("Rye", 40.9807, -73.6837),
+    ("Port Chester", 41.0018, -73.6657), ("Harrison NY", 40.9690, -73.7126),
+    ("White Plains", 41.0340, -73.7629), ("Hastings-on-Hudson", 40.9945, -73.8787),
+    ("Dobbs Ferry", 41.0145, -73.8726), ("Irvington NY", 41.0393, -73.8682),
+    ("Tarrytown", 41.0762, -73.8587), ("Sleepy Hollow", 41.0857, -73.8585),
+    ("Elmsford", 41.0551, -73.8201), ("Valhalla", 41.0748, -73.7751),
+    ("Pleasantville", 41.1329, -73.7926), ("Ossining", 41.1626, -73.8615),
+    ("Chappaqua", 41.1595, -73.7648), ("Mount Kisco", 41.2043, -73.7271),
+    ("Croton-on-Hudson", 41.2084, -73.8912), ("Peekskill", 41.2901, -73.9204),
+    ("Yorktown Heights", 41.2709, -73.7776), ("Bedford", 41.2043, -73.6437),
+    ("Katonah", 41.2587, -73.6854), ("Armonk", 41.1265, -73.7140),
+    # Rockland, Orange, Putnam and Dutchess counties
+    ("Nyack", 41.0907, -73.9179), ("Piermont", 41.0420, -73.9182),
+    ("Tappan", 41.0220, -73.9474), ("Pearl River", 41.0590, -74.0218),
+    ("Nanuet", 41.0887, -74.0135), ("Spring Valley", 41.1132, -74.0438),
+    ("New City", 41.1476, -73.9893), ("Suffern", 41.1148, -74.1496),
+    ("Haverstraw", 41.1976, -73.9646), ("Stony Point", 41.2295, -73.9871),
+    ("Monroe", 41.3304, -74.1868), ("Harriman", 41.3084, -74.1446),
+    ("Highland Falls", 41.3693, -73.9662), ("Cornwall", 41.4448, -74.0160),
+    ("Newburgh", 41.5034, -74.0104), ("Beacon", 41.5048, -73.9696),
+    ("Middletown NY", 41.4459, -74.4229), ("Goshen", 41.4021, -74.3243),
+    ("Warwick", 41.2565, -74.3599), ("Walden", 41.5612, -74.1885),
+    ("Cold Spring", 41.4201, -73.9546), ("Carmel", 41.4301, -73.6801),
+    ("Brewster", 41.3973, -73.6171), ("Mahopac", 41.3723, -73.7335),
+    ("Fishkill", 41.5357, -73.8990), ("Wappingers Falls", 41.5965, -73.9110),
+    ("Poughkeepsie", 41.7004, -73.9210), ("Hopewell Junction", 41.5843, -73.8087),
+    ("Pawling", 41.5620, -73.6026), ("New Paltz", 41.7476, -74.0868),
+    # Nassau County
+    ("Great Neck", 40.8007, -73.7285), ("Port Washington", 40.8257, -73.6982),
+    ("Manhasset", 40.7979, -73.6996), ("Roslyn", 40.7998, -73.6510),
+    ("Glen Cove", 40.8623, -73.6337), ("Oyster Bay", 40.8715, -73.5321),
+    ("Mineola", 40.7490, -73.6410), ("Garden City", 40.7268, -73.6343),
+    ("Hempstead", 40.7062, -73.6187), ("Floral Park", 40.7237, -73.7049),
+    ("New Hyde Park", 40.7351, -73.6879), ("Elmont", 40.7009, -73.7129),
+    ("Valley Stream", 40.6643, -73.7085), ("Lynbrook", 40.6548, -73.6718),
+    ("Rockville Centre", 40.6587, -73.6412), ("Oceanside", 40.6387, -73.6401),
+    ("Long Beach", 40.5884, -73.6579), ("Freeport", 40.6576, -73.5832),
+    ("Baldwin", 40.6565, -73.6093), ("Merrick", 40.6629, -73.5515),
+    ("Bellmore", 40.6687, -73.5271), ("Wantagh", 40.6837, -73.5101),
+    ("Massapequa", 40.6807, -73.4743), ("Levittown", 40.7259, -73.5143),
+    ("East Meadow", 40.7140, -73.5590), ("Uniondale", 40.7004, -73.5932),
+    ("Westbury", 40.7557, -73.5876), ("Hicksville", 40.7684, -73.5251),
+    ("Plainview", 40.7765, -73.4673), ("Syosset", 40.8262, -73.5021),
+    ("Bethpage", 40.7443, -73.4821), ("Farmingdale", 40.7326, -73.4454),
+    ("Cedarhurst", 40.6229, -73.7243), ("Jericho", 40.7920, -73.5399),
+    # Suffolk County
+    ("Huntington", 40.8682, -73.4257), ("Huntington Station", 40.8534, -73.4115),
+    ("Northport", 40.9009, -73.3432), ("Commack", 40.8429, -73.2929),
+    ("Smithtown", 40.8559, -73.2007), ("Kings Park", 40.8862, -73.2573),
+    ("Amityville", 40.6790, -73.4171), ("Lindenhurst", 40.6868, -73.3735),
+    ("Babylon", 40.6957, -73.3257), ("Deer Park", 40.7618, -73.3293),
+    ("Bay Shore", 40.7251, -73.2454), ("Brentwood", 40.7812, -73.2462),
+    ("Islip", 40.7298, -73.2104), ("Central Islip", 40.7907, -73.2018),
+    ("Sayville", 40.7359, -73.0821), ("Ronkonkoma", 40.8154, -73.1123),
+    ("Hauppauge", 40.8257, -73.2026), ("Patchogue", 40.7657, -73.0151),
+    ("Medford", 40.8176, -73.0001), ("Stony Brook", 40.9257, -73.1409),
+    ("Port Jefferson", 40.9465, -73.0693), ("Centereach", 40.8584, -73.0996),
+    ("Selden", 40.8665, -73.0357), ("Coram", 40.8687, -73.0015),
+    ("Shirley", 40.8015, -72.8676), ("Mastic", 40.8020, -72.8409),
+    ("Rocky Point", 40.9526, -72.9254), ("Wading River", 40.9504, -72.8426),
+    ("Riverhead", 40.9170, -72.6620), ("Westhampton", 40.8243, -72.6662),
+    ("Hampton Bays", 40.8690, -72.5176), ("Southampton", 40.8843, -72.3895),
+    ("Bridgehampton", 40.9379, -72.3009), ("Sag Harbor", 40.9979, -72.2926),
+    ("East Hampton", 40.9634, -72.1848), ("Amagansett", 40.9737, -72.1437),
+    ("Montauk", 41.0359, -71.9545), ("Mattituck", 40.9912, -72.5343),
+    ("Southold", 41.0648, -72.4262), ("Greenport", 41.1034, -72.3593),
+    ("Shelter Island", 41.0682, -72.3387), ("Brookhaven", 40.7793, -72.9154),
+    # Connecticut: Fairfield County
+    ("Greenwich", 41.0262, -73.6282), ("Stamford", 41.0534, -73.5387),
+    ("Darien", 41.0787, -73.4693), ("New Canaan", 41.1468, -73.4948),
+    ("Norwalk", 41.1177, -73.4082), ("Westport", 41.1415, -73.3579),
+    ("Wilton", 41.1954, -73.4379), ("Ridgefield CT", 41.2815, -73.4982),
+    ("Fairfield", 41.1408, -73.2613), ("Bridgeport", 41.1792, -73.1894),
+    ("Trumbull", 41.2429, -73.2007), ("Stratford", 41.1845, -73.1332),
+    ("Shelton", 41.3165, -73.0932), ("Danbury", 41.3948, -73.4540),
+    ("Bethel", 41.3712, -73.4140), ("Newtown", 41.4140, -73.3035),
+    ("Brookfield", 41.4826, -73.4096), ("New Milford", 41.5770, -73.4085),
+    # Connecticut: New Haven County and the Naugatuck valley
+    ("Milford", 41.2223, -73.0565), ("Orange CT", 41.2784, -73.0257),
+    ("West Haven", 41.2707, -72.9470), ("New Haven", 41.3083, -72.9279),
+    ("East Haven", 41.2762, -72.8684), ("Hamden", 41.3959, -72.8968),
+    ("North Haven", 41.3909, -72.8595), ("Branford", 41.2795, -72.8151),
+    ("Guilford", 41.2890, -72.6818), ("Madison CT", 41.2795, -72.5984),
+    ("Wallingford", 41.4570, -72.8231), ("Cheshire", 41.4990, -72.9007),
+    ("Meriden", 41.5382, -72.8070), ("Derby", 41.3207, -73.0890),
+    ("Ansonia", 41.3462, -73.0790), ("Seymour", 41.3968, -73.0759),
+    ("Naugatuck", 41.4859, -73.0507), ("Waterbury", 41.5582, -73.0515),
+    ("Southbury", 41.4815, -73.2132), ("Woodbury", 41.5445, -73.2090),
+    # Connecticut: central and the lower Connecticut River
+    ("Southington", 41.5965, -72.8776), ("Bristol", 41.6718, -72.9493),
+    ("New Britain", 41.6612, -72.7795), ("Berlin", 41.6215, -72.7457),
+    ("Middletown CT", 41.5623, -72.6506), ("Cromwell", 41.5951, -72.6454),
+    ("Newington", 41.6979, -72.7237), ("Wethersfield", 41.7143, -72.6526),
+    ("Rocky Hill", 41.6648, -72.6393), ("West Hartford", 41.7620, -72.7420),
+    ("Hartford", 41.7658, -72.6734), ("East Hartford", 41.7823, -72.6120),
+    ("Glastonbury", 41.7123, -72.6082), ("Manchester", 41.7759, -72.5215),
+    ("Farmington", 41.7198, -72.8320), ("Portland", 41.5729, -72.6407),
+    ("East Hampton CT", 41.5759, -72.5026), ("Colchester", 41.5757, -72.3320),
+    ("Haddam", 41.4773, -72.5120), ("Chester", 41.4032, -72.4509),
+    ("Essex", 41.3534, -72.3912), ("Old Saybrook", 41.2918, -72.3762),
+    ("Clinton", 41.2787, -72.5276), ("Westbrook", 41.2854, -72.4476),
+    ("Old Lyme", 41.3159, -72.3290), ("East Lyme", 41.3565, -72.2298),
+    ("Waterford", 41.3418, -72.1362), ("New London", 41.3557, -72.0995),
+    ("Groton", 41.3501, -72.0787), ("Norwich", 41.5243, -72.0759),
+    ("Montville", 41.4598, -72.1509), ("Hebron", 41.6579, -72.3659),
+))
+
+# The city's neighbourhoods plus the surrounding towns.
+PLACE_NAMES = _CITY_PLACE_NAMES + _REGION_PLACE_NAMES
+
+# Counties and regions, used when no named place is near.
+AREA_BOXES = _CITY_AREA_BOXES + (
+    ("Hudson County", 40.64, 40.83, -74.17, -74.00),
+    ("Essex County", 40.67, 40.90, -74.38, -74.11),
+    ("Union County", 40.57, 40.73, -74.47, -74.16),
+    ("Bergen County", 40.76, 41.14, -74.28, -73.89),
+    ("Passaic County", 40.83, 41.21, -74.51, -74.10),
+    ("Morris County", 40.66, 41.09, -74.90, -74.26),
+    ("Middlesex County", 40.25, 40.61, -74.63, -74.20),
+    ("Monmouth County", 40.08, 40.49, -74.62, -73.97),
+    ("Nassau County", 40.52, 40.99, -73.78, -73.42),
+    ("Suffolk County", 40.59, 41.31, -73.50, -71.85),
+    ("Westchester", 40.87, 41.37, -73.99, -73.48),
+    ("Rockland County", 41.00, 41.33, -74.24, -73.89),
+    ("Orange County", 41.14, 41.64, -74.77, -73.95),
+    ("Putnam County", 41.32, 41.53, -73.99, -73.52),
+    ("Dutchess County", 41.44, 42.08, -74.00, -73.48),
+    ("Fairfield County", 40.98, 41.55, -73.73, -73.08),
+    ("New Haven County", 41.19, 41.65, -73.33, -72.53),
+    ("Hartford County", 41.54, 42.04, -73.03, -72.41),
+    ("Middlesex County CT", 41.25, 41.65, -72.75, -72.30),
+    ("New London County", 41.26, 41.71, -72.47, -71.79),
+    ("Connecticut", 40.98, 42.05, -73.73, -71.79),
+    ("New Jersey", 38.90, 41.36, -75.57, -74.02),
+    ("Long Island", 40.54, 41.20, -73.78, -71.85),
+)
+
+
+def get_place_names() -> tuple:
+    """Neighbourhood / town centres used to name stations and lines on this map."""
+    return PLACE_NAMES
+
+
+def get_area_boxes() -> tuple:
+    """Broad areas used for names when no place is near."""
+    return AREA_BOXES
+
+
+def get_water_mask():
+    """Offline coastline / lake / boundary data for this map."""
+    from map_presets_ny_water_utils import WATER_MASK
+    return WATER_MASK
+
+
+def get_events() -> list:
+    """Historical events for this map (the region shares New York City's)."""
+    from nyc_events import get_nyc_events
+    return get_nyc_events()
+
+
+def get_road_utils():
+    """Module holding this map's street network data and queries."""
+    import map_presets_nyc_road_utils
+    return map_presets_nyc_road_utils
 
 
 def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -568,7 +846,7 @@ def _metro_suburb_raw_population(lat: float, lon: float) -> int:
     return max(rural_floor, min(int(total), 1500))
 
 
-# 1830 villages and rural density on Long Island (Nassau/Suffolk; NYC boroughs use map_presets_nyc).
+# 1830 villages and rural density on Long Island (Nassau/Suffolk; NYC boroughs use nyc_city_data).
 LONG_ISLAND_POPULATION_CENTERS_1830 = [
     {"name": "Hempstead", "lat": 40.71, "lon": -73.62, "pop_1830": 1800, "spread_km": 6.0},
     {"name": "Huntington", "lat": 40.87, "lon": -73.43, "pop_1830": 1200, "spread_km": 7.0},
@@ -611,9 +889,22 @@ def get_ny_metro_population_at_location(lat: float, lon: float, is_water: bool) 
     if is_water:
         return 0
     if _is_in_nyc_bounds(lat, lon):
-        from map_presets_nyc import get_nyc_population_at_location
+        from nyc_city_data import get_nyc_population_at_location
         return get_nyc_population_at_location(lat, lon, False)
     return get_suburb_county_population_at_location(lat, lon, False)
+
+def population_fill_regions() -> dict:
+    """Boundaries whose land must all carry population, with the 1830 model for each.
+
+    The precomputed grid only covers selected counties; New Jersey, Long Island and
+    Connecticut are filled in at map load wherever it has gaps (water excluded).
+    """
+    return {
+        'long_island_rings': lambda lat, lon: get_long_island_population_at_location(lat, lon, False),
+        'nj_state': lambda lat, lon: get_suburb_county_population_at_location(lat, lon, False),
+        'ct_state_rings': lambda lat, lon: get_suburb_county_population_at_location(lat, lon, False),
+    }
+
 
 def initialize_ny_metro_population(width: int, height: int, map_center_lat: float = None, map_center_lon: float = None) -> dict:
     """Return precomputed 1830 population grid (from generate_ny_metro_population_points.py).
@@ -2054,6 +2345,7 @@ NY_METRO_INITIAL_POPULATION: dict[tuple[int, int], int] = {
     (34, 21): 16,
     (34, 24): 12,
     (34, 25): 12,
+    (34, 26): 262,
     (34, 27): 110,
     (34, 33): 265,
     (34, 34): 106,

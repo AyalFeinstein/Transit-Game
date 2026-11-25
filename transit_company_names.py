@@ -1,5 +1,6 @@
 """Realistic transit company names for AI players.
-Map-specific names: NYC/NY Metro use regional railroads; standard map uses generic names."""
+Maps may supply their own regional names (TRANSIT_COMPANY_NAMES in the map's preset file);
+maps that do not get the generic list."""
 
 import random
 
@@ -27,43 +28,6 @@ TRANSIT_NAMES_GENERIC = [
     "Lakeside Railway",
 ]
 
-# NYC-area specific (historical and plausible)
-TRANSIT_NAMES_NYC = [
-    "Hudson River Railroad",
-    "Brooklyn & Manhattan Transit",
-    "New York Central",
-    "Erie Railroad",
-    "Long Island Rail Road",
-    "Pennsylvania Railroad",
-    "Manhattan Railway Company",
-    "Brooklyn Rapid Transit",
-    "Interborough Rapid Transit",
-    "Hudson & Manhattan Railroad",
-    "New York & Harlem Railroad",
-    "New York & New Haven Railroad",
-    "Staten Island Railway",
-    "Queens County Railroad",
-    "Bronx & Westchester Railway",
-    "Jersey Central Railroad",
-    "Metropolitan Railway",
-    "Delaware & Hudson",
-    "Reading Railroad",
-]
-
-# NY Metro (includes NYC + regional)
-TRANSIT_NAMES_NY_METRO = [
-    *TRANSIT_NAMES_NYC,
-    "Lehigh Valley Railroad",
-    "Baltimore & Ohio",
-    "Philadelphia Rapid Transit",
-]
-
-# Map preset -> name list (presets without entry use generic)
-MAP_PRESET_NAMES = {
-    "nyc": TRANSIT_NAMES_NYC,
-    "ny_metro": TRANSIT_NAMES_NY_METRO,
-}
-
 
 def get_transit_company_name(existing_names: set = None, map_preset_name: str = None, rng: random.Random = None) -> str:
     """Return a unique transit company name. Map-specific when preset provided; generic for standard map."""
@@ -79,7 +43,10 @@ def get_transit_company_name(existing_names: set = None, map_preset_name: str = 
     except Exception:
         names = None
     if not names:
-        names = MAP_PRESET_NAMES.get(map_preset_name, TRANSIT_NAMES_GENERIC) if map_preset_name else TRANSIT_NAMES_GENERIC
+        names = TRANSIT_NAMES_GENERIC
+        if map_preset_name:
+            from map_preset_loader import get_preset_transit_company_names
+            names = get_preset_transit_company_names(map_preset_name) or TRANSIT_NAMES_GENERIC
     available = [n for n in names if n not in existing]
     if available:
         return rand.choice(available)
