@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "agencies": [
+    {
+      "name": "NIMBYs",
+      "activation_year": 1890,
+      "description": "Not In My Backyard activists — can sue over new construction.",
+      "excuse_causes": ["*"]
+    },
+    {
+      "name": "EPA",
+      "activation_year": 1970,
+      "description": "Environmental Protection Agency — environmental damage suits.",
+      "excuse_causes": ["Environmental Damage"]
+    }
+  ],
+  "transit_companies": [
+    "Central Transit Company",
+    "Metropolitan Railway",
+    "Union Street Railway",
+    "City Transit Lines",
+    "Regional Rail Company",
+    "Metro Express",
+    "Urban Transit Co",
+    "City Line Railway",
+    "Metropolitan Transit",
+    "Central Railway",
+    "Valley Transit",
+    "Pacific Railway",
+    "Northern Transit",
+    "Southern Railway Co",
+    "Eastern Transit",
+    "Western Railway",
+    "Midland Transit",
+    "Coastal Railway",
+    "River Transit Co",
+    "Lakeside Railway"
+  ],
+  "default_line_names": []
+}
