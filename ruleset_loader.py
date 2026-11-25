@@ -591,7 +591,11 @@ def apply_ruleset_events_to_game(game, ruleset_name: Optional[str] = None) -> No
     mode, events = load_ruleset_events(ruleset_name)
     name = ruleset_name or get_active_ruleset()
     if mode == "replace":
-        game.event_system.events = list(events)
+        # The ruleset's catalogue replaces the global events; the map's own events stay.
+        from map_preset_loader import get_preset_events
+        game_map = getattr(game, 'map', None)
+        map_events = get_preset_events(getattr(game_map, 'map_preset_name', None)) if game_map else []
+        game.event_system.events = list(events) + list(map_events)
     elif mode == "append":
         for event in events:
             game.event_system.add_event(event)

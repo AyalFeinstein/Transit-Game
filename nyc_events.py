@@ -338,10 +338,8 @@ def get_nyc_events():
         CholeraEpidemicEvent(1849),
         CholeraEpidemicEvent(1866),
         SpanishFluEpidemicEvent(),
-        # Area-specific events (hidden - affect where new people are added)
-        BrooklynGrowthEvent(),
-        QueensSuburbanizationEvent(),
-        BronxExpansionEvent(),
-        ManhattanLowerEastSideEvent(),
+        # The borough growth events above (Brooklyn, Queens, Bronx, Lower East Side) are not
+        # listed: their yearly boosts (25-150%) overwhelm the population targets. The maps add
+        # smaller Brooklyn and Queens boosts of their own (AREA_GROWTH_BONUSES in each map file).
     ]
 

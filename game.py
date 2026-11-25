@@ -196,7 +196,10 @@ class Game:
         
         if hasattr(self.map, 'update_population_over_time'):
             population_change = event_population_change - population_reduction
-            self.map.update_population_over_time(current_year, population_change)
+            self.map.update_population_over_time(
+                current_year, population_change,
+                area_population_changes=event_effects.get('area_population_changes') or {},
+            )
         
         pass
     
