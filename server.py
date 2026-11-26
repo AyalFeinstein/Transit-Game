@@ -30,9 +30,12 @@ game_settings = {
 }
 
 
-def serialize_game_state(game: Game) -> dict:
-    """Game state message: the pickled Game (base64) plus a few summary fields."""
-    game_data = pickle.dumps(game, protocol=4)
+def serialize_game_state(game: Game, ui: Operations = None, year_end_result: dict = None) -> dict:
+    """Game state message: the pickled Game (base64), with the server Operations' own state
+    (completed builds, news, AI money log, global settings...) when ``ui`` is given and the
+    year-end summary after End Year, plus a few summary fields."""
+    from network_rpc import pack_game_state
+    game_data = pack_game_state(game, ui, year_end_result)
     return {
         'game_data': base64.b64encode(game_data).decode('utf-8'),
         'year': game.get_year(),
@@ -83,7 +86,7 @@ async def start_session(creator_sid: str, player_names: list, operations_kwargs:
         'end_year_ready': set(),
         'creator_sid': creator_sid,
     }
-    state = serialize_game_state(game)
+    state = serialize_game_state(game, ui)
     names = game_sessions[session_id]['player_names']
     all_players = [{'player_id': pid, 'player_name': names[pid], 'connected': True} for pid in players.values()]
     for client_sid, player_id in players.items():
@@ -193,7 +196,7 @@ async def join_game(sid, data):
         # Send game state to new player (during a year end they get it with year_advanced)
         if not session.get('advancing_year'):
             await sio.emit('game_state', {
-                'game_state': serialize_game_state(game),
+                'game_state': serialize_game_state(game, session['ui']),
                 'player_id': player_id,
                 'player_name': player_names[player_id]
             }, room=sid)
@@ -221,7 +224,7 @@ async def get_game_state(sid, data):
             return  # everyone gets the new state (year_advanced) when the year end finishes
 
         await sio.emit('game_state', {
-            'game_state': serialize_game_state(game)
+            'game_state': serialize_game_state(game, session['ui'])
         }, room=sid)
         
     except Exception as e:
@@ -268,6 +271,8 @@ async def player_action(sid, data):
                 pid for pid in session['players'].values() if not players[pid].is_eliminated
             }
             session['end_year_ready'].add(player_id)
+            # Kept on the game too, so every client shows who is ready (and greys out End Year).
+            ui.mark_human_ready_for_year_end(player)
             
             # Check if all active players are ready
             if active_player_ids.issubset(session['end_year_ready']):
@@ -284,14 +289,15 @@ async def player_action(sid, data):
                     await sio.emit('year_advanced', {
                         'new_year': game.get_year(),
                         'message': result.get('message', 'Year advanced'),
-                        'game_state': serialize_game_state(game),  # Send full game state so clients can update year display
+                        # Full game state, with the year-end summary each client shows (finances, events...)
+                        'game_state': serialize_game_state(game, session['ui'], result.pop('year_end_result', None)),
                         'ai_actions': result.get('ai_actions', []),
                         'ai_failures': result.get('ai_failures', []),
-                        'ai_money_log': list(getattr(ui, '_ai_money_debug_log', None) or []),
                     }, room=session_id)
                 else:
                     # Year advance failed - remove this player from ready
                     session['end_year_ready'].discard(player_id)
+                    player._ready_for_end_year_year = None
                     result['message'] = 'Year advance failed: ' + result.get('message', 'Unknown error')
             else:
                 # Not all players ready yet
@@ -317,7 +323,7 @@ async def player_action(sid, data):
         # Everyone gets the new state after every action (even a failed one: the state is still
         # the latest); the acting client is also told about a failure.
         await sio.emit('game_state', {
-            'game_state': serialize_game_state(game),
+            'game_state': serialize_game_state(game, session['ui']),
             'action_result': result,
         }, room=session_id)
         if not result.get('success'):
@@ -355,8 +361,15 @@ def handle_operations_call(ui, player, action_data):
         index = args[0] if args else None
         if not isinstance(index, int) or not (0 <= index < len(queue)) or queue[index].get('player') is not player:
             return {'success': False, 'message': f'{method}: not one of your constructions'}
+        if method == 'reorder_build_queue':
+            target = args[1] if len(args) > 1 else kwargs.get('new_index')
+            if not isinstance(target, int) or not (0 <= target < len(queue)) or queue[target].get('player') is not player:
+                return {'success': False, 'message': f'{method}: you can only reorder your own constructions'}
+    from network_rpc import seeded_random
+    seed = action_data.get('seed')
     try:
-        outcome = getattr(ui, method)(*args, **kwargs)
+        with seeded_random(seed if isinstance(seed, int) else None):
+            outcome = getattr(ui, method)(*args, **kwargs)
     except (ValueError, KeyError, IndexError) as e:
         return {'success': False, 'message': str(e)}
     if isinstance(outcome, dict) and outcome.get('success') is False:
@@ -429,6 +442,7 @@ def advance_year_now(ui, game):
             'success': True,
             'message': f'Year advanced to {new_year}',
             'new_year': new_year,
+            'year_end_result': result,
             'ai_actions': ai_actions,
             'ai_failures': ai_failures,
         }
