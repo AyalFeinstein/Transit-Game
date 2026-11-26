@@ -718,7 +718,6 @@ class MainWindow(QMainWindow):
         self.marketplace_tab = None
         self.marketplace_layout = None
         self.current_player_index = 0
-        self.last_lawyer_replenishment_year = None
         self.layout = self.game_layout
         self.player_tabs_dict = {}
         self._player_tabs_keepalive = []
@@ -798,24 +797,30 @@ class MainWindow(QMainWindow):
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(0, self._clamp_window_to_screen)
 
+    STATUS_COLUMN_WIDTH = 240
+
     def _attach_game_status_bar(self, central_layout):
-        """Build bottom status bar once; player list is a compact vertical column."""
+        """Build the status column once (year, players' money, End Year and game buttons,
+        messages and chat). It sits on the left of the player's tab; see
+        _dock_status_bar_in_current_tab."""
         if self.status_bar is not None:
             return
         self.status_bar = QWidget()
-        self.status_bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.status_bar_layout = QHBoxLayout()
-        self.status_bar_layout.setContentsMargins(4, 2, 4, 2)
+        self.status_bar.setFixedWidth(self.STATUS_COLUMN_WIDTH)
+        self.status_bar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.status_bar_layout = QVBoxLayout()
+        self.status_bar_layout.setContentsMargins(4, 4, 4, 4)
         self.status_bar_layout.setSpacing(6)
         self.status_bar.setLayout(self.status_bar_layout)
         self.status_year_label = QLabel("Year: 1830")
-        self.status_year_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.status_year_label.setWordWrap(True)
+        self.status_year_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         self.status_end_year_btn = QPushButton("End Year")
         self.status_end_year_btn.clicked.connect(self.advance_year_button_clicked)
-        self.status_bar_layout.addWidget(self.status_year_label, 0, Qt.AlignmentFlag.AlignTop)
+        self.status_bar_layout.addWidget(self.status_year_label)
 
         players_widget = QWidget()
-        players_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
+        players_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         players_layout = QVBoxLayout(players_widget)
         players_layout.setContentsMargins(0, 0, 0, 0)
         players_layout.setSpacing(2)
@@ -825,40 +830,39 @@ class MainWindow(QMainWindow):
             self.status_money_labels[i] = {'widget': row, 'swatch': swatch, 'text': text}
             players_layout.addWidget(row)
         self.status_players_widget = players_widget
-        self.status_bar_layout.addWidget(players_widget, 0, Qt.AlignmentFlag.AlignTop)
+        self.status_bar_layout.addWidget(players_widget)
 
         self.status_end_year_timer_label = QLabel("")
+        self.status_end_year_timer_label.setWordWrap(True)
         self.status_end_year_timer_label.setVisible(False)
-        self.status_end_year_timer_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.status_bar_layout.addWidget(self.status_end_year_timer_label, 0, Qt.AlignmentFlag.AlignTop)
-        self.status_bar_layout.addWidget(self.status_end_year_btn, 0, Qt.AlignmentFlag.AlignTop)
+        self.status_bar_layout.addWidget(self.status_end_year_timer_label)
+        self.status_bar_layout.addWidget(self.status_end_year_btn)
+        game_buttons = QHBoxLayout()
+        game_buttons.setContentsMargins(0, 0, 0, 0)
+        game_buttons.setSpacing(4)
         self.status_save_game_btn = QPushButton("Save Game")
         self.status_save_game_btn.clicked.connect(self.on_save_game_clicked)
-        self.status_bar_layout.addWidget(self.status_save_game_btn, 0, Qt.AlignmentFlag.AlignTop)
+        game_buttons.addWidget(self.status_save_game_btn)
         self.status_end_game_btn = QPushButton("End Game")
         self.status_end_game_btn.clicked.connect(self.on_end_game_clicked)
-        self.status_bar_layout.addWidget(self.status_end_game_btn, 0, Qt.AlignmentFlag.AlignTop)
+        game_buttons.addWidget(self.status_end_game_btn)
+        self.status_bar_layout.addLayout(game_buttons)
 
-        messages_widget = QWidget()
-        messages_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
-        messages_layout = QVBoxLayout()
-        messages_layout.setContentsMargins(0, 0, 0, 0)
-        messages_layout.setSpacing(2)
-        messages_widget.setLayout(messages_layout)
+        messages_label = QLabel("Messages")
+        messages_label.setStyleSheet("font-weight: bold;")
+        self.status_bar_layout.addWidget(messages_label)
         self.status_messages_list = QListWidget()
-        self.status_messages_list.setMaximumHeight(40)
-        self.status_messages_list.setMaximumWidth(220)
-        self.status_messages_list.setMinimumWidth(120)
+        self.status_messages_list.setWordWrap(True)
+        self.status_messages_list.setMinimumHeight(80)
         for m in self._get_visible_messages():
             self.status_messages_list.insertItem(0, QListWidgetItem(str(m)))
         self._message_widgets.append(self.status_messages_list)
-        messages_layout.addWidget(self.status_messages_list)
+        self.status_bar_layout.addWidget(self.status_messages_list, 1)
         chat_row = QHBoxLayout()
         chat_row.setContentsMargins(0, 0, 0, 0)
         chat_row.setSpacing(4)
         self.status_chat_input = QLineEdit()
         self.status_chat_input.setPlaceholderText("Chat...")
-        self.status_chat_input.setMaximumWidth(150)
         self.status_chat_input.setFixedHeight(22)
         chat_send_btn = QPushButton("Send")
         chat_send_btn.setFixedHeight(22)
@@ -876,21 +880,84 @@ class MainWindow(QMainWindow):
                 self.status_chat_input.clear()
         chat_send_btn.clicked.connect(_on_chat_send)
         self.status_chat_input.returnPressed.connect(_on_chat_send)
-        chat_row.addWidget(self.status_chat_input)
+        chat_row.addWidget(self.status_chat_input, 1)
         chat_row.addWidget(chat_send_btn)
-        messages_layout.addLayout(chat_row)
-        self.status_bar_layout.addWidget(messages_widget, 0, Qt.AlignmentFlag.AlignTop)
-        self.status_bar_layout.addStretch(1)
+        self.status_bar_layout.addLayout(chat_row)
+        # Parked (hidden) in the window until a player's tab takes it.
+        self.status_bar.setVisible(False)
         central_layout.addWidget(self.status_bar)
-    
+
+    def _dock_status_bar_in_current_tab(self, *_args):
+        """Move the status column into the shown player tab's left side. On tabs without
+        one (Other Players, News Log, Rules…) it stays in the last player tab."""
+        status_bar = getattr(self, 'status_bar', None)
+        if status_bar is None or not getattr(self, 'tabs', None):
+            return
+        current = self.tabs.currentWidget()
+        for d in (getattr(self, 'player_tabs_dict', None) or {}).values():
+            if not isinstance(d, dict) or d.get('player_root') is not current:
+                continue
+            holder = d.get('status_holder_layout')
+            if holder is None:
+                return
+            if status_bar.parentWidget() is not d.get('status_holder'):
+                holder.addWidget(status_bar)
+            status_bar.setVisible(True)
+            return
+        if status_bar.parentWidget() is self.centralWidget():
+            status_bar.setVisible(False)
+
+    def _on_main_tab_shown_for_layout(self, _index=None):
+        """A player's own tab came to the front: give it the status column and get its
+        always-visible map ready."""
+        self._dock_status_bar_in_current_tab()
+        if not getattr(self, 'tabs', None):
+            return
+        current = self.tabs.currentWidget()
+        self._grow_window_for_game_layout()
+        for player_id, d in (getattr(self, 'player_tabs_dict', None) or {}).items():
+            if isinstance(d, dict) and current is not None and d.get('player_root') is current:
+                from PyQt6.QtCore import QTimer
+                QTimer.singleShot(50, lambda pid=player_id: self._ensure_map_web_view_ready(pid))
+                return
+
+    def _grow_window_for_game_layout(self):
+        """The status column, map and sub-tabs need more room than the setup screen: grow a
+        small window (within the screen) the first time a game is shown."""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        want_w, want_h = 1280, 820
+        geom = getattr(self, '_screen_geom', None)
+        if geom is not None:
+            want_w = min(want_w, geom.width())
+            want_h = min(want_h, geom.height())
+        if self.width() >= want_w and self.height() >= want_h:
+            return
+        self.resize(max(self.width(), want_w), max(self.height(), want_h))
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, self._clamp_window_to_screen)
+
+    def _park_status_bar(self):
+        """Take the status column back out of the player tabs before they are removed."""
+        status_bar = getattr(self, 'status_bar', None)
+        if status_bar is None:
+            return
+        try:
+            status_bar.setVisible(False)
+            self.centralWidget().layout().addWidget(status_bar)
+        except RuntimeError:
+            self.status_bar = None
+            self.status_bar_layout = None
+
     def _compact_status_bar_height(self):
-        """Shrink the status bar to fit visible player rows and controls."""
+        """Re-lay out the status column after player rows are shown or hidden. (It fills
+        the height of the player's tab, so it is not shrunk to its contents.)"""
         if not getattr(self, 'status_bar', None):
             return
         players_widget = getattr(self, 'status_players_widget', None)
         if players_widget is not None:
-            players_widget.adjustSize()
-        self.status_bar.adjustSize()
+            players_widget.updateGeometry()
+        self.status_bar.updateGeometry()
     
     def _setup_menu_bar(self):
         """Create the menu bar with File menu and New Game action"""
@@ -1011,7 +1078,6 @@ class MainWindow(QMainWindow):
         corporation_menu.addAction(self.view_show_law_tab_action)
         corporation_menu.addAction(self.view_show_finance_tab_action)
         corporation_menu.addAction(self.view_show_marketplace_tab_action)
-        corporation_menu.addAction(self.view_show_map_tab_action)
         corporation_menu.addAction(self.view_show_construction_tab_action)
         corporation_menu.addAction(self.view_show_government_tab_action)
         # Help menu: open Rules and Vehicles tabs
@@ -1110,7 +1176,15 @@ class MainWindow(QMainWindow):
         if player_id is None:
             return None
         d = getattr(self, 'player_tabs_dict', {}).get(player_id)
-        return d.get('player_tabs') if d else None
+        return self._player_main_tab_widget(d)
+
+    @staticmethod
+    def _player_main_tab_widget(d):
+        """The widget shown as a player's top-level tab: the wrapper holding the map and
+        sub-tabs for a player's own tab, the bare sub-tab widget for other players."""
+        if not isinstance(d, dict):
+            return None
+        return d.get('player_root') or d.get('player_tabs')
 
     def _is_assigned_player_main_tab(self, index: int) -> bool:
         widget = self._get_assigned_player_tab_widget()
@@ -1292,29 +1366,28 @@ class MainWindow(QMainWindow):
         self.operations = None
         from inflation_utils import clear_inflation_rate_multiplier
         clear_inflation_rate_multiplier()
+        self._park_status_bar()
         while self.tabs.count() > 1:
             self.tabs.removeTab(1)
         self.player_tabs_dict = {}
         self._player_tabs_keepalive = []
         self.current_player_index = 0
         if self.status_bar:
-            if hasattr(self.status_bar, 'clearMessage'):
-                self.status_bar.clearMessage()
-            if self.status_bar_layout:
-                status_messages = getattr(self, 'status_messages_list', None)
-                if status_messages and status_messages in self._message_widgets:
-                    self._message_widgets.remove(status_messages)
-                while self.status_bar_layout.count():
-                    item = self.status_bar_layout.takeAt(0)
-                    if item.widget():
-                        item.widget().deleteLater()
+            # Remove the whole status column; the next game builds a fresh one.
+            status_messages = getattr(self, 'status_messages_list', None)
+            if status_messages and status_messages in self._message_widgets:
+                self._message_widgets.remove(status_messages)
+            self.status_messages_list = None
+            self.status_bar.setParent(None)
+            self.status_bar.deleteLater()
+            self.status_bar = None
+            self.status_bar_layout = None
         
         self.status_year_label = None
         self.status_money_labels = {}
         self.status_end_year_btn = None
         self.status_end_year_timer_label = None
         self.tabs.setCurrentIndex(0)
-        self.last_lawyer_replenishment_year = None
         self._station_creation_state = {}
         self.advance_year_action.setEnabled(False)
         self.refresh_displays_action.setEnabled(False)
@@ -2234,16 +2307,20 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._try_complete_year_end)
 
     def _update_end_year_button_state(self):
-        if not self.status_end_year_btn:
-            return
-        if getattr(self, '_advance_year_in_progress', False):
-            self.status_end_year_btn.setEnabled(False)
-            return
-        for p in self._humans_to_mark_ready_on_end_year():
-            if self.operations and self.operations.human_ready_for_year_end(p):
-                self.status_end_year_btn.setEnabled(False)
-                return
-        self.status_end_year_btn.setEnabled(True)
+        enabled = not getattr(self, '_advance_year_in_progress', False) and not any(
+            self.operations and self.operations.human_ready_for_year_end(p)
+            for p in self._humans_to_mark_ready_on_end_year()
+        )
+        if getattr(self, 'advance_year_action', None) is not None and self.operations:
+            self.advance_year_action.setEnabled(enabled)
+        if self.status_end_year_btn:
+            self.status_end_year_btn.setEnabled(enabled)
+        if (
+            enabled and getattr(self, 'is_network_mode', False)
+            and self.status_end_year_timer_label and not getattr(self, '_advance_year_in_progress', False)
+        ):
+            self.status_end_year_timer_label.setVisible(False)
+            self.status_end_year_timer_label.setText("")
 
     def _request_year_end(self):
         """Register End Year for the active human and wait until every player has finished."""
@@ -2332,17 +2409,7 @@ class MainWindow(QMainWindow):
         action_result = data.get('action_result', {})
         game = self.network_client.deserialize_game_state(game_state)
         if game is not None and self.operations:
-            self.operations.game = game
-            # Sync session-deleted points to new map so removed points stay removed
-            game_map = game.get_map()
-            if game_map and hasattr(self.operations, '_session_deleted_population_points') and self.operations._session_deleted_population_points:
-                if not hasattr(game_map, '_deleted_population_points'):
-                    game_map._deleted_population_points = set()
-                game_map._deleted_population_points |= self.operations._session_deleted_population_points
-                # Also remove from population dict so they never reappear (belt-and-suspenders)
-                if hasattr(game_map, 'population') and game_map.population is not None:
-                    for pt in self.operations._session_deleted_population_points:
-                        game_map.population.pop(pt, None)
+            self._adopt_network_game(game)
             if self.status_year_label:
                 try:
                     self.status_year_label.setText(f"Year: {game.get_year()}")
@@ -2350,7 +2417,23 @@ class MainWindow(QMainWindow):
                     pass
             if action_result.get('success') and action_result.get('message'):
                 self.add_message(action_result['message'])
+            self._sync_missing_competitor_tabs_from_operations()
             self.refresh_all_displays()
+            self._update_end_year_button_state()
+
+    def _adopt_network_game(self, game):
+        """Make the server's latest game (and the Operations state sent with it) this client's game."""
+        self.operations.game = game
+        # Sync session-deleted points to new map so removed points stay removed
+        game_map = game.get_map()
+        deleted = getattr(self.operations, '_session_deleted_population_points', None)
+        if game_map and deleted:
+            if not hasattr(game_map, '_deleted_population_points'):
+                game_map._deleted_population_points = set()
+            game_map._deleted_population_points |= deleted
+            if getattr(game_map, 'population', None) is not None:
+                for pt in deleted:
+                    game_map.population.pop(pt, None)
 
     def _on_network_error(self, message):
         """Handle network error."""
@@ -2371,31 +2454,29 @@ class MainWindow(QMainWindow):
         new_year = data.get('new_year', 0)
         message = data.get('message', f'Year advanced to {new_year}')
         game_state_data = data.get('game_state')
+        year_end_result = None
         if game_state_data and self.network_client:
             game = self.network_client.deserialize_game_state(game_state_data)
             if game is not None and self.operations:
-                self.operations.game = game
-                game_map = game.get_map()
-                if game_map and hasattr(self.operations, '_session_deleted_population_points') and self.operations._session_deleted_population_points:
-                    if not hasattr(game_map, '_deleted_population_points'):
-                        game_map._deleted_population_points = set()
-                    game_map._deleted_population_points |= self.operations._session_deleted_population_points
-                    if hasattr(game_map, 'population') and game_map.population is not None:
-                        for pt in self.operations._session_deleted_population_points:
-                            game_map.population.pop(pt, None)
+                from network_rpc import year_end_result_of
+                year_end_result = year_end_result_of(game)
+                self._adopt_network_game(game)
         if self.operations:
             current_year = self.operations.get_year()
             if self.status_year_label:
                 self.status_year_label.setText(f"Year: {current_year}")
         self._show_network_ai_report(data, new_year)
-        self._sync_missing_competitor_tabs_from_operations()
-        self.refresh_all_displays()
-        QMessageBox.information(self, "Year Advanced", message)
+        self._update_end_year_button_state()
+        if year_end_result:
+            # The same year-end summary, events and messages as a local game.
+            self._apply_advance_year_result(year_end_result, [])
+        else:
+            self._sync_missing_competitor_tabs_from_operations()
+            self.refresh_all_displays()
+            QMessageBox.information(self, "Year Advanced", message)
 
     def _show_network_ai_report(self, data, year):
         """The server runs the AIs: put the AI actions and money log it sent into the AI Watch tab."""
-        if self.operations and isinstance(data.get('ai_money_log'), list):
-            self.operations._ai_money_debug_log = data['ai_money_log']
         if not (getattr(self, 'ai_watch_text', None) and self.ai_watch_text):
             return
         actions = data.get('ai_actions') or []
@@ -2521,6 +2602,8 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         self.tabs.currentChanged.connect(self._on_game_session_main_tab_changed)
+        self.tabs.currentChanged.connect(self._on_main_tab_shown_for_layout)
+        self._on_main_tab_shown_for_layout(self.tabs.currentIndex())
         if self._other_players_container is not None:
             try:
                 self._other_players_container.currentChanged.disconnect()
@@ -2725,13 +2808,16 @@ class MainWindow(QMainWindow):
                     matched = True
                 except Exception:
                     pass
+        if want == 'Map' and d.get('player_root') is not None:
+            matched = True  # the map is always shown in the player's own tab
         if matched and want == 'Map':
             from PyQt6.QtCore import QTimer
             QTimer.singleShot(50, lambda pid=player_id: self._ensure_map_web_view_ready(pid))
         # Ensure we're actually viewing the selected player's top-level tab.
+        main_widget = self._player_main_tab_widget(d)
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
-            if w is tabs:
+            if w is main_widget:
                 self.tabs.setCurrentIndex(i)
                 return
             if w is getattr(self, '_other_players_container', None):
@@ -3413,7 +3499,7 @@ class MainWindow(QMainWindow):
         # Map pane: QWidget container so QWebEngineView gets stable geometry when the tab is shown.
         map_container = QWidget()
         map_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        map_container.setMinimumSize(400, 300)
+        map_container.setMinimumSize(320, 200)
         map_layout = QVBoxLayout()
         map_layout.setContentsMargins(5, 5, 5, 5)
         map_layout.setSpacing(5)
@@ -3423,9 +3509,9 @@ class MainWindow(QMainWindow):
         logger.debug("map_container added to map_main_layout, count: %d", map_main_layout.count())
         
         logger.debug("Adding map_tab to player_tabs")
-        map_tab_index = player_tabs.addTab(map_tab, "Map") if not for_other_player else -1
-        logger.debug("map_tab added, player_tabs tab count: %d", player_tabs.count())
-        # Don't add year display to map tab - it covers the sidebar buttons
+        # The player's own map is always on screen (top right of the player's tab), not a
+        # sub-tab; other players' tabs have no map.
+        map_tab_index = -1
         
         # Add tab change handler to create QWebEngineView when map tab becomes visible
         def on_player_tab_changed(index):
@@ -3625,7 +3711,35 @@ class MainWindow(QMainWindow):
         # Required by _open_active_player_subtab / Corporation menu (Show Map Tab, etc.)
         player_tabs_dict['player_tabs'] = player_tabs
         self.player_tabs_dict[player_id] = player_tabs_dict
-        return player_tabs
+        if for_other_player:
+            return player_tabs
+        # Player's own tab: status column on the left; on the right the map above the
+        # other sub-tabs, with a draggable divider between them.
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(4)
+        status_holder = QWidget()
+        status_holder.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        status_holder_layout = QVBoxLayout(status_holder)
+        status_holder_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addWidget(status_holder, 0)
+        map_and_tabs = QSplitter(Qt.Orientation.Vertical)
+        map_and_tabs.setChildrenCollapsible(False)
+        map_and_tabs.addWidget(map_tab)
+        map_and_tabs.addWidget(player_tabs)
+        player_tabs.setMinimumHeight(180)
+        map_and_tabs.setStretchFactor(0, 11)
+        map_and_tabs.setStretchFactor(1, 9)
+        map_and_tabs.setSizes([550, 450])
+        map_and_tabs.splitterMoved.connect(lambda *_a: self._invalidate_all_map_web_views())
+        root_layout.addWidget(map_and_tabs, 1)
+        player_tabs_dict['player_root'] = root
+        player_tabs_dict['status_holder'] = status_holder
+        player_tabs_dict['status_holder_layout'] = status_holder_layout
+        player_tabs_dict['map_and_tabs_splitter'] = map_and_tabs
+        self._player_tabs_keepalive.append(root)
+        return root
 
     def _strip_other_player_controls(self) -> None:
         """Other players' tabs are for viewing only: hide every control that acts (buttons,
@@ -4202,46 +4316,49 @@ class MainWindow(QMainWindow):
         was_eliminated = self.operations.check_and_eliminate_player(
             player, balance_before=balance_before, net_change=net_change,
         )
-            
         if was_eliminated:
-            player_name = self.operations.get_player_name(player)
-            self.add_message(f"{player_name} eliminated (bankrupt).")
-            loss_message = (
-                f"Well, well. {player_name} has gone broke and is out of the game. "
-                "Did you think running a transit empire was going to be easy? Construction costs, maintenance, "
-                "workers, lawsuits, strikes, and the occasional disaster—and you couldn't even keep the lights on. "
-                "Maybe stick to Monopoly next time.\n\n"
-                "You lost because you spent more than you made. Too much building, too little revenue, or one too many "
-                "lawsuits and strikes. The game doesn't care how close you were—zero money means you're done. "
-                "No bailout, no second chances. Consider it a lesson in fiscal responsibility.\n\n"
-                "All of this player's lines and trainsets have been removed. Try not to blow it again."
-            )
+            self._announce_player_eliminated(player)
+
+    def _announce_player_eliminated(self, player):
+        """Message, popup and player-list update for a player who went bankrupt."""
+        player_name = self.operations.get_player_name(player)
+        self.add_message(f"{player_name} eliminated (bankrupt).")
+        loss_message = (
+            f"Well, well. {player_name} has gone broke and is out of the game. "
+            "Did you think running a transit empire was going to be easy? Construction costs, maintenance, "
+            "workers, lawsuits, strikes, and the occasional disaster—and you couldn't even keep the lights on. "
+            "Maybe stick to Monopoly next time.\n\n"
+            "You lost because you spent more than you made. Too much building, too little revenue, or one too many "
+            "lawsuits and strikes. The game doesn't care how close you were—zero money means you're done. "
+            "No bailout, no second chances. Consider it a lesson in fiscal responsibility.\n\n"
+            "All of this player's lines and trainsets have been removed. Try not to blow it again."
+        )
+        if not getattr(player, 'is_ai', False):
             QMessageBox.warning(self, "Player Eliminated", loss_message)
-            
-            self.update_player_combo()
-            
-            active_players = self.operations.get_active_players()
-            if not active_players:
-                game_over_message = (
-                    "Everybody's broke. All players have been eliminated—congratulations on the group failure. "
-                    "You had one job: run a transit system without going bankrupt. Construction, maintenance, "
-                    "workers, lawsuits, strikes… and not a single one of you could make it work. Impressive.\n\n"
-                    "You all ran out of money because none of you managed to bring in more than you spent. "
-                    "No bailouts here; the game doesn't reward mediocrity. Consider it a collective lesson in "
-                    "how not to run a railroad.\n\n"
-                    "No one wins. The board is reset. Maybe next time try not to burn through the cash so fast."
-                )
-                QMessageBox.information(self, "Game Over", game_over_message)
-            else:
+
+        self.update_player_combo()
+        
+        active_players = self.operations.get_active_players()
+        if not active_players:
+            game_over_message = (
+                "Everybody's broke. All players have been eliminated—congratulations on the group failure. "
+                "You had one job: run a transit system without going bankrupt. Construction, maintenance, "
+                "workers, lawsuits, strikes… and not a single one of you could make it work. Impressive.\n\n"
+                "You all ran out of money because none of you managed to bring in more than you spent. "
+                "No bailouts here; the game doesn't reward mediocrity. Consider it a collective lesson in "
+                "how not to run a railroad.\n\n"
+                "No one wins. The board is reset. Maybe next time try not to burn through the cash so fast."
+            )
+            QMessageBox.information(self, "Game Over", game_over_message)
+        elif not self.is_network_mode:  # a networked client keeps its own seat
+            current_player = self.operations.get_current_player(self.current_player_index)
+            if current_player is None or current_player == player:
                 
-                current_player = self.operations.get_current_player(self.current_player_index)
-                if current_player is None or current_player == player:
-                    
-                    for idx, p in enumerate(self.operations.get_players()):
-                        if p == active_players[0]:
-                            self.current_player_index = idx
-                            break
-                    self.update_player_combo()
+                for idx, p in enumerate(self.operations.get_players()):
+                    if p == active_players[0]:
+                        self.current_player_index = idx
+                        break
+                self.update_player_combo()
     
     def update_player_combo(self):
         if not hasattr(self, 'player_combo'):
@@ -4615,40 +4732,44 @@ class MainWindow(QMainWindow):
         """Refresh all UI displays. Uses assigned_player for government when in network mode."""
         if not self.operations:
             return
-        if hasattr(self, '_update_propose_merge_action'):
-            self._update_propose_merge_action()
-        if hasattr(self, 'DisplayMapInfo'):
-            self.DisplayMapInfo()
-        if hasattr(self, 'DisplayMarketplaceInfo'):
-            self.DisplayMarketplaceInfo()
-        if hasattr(self, 'refresh_construction_tab'):
-            self.refresh_construction_tab()
-        if hasattr(self, 'update_status_bar'):
-            self.update_status_bar()
-        if hasattr(self, 'DisplayGovernmentInfo'):
-            self.DisplayGovernmentInfo()  # Refreshes all players' government tabs
-        if hasattr(self, 'DisplayFinanceTab'):
-            self.DisplayFinanceTab()
-        if hasattr(self, 'DisplayAIWatchFinances'):
-            self.DisplayAIWatchFinances()
+
+        def refresh(name, *args):
+            # One display failing must not leave the others (e.g. the Law tab) out of date.
+            method = getattr(self, name, None)
+            if method is None:
+                return
+            try:
+                method(*args)
+            except Exception:
+                logger.exception("Refreshing %s failed", name)
+
+        for name in ('_update_propose_merge_action', 'DisplayMapInfo', 'DisplayMarketplaceInfo',
+                     'refresh_construction_tab', 'update_status_bar',
+                     'DisplayGovernmentInfo',  # all players' government tabs
+                     'DisplayFinanceTab', 'DisplayAIWatchFinances'):
+            refresh(name)
         for player in self.operations.get_players():
-            if hasattr(self, 'DisplayLinesControls'):
-                self.DisplayLinesControls(player)
-            if hasattr(self, 'DisplayRollingStockInfo'):
-                self.DisplayRollingStockInfo(player)
-            if hasattr(self, 'DisplayWorkersControls'):
-                self.DisplayWorkersControls(player)
-            if hasattr(self, 'DisplayLawInfo'):
-                try:
-                    self.DisplayLawInfo(player)
-                except Exception:
-                    pass
+            for name in ('DisplayLinesControls', 'DisplayRollingStockInfo', 'DisplayWorkersControls', 'DisplayLawInfo'):
+                refresh(name, player)
 
     def advance_year_button_clicked(self):
         if self.is_network_mode and self.network_client:
+            ready = self._humans_to_mark_ready_on_end_year()
+            if any(self.operations.human_ready_for_year_end(p) for p in ready):
+                return  # already waiting for the other players
+            # Grey out End Year until the server starts the next year (or turns the request down).
+            for p in ready:
+                self.operations.mark_human_ready_for_year_end(p)
+            self._update_end_year_button_state()
+            if self.status_end_year_timer_label:
+                self.status_end_year_timer_label.setVisible(True)
+                self.status_end_year_timer_label.setText("Waiting for the other players to end the year…")
             try:
                 self.network_client.end_year()
             except Exception as e:
+                for p in ready:
+                    p._ready_for_end_year_year = None
+                self._update_end_year_button_state()
                 QMessageBox.warning(self, "Network Error", f"Failed to send end year request: {str(e)}")
                 import traceback
                 traceback.print_exc()
@@ -4923,6 +5044,8 @@ class MainWindow(QMainWindow):
         for ai_player, human_player in result.get('merge_proposals', []):
             if self.operations.is_player_eliminated(ai_player) or self.operations.is_player_eliminated(human_player):
                 continue
+            if human_player not in self._humans_to_mark_ready_on_end_year() and self.is_network_mode:
+                continue  # another player's offer
             ai_name = self.operations.get_player_name(ai_player)
             human_name = self.operations.get_player_name(human_player)
             reply = QMessageBox.question(
@@ -4940,17 +5063,6 @@ class MainWindow(QMainWindow):
                     self.add_message(f"{human_name} merged with {ai_name}. {ai_name} has been absorbed.")
                     QMessageBox.information(self, "Merger Complete", f"You have merged with {ai_name}. All their assets are now yours.")
 
-        from worker import LAWYER
-        import random
-        old_year = new_year - 1
-        if self.last_lawyer_replenishment_year is None:
-            self.last_lawyer_replenishment_year = old_year - random.randint(0, 4)
-        years_since_last_lawyer = new_year - self.last_lawyer_replenishment_year
-        if years_since_last_lawyer >= 5:
-            lawyer_replenishment = random.randint(1, 3)
-            self.operations.marketplace_add_worker_supply(LAWYER.name, lawyer_replenishment)
-            self.last_lawyer_replenishment_year = new_year
-        
         profit_info = "\n---Profit---\n"
         maintenance_info = "\n---Trainset Maintenance---\n"
         resource_costs_info = "\n---Resource Costs---\n"
@@ -4985,15 +5097,10 @@ class MainWindow(QMainWindow):
             net_sign = "+" if net_val > 0 else ""
             net_info += f"{self.operations.get_player_name(player)}: {net_sign}${net_val}\n"
 
-            
-            if not self.operations.is_player_eliminated(player):
-                self.check_and_eliminate_player(
-                    player,
-                    balance_before=finances.get('balance_before'),
-                    net_change=finances.get('net'),
-                )
-                
-        
+        # advance_year_complete eliminated bankrupt players; tell everyone.
+        for player in result.get('eliminated_players', []) or []:
+            self._announce_player_eliminated(player)
+
         new_laws_info = ""
         new_laws = result.get('new_government_laws', [])
         if new_laws:
@@ -5035,8 +5142,9 @@ class MainWindow(QMainWindow):
         # Defer heavy refresh (DisplayMapInfo, DisplayGovernmentInfo, etc.) so End Year
         # button re-enables immediately; full refresh runs in next event loop tick.
         QTimer.singleShot(0, self._deferred_refresh_after_advance_year)
-        # Defer auto-save so it doesn't block; runs after UI updates
-        QTimer.singleShot(100, lambda ny=new_year: self._deferred_auto_save(ny))
+        # Defer auto-save so it doesn't block; runs after UI updates (the server keeps networked games)
+        if not self.is_network_mode:
+            QTimer.singleShot(100, lambda ny=new_year: self._deferred_auto_save(ny))
 
         QTimer.singleShot(50, self._start_background_ai_in_year_turns)
         QTimer.singleShot(100, self._maybe_auto_advance_year_if_ai)
@@ -5158,8 +5266,7 @@ class MainWindow(QMainWindow):
         self._return_to_game_tab()
     
     def _return_to_game_tab(self):
-        
-        
+        self._park_status_bar()
         while self.tabs.count() > 0:
             self.tabs.removeTab(0)
         
@@ -5416,6 +5523,8 @@ class MainWindow(QMainWindow):
                         self.marketplace_layout = d['marketplace_layout']
                 self._apply_view_only_state()
         self.tabs.currentChanged.connect(_on_tab_changed)
+        self.tabs.currentChanged.connect(self._on_main_tab_shown_for_layout)
+        self._on_main_tab_shown_for_layout(self.tabs.currentIndex())
         self._apply_view_only_state()
         self.update_status_bar()
         self._update_game_session_tab_menu_actions()
@@ -7715,8 +7824,41 @@ class MainWindow(QMainWindow):
     def view_marketplace_button_clicked(self):
         self.DisplayMarketplaceInfo()
     
-    def on_rent_workers_clicked(self, worker_type, quantity: int, current_year: int):
-        current_player = self.operations.get_current_player(self.current_player_index)
+    def _add_worker_hire_row(self, layout, player, worker_type, note: str = ""):
+        """'<Workers>: n  Hire [qty] $cost/yr [Hire]' row, so workers can be hired in the tab that uses them."""
+        year = self.operations.get_year()
+        rental = self.operations.get_player_worker_rental(player, worker_type.name)
+        count = rental.quantity if rental else 0
+        supply = self.operations.marketplace_get_worker_supply(worker_type.name)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"{worker_type.name}s: {count}{note}"))
+        row.addStretch()
+        row.addWidget(QLabel("Hire:"))
+        spin = QSpinBox()
+        spin.setRange(1, max(1, min(100, supply)))
+        row.addWidget(spin)
+        cost_label = QLabel()
+        row.addWidget(cost_label)
+
+        def update_cost():
+            cost = self.operations.calculate_worker_rental_cost(worker_type, spin.value(), year)
+            cost_label.setText(f"${cost:,}/yr ({supply} available)")
+        update_cost()
+        spin.valueChanged.connect(update_cost)
+        hire_btn = QPushButton(f"Hire {worker_type.name}s")
+        hire_btn.setEnabled(supply > 0)
+        hire_btn.setToolTip(f"Rent {worker_type.name}s from the marketplace (same as the Marketplace → Workers tab).")
+        hire_btn.clicked.connect(
+            lambda _=False: self.on_rent_workers_clicked(worker_type, spin.value(), year, player=player)
+        )
+        row.addWidget(hire_btn)
+        widget = QWidget()
+        widget.setLayout(row)
+        layout.addWidget(widget)
+        return widget
+
+    def on_rent_workers_clicked(self, worker_type, quantity: int, current_year: int, player=None):
+        current_player = player or self.operations.get_current_player(self.current_player_index)
         if not current_player:
             QMessageBox.warning(self, "No Active Player", "No active player selected.")
             return
@@ -7742,18 +7884,24 @@ class MainWindow(QMainWindow):
             return
         self.operations.marketplace_deduct_worker_supply(worker_type.name, quantity)
         self.operations.deduct_player_money(current_player, total_cost, reason='Worker rental')
-        # Update display immediately so user sees new money before modal dialog
+        # Auto-assign construction workers if they were rented
+        from worker import CONSTRUCTION_WORKER, ENGINEER, LAWYER, MAINTENANCE_WORKER
+        if worker_type.name == CONSTRUCTION_WORKER.name:
+            self.operations.auto_assign_unassigned_workers(current_player)
+        # Update every tab that shows these workers at once, before the modal dialog
         self.DisplayMarketplaceInfo()
         self.DisplayWorkersControls(current_player)
+        refresh_users = {
+            CONSTRUCTION_WORKER.name: lambda: self.refresh_construction_tab(),
+            ENGINEER.name: lambda: self.DisplayRollingStockInfo(current_player),
+            LAWYER.name: lambda: self.DisplayLawInfo(current_player),
+            MAINTENANCE_WORKER.name: lambda: self.DisplayLinesControls(current_player),
+        }.get(worker_type.name)
+        if refresh_users:
+            refresh_users()
         self.update_status_bar()
         self.add_message(f"Rented {quantity} {worker_type.name}(s) for ${total_cost}.")
-        
-        # Auto-assign construction workers if they were rented
-        from worker import CONSTRUCTION_WORKER
-        if worker_type == CONSTRUCTION_WORKER:
-            self.operations.auto_assign_unassigned_workers(current_player)
-            self.refresh_construction_tab()
-        
+
         QMessageBox.information(self, "Workers Rented", 
                                f"Successfully rented {quantity} {worker_type.name}(s) for ${total_cost} per year.")
     
@@ -8309,6 +8457,10 @@ class MainWindow(QMainWindow):
         player_tabs_dict = self.player_tabs_dict.get(player_id)
         if not isinstance(player_tabs_dict, dict):
             return False
+        root = player_tabs_dict.get('player_root')
+        if root is not None:
+            # The player's own map is always on screen while their tab is shown.
+            return getattr(self, 'tabs', None) is not None and self.tabs.currentWidget() is root
         player_tabs = player_tabs_dict.get('player_tabs')
         map_tab_index = player_tabs_dict.get('map_tab_index')
         if player_tabs is None or not isinstance(map_tab_index, int) or map_tab_index < 0:
@@ -8569,7 +8721,7 @@ class MainWindow(QMainWindow):
                             logger.debug("QWebEngineView created: %s", web_view)
                             
                             web_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-                            web_view.setMinimumSize(400, 300)
+                            web_view.setMinimumSize(320, 200)
                             web_view.setMaximumSize(16777215, 16777215)
                             web_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                             if not existing_web_view:
@@ -8627,7 +8779,7 @@ class MainWindow(QMainWindow):
                                 fallback_browser.setOpenExternalLinks(True)
                                 fallback_browser.setHtml(fallback_html)
                                 fallback_browser.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-                                fallback_browser.setMinimumSize(400, 300)
+                                fallback_browser.setMinimumSize(320, 200)
                                 map_layout.addWidget(fallback_browser, 1)
                                 osm_map_created = True
                                 logger.debug("Using QTextBrowser fallback (static map, no interactivity)")
@@ -10379,7 +10531,8 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         offer = self.operations.get_loan_offer(player, 0)
         spin.blockSignals(True)
         spin.setRange(0, max(0, int(offer['maximum'])))
-        if spin.value() == 0 and offer['maximum'] >= offer['minimum']:
+        # Keep the amount within today's limits (the minimum rises with inflation and debt).
+        if offer['maximum'] >= offer['minimum'] and spin.value() < offer['minimum']:
             spin.setValue(int(offer['minimum']))
         spin.blockSignals(False)
         btn = player_tabs_dict.get('take_loan_btn')
@@ -10546,6 +10699,9 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         all_line_names.update(construction_line_names)
         
         for_other = self.player_tabs_dict[player_id].get('for_other_player', False)
+        if not for_other:
+            from worker import MAINTENANCE_WORKER
+            self._add_worker_hire_row(scroll_layout, data_player, MAINTENANCE_WORKER, note=" (keep lines in good repair)")
         if not all_line_names:
             empty_msg = "No lines owned." if for_other else "No available lines"
             scroll_layout.addWidget(QLabel(empty_msg))
@@ -10742,6 +10898,14 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         locomotives_layout = locomotives_content_layout
         railcars_layout = railcars_content_layout
         
+        if not player_tabs_dict.get('for_other_player', False):
+            from worker import ENGINEER
+            engineers = self.operations.get_player_engineer_count(player)
+            assigned = self.operations.get_player_assigned_trainsets_count(player)
+            self._add_worker_hire_row(
+                trainsets_content_layout, player, ENGINEER,
+                note=f" ({assigned} running trainsets, {engineers - assigned} free)",
+            )
         trainsets_section = QVBoxLayout()
         trainsets = self.operations.get_player_trainsets(player)
         if trainsets:
@@ -10904,7 +11068,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             worker_label_widget.setTextFormat(Qt.TextFormat.RichText)
             worker_layout.addWidget(worker_label_widget)
             
-            current_multiplier = worker_type.get_salary_multiplier()
+            current_multiplier = rental.worker_type.get_salary_multiplier()
             
             salary_slider = QSlider(Qt.Orientation.Horizontal)
             salary_slider.setMinimum(5)
@@ -10927,13 +11091,20 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             self.salary_sliders[salary_key] = (salary_slider, salary_label, worker_type)
             
             def make_salary_updater(slider, label, cost_label, worker_type_obj, rental_obj, current_year):
-                def update_salary(value):
-                    multiplier = value / 10.0
-                    worker_type_obj.set_salary_multiplier(multiplier)
-                    label.setText(f"{multiplier:.1f}x")
+                # Applied once the slider settles (each change is sent to the server in network games).
+                apply_timer = QTimer(slider)
+                apply_timer.setSingleShot(True)
+                apply_timer.setInterval(250)
+
+                def apply_salary():
+                    self.operations.set_worker_salary_multiplier(worker_type_obj.name, slider.value() / 10.0)
                     if rental_obj:
-                        new_cost = rental_obj.get_yearly_cost(current_year)
-                        cost_label.setText(f"Yearly cost: ${new_cost}")
+                        cost_label.setText(f"Yearly cost: ${rental_obj.get_yearly_cost(current_year)}")
+                apply_timer.timeout.connect(apply_salary)
+
+                def update_salary(value):
+                    label.setText(f"{value / 10.0:.1f}x")
+                    apply_timer.start()
                 return update_salary
             
             salary_slider.valueChanged.connect(make_salary_updater(salary_slider, salary_label, cost_label, worker_type, rental, current_year))
@@ -11040,6 +11211,9 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 available = self.operations.get_player_available_lawyer_count(display_player)
                 lawyer_label = QLabel(f"  Lawyers: {lawyer_count} total, {available} available for lawsuits (rest drafting laws)")
                 player_section.addWidget(lawyer_label)
+                if not self.player_tabs_dict[player_id].get('for_other_player', False):
+                    from worker import LAWYER
+                    self._add_worker_hire_row(player_section, display_player, LAWYER)
                 
                 excuses = self.operations.get_player_lawsuit_excuses(display_player)
                 if excuses:
@@ -11508,6 +11682,9 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             if not player:
                 continue
             effective = self.operations.get_effective_player(player)
+            if not for_other_player:
+                from worker import CONSTRUCTION_WORKER
+                self._add_worker_hire_row(in_progress_layout, effective or player, CONSTRUCTION_WORKER)
             # Show build queue for the company (effective player); merged humans see same jobs
             player_builds = [idx for idx, build in enumerate(build_queue) 
                            if build.get('player') and self.operations.get_effective_player(build.get('player')) == effective]
@@ -11523,7 +11700,7 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
             in_progress_label.setStyleSheet("font-weight: bold; font-size: 12pt;")
             in_progress_layout.addWidget(in_progress_label)
             
-            for idx in player_builds:
+            for position, idx in enumerate(player_builds):
                 build = build_queue[idx]
                 build_type = build['type']
                 
@@ -11624,13 +11801,16 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                 
                 if not for_other_player:
                     button_layout = QHBoxLayout()
-                    if idx > 0:
+                    # Move past this company's own neighbouring job, never another company's.
+                    if position > 0:
                         move_up_btn = QPushButton("Move Up")
-                        move_up_btn.clicked.connect(lambda checked, i=idx: self.on_move_build_up(i))
+                        move_up_btn.clicked.connect(
+                            lambda checked, i=idx, t=player_builds[position - 1]: self.on_move_build_up(i, t))
                         button_layout.addWidget(move_up_btn)
-                    if idx < len(build_queue) - 1:
+                    if position < len(player_builds) - 1:
                         move_down_btn = QPushButton("Move Down")
-                        move_down_btn.clicked.connect(lambda checked, i=idx: self.on_move_build_down(i))
+                        move_down_btn.clicked.connect(
+                            lambda checked, i=idx, t=player_builds[position + 1]: self.on_move_build_down(i, t))
                         button_layout.addWidget(move_down_btn)
                     cancel_btn = QPushButton("Cancel")
                     cancel_btn.setStyleSheet("background-color: #ff4444; color: white;")
@@ -11696,7 +11876,15 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
                     completion_info = QLabel(f"Completed: Year {completed_year}")
                     job_layout.addWidget(completion_info)
                     
-                    if job_type == 'line' and not for_other_player:
+                    built_line_name = completed_job.get('data', {}).get('name', '')
+                    built_line = self.operations.get_map().get_lines_by_name().get(built_line_name) if built_line_name else None
+                    still_owned = (
+                        built_line is not None
+                        and self.operations.get_line_owner(built_line) is not None
+                        and self.operations.get_player_id(self.operations.get_line_owner(built_line)) == player_id
+                    )
+                    if job_type == 'line' and not for_other_player and still_owned:
+                        # Only for lines the player still owns (not since sold, merged or seized).
                         sell_btn = QPushButton("Sell Line to Marketplace")
                         def sell_line_to_marketplace():
                             current_player = self.operations.get_current_player(self.current_player_index)
@@ -11746,17 +11934,20 @@ Static map (PyQt6-WebEngine not available). Run: poetry install && poetry run py
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to assign workers: {str(e)}")
     
-    def on_move_build_up(self, build_index: int):
-        
+    def on_move_build_up(self, build_index: int, target_index: int = None):
         try:
-            self.operations.reorder_build_queue(build_index, build_index - 1)
+            if target_index is None:
+                target_index = build_index - 1
+            self.operations.reorder_build_queue(build_index, target_index)
             self.refresh_construction_tab()
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to move build: {str(e)}")
     
-    def on_move_build_down(self, build_index: int):
+    def on_move_build_down(self, build_index: int, target_index: int = None):
         try:
-            self.operations.reorder_build_queue(build_index, build_index + 1)
+            if target_index is None:
+                target_index = build_index + 1
+            self.operations.reorder_build_queue(build_index, target_index)
             self.refresh_construction_tab()
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to move build: {str(e)}")

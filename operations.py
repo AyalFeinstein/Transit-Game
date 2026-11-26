@@ -4312,6 +4312,15 @@ class Operations:
                 for i, ln in enumerate(list(lns)):
                     if ln == old_name:
                         lns[i] = new_name
+        for job in getattr(self, "completed_jobs", None) or []:
+            if job.get("type") == "line":
+                jd = job.get("data") or {}
+                if jd.get("name") == old_name:
+                    jd["name"] = new_name
+            elif job.get("type") in ("line_repair", "line_extension", "line_upgrade"):
+                jd = job.get("data") or {}
+                if jd.get("line_name") == old_name:
+                    jd["line_name"] = new_name
         for build in self.game.build_queue or []:
             if build.get("type") == "line":
                 bd = build.setdefault("data", {})
@@ -5183,6 +5192,11 @@ class Operations:
         for wt in (ENGINEER, CONSTRUCTION_WORKER, MAINTENANCE_WORKER, LAWYER):
             if wt.name == worker_type_name:
                 wt.set_salary_multiplier(float(multiplier))
+                # Rentals from a loaded (or network-copied) game hold their own copy of the type.
+                for player in self.get_players():
+                    rental = player.worker_rentals.get(worker_type_name)
+                    if rental is not None and rental.worker_type is not wt:
+                        rental.worker_type.set_salary_multiplier(float(multiplier))
                 return
         raise ValueError(f"Unknown worker type: {worker_type_name!r}")
     
@@ -6009,12 +6023,16 @@ class Operations:
         self._complete_law_drafts(new_year)
 
         # Eliminate only after all year-end money changes (finances, funding, lobby penalties).
+        eliminated_players = []
         for player in all_players:
             if not self.is_player_eliminated(player):
                 was_eliminated = self.check_and_eliminate_player(player)
                 if was_eliminated:
+                    eliminated_players.append(player)
                     continue
                 self.check_and_unassign_trainsets_for_engineers(player, new_year)
+
+        self._replenish_lawyer_supply(new_year)
 
         # Random AI spawn: add new AI every 50-100 years if enabled
         new_ai_spawned = None
@@ -6062,9 +6080,24 @@ class Operations:
             'election_held': election_held,
             'government_funding': government_funding,
             'war_events': war_events,
+            'eliminated_players': eliminated_players,
         }
         result['news_articles'] = self._generate_news_articles_for_year(new_year, result)
         return result
+
+    def _replenish_lawyer_supply(self, new_year: int) -> int:
+        """Every 5 years 1-3 new lawyers join the marketplace (first time 0-4 years after the start).
+        Returns how many joined this year."""
+        from worker import LAWYER
+        last = getattr(self.game, '_last_lawyer_replenishment_year', None)
+        if last is None:
+            last = self.game._last_lawyer_replenishment_year = (new_year - 1) - random.randint(0, 4)
+        if new_year - last < 5:
+            return 0
+        added = random.randint(1, 3)
+        self.marketplace_add_worker_supply(LAWYER.name, added)
+        self.game._last_lawyer_replenishment_year = new_year
+        return added
 
     def is_player_desperate(self, player: Player) -> bool:
         """True if player is in extremely desperate situation (eligible for merger).
