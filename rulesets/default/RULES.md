@@ -96,7 +96,8 @@ You can build several kinds of lines depending on the map preset. Each mode has 
 - **Lawyers**: Help win lawsuits against other players
 
 ### Worker Management
-- Workers are rented from the marketplace
+- Workers are rented from the marketplace: from the Marketplace → Workers tab, or right where they are used (construction workers in the Construction tab, engineers in Rolling Stock, maintenance workers in Lines, lawyers in Law)
+- New lawyers join the marketplace every 5 years (1–3 at a time)
 - **Salary inflation**: Base worker rent uses the same calendar inflation curve as marketplace prices (about **1× in 1830 to 10× by 2050**), before your per-type salary multiplier setting
 - **Demanded pay**: Workers also expect a higher multiplier over the era (**about 1× in 1830 up to 5× by 2050**, with small random variance)
 - If workers are underpaid by **0.5× or more** relative to demand, they may go on strike

@@ -253,7 +253,8 @@ class NetworkClient(QObject):
             print(f"Game state without game data (keys: {list((game_state_data or {}).keys())})")
             return None
         try:
-            game = pickle.loads(base64.b64decode(game_data_b64.encode('utf-8')))
+            from network_rpc import unpack_game_state
+            game = unpack_game_state(base64.b64decode(game_data_b64.encode('utf-8')))
         except Exception as e:
             import traceback
             print(f"Could not read game state from server: {e}")
