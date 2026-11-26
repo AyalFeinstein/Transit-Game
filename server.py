@@ -190,12 +190,13 @@ async def join_game(sid, data):
             'total_players': len(session['players'])
         }, room=session_id)
         
-        # Send game state to new player
-        await sio.emit('game_state', {
-            'game_state': serialize_game_state(game),
-            'player_id': player_id,
-            'player_name': player_names[player_id]
-        }, room=sid)
+        # Send game state to new player (during a year end they get it with year_advanced)
+        if not session.get('advancing_year'):
+            await sio.emit('game_state', {
+                'game_state': serialize_game_state(game),
+                'player_id': player_id,
+                'player_name': player_names[player_id]
+            }, room=sid)
         
         print(f"Player {player_id} ({player_names[player_id]}) joined game {session_id}")
         
@@ -216,7 +217,9 @@ async def get_game_state(sid, data):
         
         session = game_sessions[session_id]
         game = session['game']
-        
+        if session.get('advancing_year'):
+            return  # everyone gets the new state (year_advanced) when the year end finishes
+
         await sio.emit('game_state', {
             'game_state': serialize_game_state(game)
         }, room=sid)
@@ -250,7 +253,11 @@ async def player_action(sid, data):
         player = game.get_players()[player_id]
         
         # All players act simultaneously (no turns).
-        if action_type == 'operations_call':
+        if session.get('advancing_year'):
+            # The AIs and the year end are running in a worker thread on this game.
+            result = {'success': False, 'message': 'The year is ending; please wait for the next year.'}
+
+        elif action_type == 'operations_call':
             # action_data: network_rpc.encode_operations_call(...) - any game-changing Operations call
             result = handle_operations_call(ui, player, action_data)
 
@@ -265,7 +272,11 @@ async def player_action(sid, data):
             # Check if all active players are ready
             if active_player_ids.issubset(session['end_year_ready']):
                 # All players ready - advance the year
-                result = await handle_advance_year(ui, game)
+                session['advancing_year'] = True
+                try:
+                    result = await handle_advance_year(ui, game)
+                finally:
+                    session['advancing_year'] = False
                 if result['success']:
                     # Clear the ready set for the next year
                     session['end_year_ready'] = set()
@@ -273,7 +284,10 @@ async def player_action(sid, data):
                     await sio.emit('year_advanced', {
                         'new_year': game.get_year(),
                         'message': result.get('message', 'Year advanced'),
-                        'game_state': serialize_game_state(game)  # Send full game state so clients can update year display
+                        'game_state': serialize_game_state(game),  # Send full game state so clients can update year display
+                        'ai_actions': result.get('ai_actions', []),
+                        'ai_failures': result.get('ai_failures', []),
+                        'ai_money_log': list(getattr(ui, '_ai_money_debug_log', None) or []),
                     }, room=session_id)
                 else:
                     # Year advance failed - remove this player from ready
@@ -351,7 +365,22 @@ def handle_operations_call(ui, player, action_data):
 
 
 async def handle_advance_year(ui, game):
-    """Handle advance year action: run AI turns, then advance_year_complete. Newly spawned AIs also get a turn."""
+    """Run the AI turns and the year end in a worker thread, so the server keeps answering
+    clients (a long End Year must not time out their connections)."""
+    import asyncio
+    return await asyncio.to_thread(advance_year_now, ui, game)
+
+
+def advance_year_now(ui, game):
+    """AI turns, then advance_year_complete; newly spawned AIs also get a turn.
+
+    The result carries ``ai_actions`` [(AI name, action description), ...] and ``ai_failures``
+    [(AI name, reason), ...] for the clients' AI Watch tab."""
+    ai_actions = []
+    ai_failures = []
+
+    def on_progress(name, description):
+        ai_actions.append((name, description))
     try:
         old_year = game.get_year()
         from ai import (
@@ -365,9 +394,10 @@ async def handle_advance_year(ui, game):
             if not getattr(p, 'is_ai', False):
                 ui.mark_human_ready_for_year_end(p)
         pending = ui.get_ai_players_needing_in_year_turn()
-        run_pending_ai_in_year_turns(
-            ui, players=pending, deadline_sec=AI_TURN_TIME_BUDGET_SEC
+        _results, failures = run_pending_ai_in_year_turns(
+            ui, players=pending, deadline_sec=AI_TURN_TIME_BUDGET_SEC, progress_callback=on_progress,
         )
+        ai_failures.extend((str(name), str(reason)) for name, reason in failures)
         if not ui.all_players_completed_year_actions():
             return {
                 'success': False,
@@ -381,22 +411,26 @@ async def handle_advance_year(ui, game):
             new_player = new_info.get('player') if isinstance(new_info, dict) else None
             if new_player is not None:
                 try:
-                    acts = run_ai_turn(ui, new_player)
+                    acts = run_ai_turn(ui, new_player, progress_callback=on_progress)
                     validate_ai_turn_results(ui, new_player, acts)
-                    ui.mark_ai_in_year_turn_completed(new_player)
                 except AIIdleTurnError as e:
                     print(f"AI turn idle for newly spawned {new_player.get_name()}: {e}")
-                    ui.mark_ai_in_year_turn_completed(new_player)
                 except Exception as e:
                     print(f"AI turn failed for newly spawned {new_player.get_name()}: {e}")
-                    ui.mark_ai_in_year_turn_completed(new_player)
+                    ai_failures.append((new_player.get_name(), str(e)))
                     import traceback
                     traceback.print_exc()
+                finally:
+                    ui.mark_ai_in_year_turn_completed(new_player)
+        for name, reason in ai_failures:
+            print(f"AI problem ({name}): {reason}")
         new_year = result.get('new_year', old_year + 1)
         return {
-            'success': True, 
+            'success': True,
             'message': f'Year advanced to {new_year}',
-            'new_year': new_year
+            'new_year': new_year,
+            'ai_actions': ai_actions,
+            'ai_failures': ai_failures,
         }
     except Exception as e:
         print(f"Error advancing year: {e}")
