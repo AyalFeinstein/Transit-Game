@@ -2276,11 +2276,12 @@ class MainWindow(QMainWindow):
             return
         self._launch_advance_year_thread()
 
-    def start_networked_game(self, game, assigned_player_id: int, network_client, network_thread, network_session_id: str, all_players_info: list):
+    def start_networked_game(self, game, assigned_player_id: int, network_client, network_thread, network_session_id: str, all_players_info: list, ai_watch_enabled: bool = False):
         """Start game UI with server-provided game state. Used when joining/creating a networked game."""
         while self.tabs.count() > 0:
             self.tabs.removeTab(0)
         self.is_network_mode = True
+        self.ai_watch_enabled = bool(ai_watch_enabled)
         self.network_client = network_client
         self.network_thread = network_thread
         self.network_session_id = network_session_id
@@ -2386,9 +2387,26 @@ class MainWindow(QMainWindow):
             current_year = self.operations.get_year()
             if self.status_year_label:
                 self.status_year_label.setText(f"Year: {current_year}")
+        self._show_network_ai_report(data, new_year)
         self._sync_missing_competitor_tabs_from_operations()
         self.refresh_all_displays()
         QMessageBox.information(self, "Year Advanced", message)
+
+    def _show_network_ai_report(self, data, year):
+        """The server runs the AIs: put the AI actions and money log it sent into the AI Watch tab."""
+        if self.operations and isinstance(data.get('ai_money_log'), list):
+            self.operations._ai_money_debug_log = data['ai_money_log']
+        if not (getattr(self, 'ai_watch_text', None) and self.ai_watch_text):
+            return
+        actions = data.get('ai_actions') or []
+        failures = data.get('ai_failures') or []
+        if not actions and not failures:
+            return
+        self.ai_watch_text.append(f"End of year {year - 1} - AI actions:")
+        for name, description in actions:
+            self.ai_watch_text.append(f"{name}: {description}")
+        for name, reason in failures:
+            self.ai_watch_text.append(f"{name}: problem - {reason}")
 
     def _on_network_end_year_status(self, data):
         """Handle end year status update."""
@@ -12794,7 +12812,8 @@ class NetworkedMainWindow(MainWindow):
                 network_client=network_client,
                 network_thread=network_thread,
                 network_session_id=network_session_id,
-                all_players_info=all_players_info
+                all_players_info=all_players_info,
+                ai_watch_enabled=bool(getattr(self, 'ai_watch_checkbox', None) and self.ai_watch_checkbox.isChecked()),
             )
             new_window._local_server_process = local_server_process
             logger.debug("Networked game window created successfully")
